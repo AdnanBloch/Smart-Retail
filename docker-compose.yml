@@ -1,0 +1,123 @@
+# SmartRetail local stack (RFC 0001 §3.1.1.12).
+# Milestone 1 ships the `core` profile: postgres, identity, catalog, gateway.
+# Only the gateway is published to the host, on 127.0.0.1:8000.
+
+x-service-env: &service-env
+  ENVIRONMENT: ${ENVIRONMENT:-local}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  OTEL_SDK_DISABLED: "true"
+  JWT_ISSUER: ${JWT_ISSUER:-smartretail-identity}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:-smartretail}
+  JWT_LEEWAY_SECONDS: ${JWT_LEEWAY_SECONDS:-10}
+  JWT_PUBLIC_KEY_PATH: /run/keys/jwt_public.pem
+
+x-healthcheck: &ready-check
+  interval: 10s
+  timeout: 3s
+  retries: 6
+  start_period: 10s
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: [core]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:-identity_local}
+      CATALOG_DB_PASSWORD: ${CATALOG_DB_PASSWORD:-catalog_local}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./ops/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  identity:
+    build:
+      context: .
+      dockerfile: services/identity/Dockerfile
+    profiles: [core]
+    environment:
+      <<: *service-env
+      SERVICE_NAME: identity
+      PORT: "8001"
+      DATABASE_URL: postgresql+asyncpg://identity_role:${IDENTITY_DB_PASSWORD:-identity_local}@postgres:5432/identity_db
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+      JWT_KEYS_DIR: /run/secrets/jwt
+      JWT_ACTIVE_KID: ${JWT_ACTIVE_KID:?run make keys}
+      ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-900}
+      REFRESH_TOKEN_TTL_SECONDS: ${REFRESH_TOKEN_TTL_SECONDS:-604800}
+      ARGON2_TIME_COST: ${ARGON2_TIME_COST:-3}
+      ARGON2_MEMORY_COST_KIB: ${ARGON2_MEMORY_COST_KIB:-65536}
+      ARGON2_PARALLELISM: ${ARGON2_PARALLELISM:-4}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@smartretail.local}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-change-me-admin-password}
+      SEED_DEMO_PASSWORD: ${SEED_DEMO_PASSWORD:-change-me-demo-password}
+    volumes:
+      # The private key is mounted into identity only.
+      - ./keys:/run/secrets/jwt:ro
+      - ./keys/jwt_public.pem:/run/keys/jwt_public.pem:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health/ready', timeout=2).status == 200 else 1)"]
+
+  catalog:
+    build:
+      context: .
+      dockerfile: services/catalog/Dockerfile
+    profiles: [core]
+    environment:
+      <<: *service-env
+      SERVICE_NAME: catalog
+      PORT: "8002"
+      DATABASE_URL: postgresql+asyncpg://catalog_role:${CATALOG_DB_PASSWORD:-catalog_local}@postgres:5432/catalog_db
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+      JWKS_URL: http://identity:8001/api/v1/auth/jwks
+      JWKS_MIN_REFETCH_SECONDS: ${JWKS_MIN_REFETCH_SECONDS:-30}
+    volumes:
+      - ./keys/jwt_public.pem:/run/keys/jwt_public.pem:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8002/health/ready', timeout=2).status == 200 else 1)"]
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    profiles: [core]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      <<: *service-env
+      SERVICE_NAME: gateway
+      PORT: "8000"
+      UPSTREAM_IDENTITY_URL: http://identity:8001
+      UPSTREAM_CATALOG_URL: http://catalog:8002
+      JWKS_URL: http://identity:8001/api/v1/auth/jwks
+      JWKS_MIN_REFETCH_SECONDS: ${JWKS_MIN_REFETCH_SECONDS:-30}
+      GATEWAY_CORS_ALLOW_ORIGINS: ${GATEWAY_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
+      GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:8000}
+      GATEWAY_MAX_BODY_BYTES: ${GATEWAY_MAX_BODY_BYTES:-1048576}
+      GATEWAY_UPSTREAM_CONNECT_TIMEOUT_S: ${GATEWAY_UPSTREAM_CONNECT_TIMEOUT_S:-2}
+      GATEWAY_UPSTREAM_READ_TIMEOUT_S: ${GATEWAY_UPSTREAM_READ_TIMEOUT_S:-10}
+    volumes:
+      - ./keys/jwt_public.pem:/run/keys/jwt_public.pem:ro
+    # No hard depends_on (RFC 0002): an unavailable upstream is a 503, not a
+    # gateway that refuses to start.
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).status == 200 else 1)"]
+
+volumes:
+  postgres-data:

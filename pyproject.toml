@@ -1,0 +1,39 @@
+# Workspace-level tooling configuration. Each package (libs/common, services/*)
+# carries its own pyproject.toml with dependencies and pytest settings.
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["docs", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S", "SIM", "RUF"]
+ignore = [
+    "B008",   # FastAPI's Depends()/Query() in defaults is idiomatic
+    "S101",   # assert is fine in tests
+    "RUF012", # mutable class attrs on SQLAlchemy/pydantic models
+    "S105",   # flags every `token_type = "..."`; secrets are never literals here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S105", "S106", "S311"]
+"scripts/**" = ["S105", "S311"]
+"**/seed.py" = ["S105", "S311"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["smartretail_common", "app", "main"]
+
+[tool.mypy]
+python_version = "3.12"
+# Editable installs use an import hook mypy cannot follow; point it at the source.
+mypy_path = "$MYPY_CONFIG_FILE_DIR/libs/common"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
+# Root-level suites (tests/e2e). Package suites use their own pyproject.
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

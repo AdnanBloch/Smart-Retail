@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartretail-gateway"
+version = "0.1.0"
+description = "SmartRetail gateway (RFC 0002): routing, early JWT rejection, correlation, CORS, aggregated docs"
+requires-python = ">=3.12"
+dependencies = [
+    "smartretail-common",
+    "fastapi>=0.115,<0.116",
+    "uvicorn[standard]>=0.32,<0.35",
+    "httpx>=0.28,<0.29",
+    "pydantic-settings>=2.6,<3",
+    "pyjwt[crypto]>=2.10,<2.11",
+]
+
+[tool.setuptools]
+# Dependencies only; the app/ source is copied into the image directly.
+packages = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]

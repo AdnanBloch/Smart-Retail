@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+*.local
+
+# Environment
+.env
+
+# Databases
+*.db
+
+# RS256 key pair from `make keys`
+keys/
+
+# Packaging and coverage output
+*.egg-info/
+coverage.xml

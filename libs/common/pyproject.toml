@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartretail-common"
+version = "0.1.0"
+description = "SmartRetail shared platform library (RFC 0001). Holds no vocabulary and no business rule (R8)."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<0.116",
+    "pydantic>=2.10,<2.11",
+    "pydantic-settings>=2.6,<3",
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.30,<0.31",
+    "pyjwt[crypto]>=2.10,<2.11",
+    "httpx>=0.28,<0.29",
+]
+
+[tool.setuptools.packages.find]
+include = ["smartretail_common*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
