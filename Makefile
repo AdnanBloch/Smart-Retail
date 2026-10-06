@@ -47,7 +47,7 @@ migrate: ## Run every service's migrations to head (never on start-up)
 
 seed: ## Seed admin, demo accounts and categories (idempotent)
 	$(COMPOSE) run --rm --no-deps identity python -m app.seed
-	$(COMPOSE) run --rm --no-deps catalog python -m app.infrastructure.seed
+	$(COMPOSE) run --rm --no-deps catalog python -m app.seed
 
 dev-install: ## Install every package and dev tool into $(VENV)
 	$(PY) -m pip install -q -e common ./services/identity ./services/catalog ./services/gateway

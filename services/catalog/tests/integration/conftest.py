@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.configs.env import Settings
+from app.core.config import Settings
 from main import create_application
 from smartretail_common.auth import JwtVerifier
 from smartretail_common.testing import provision_test_database, truncate_all
