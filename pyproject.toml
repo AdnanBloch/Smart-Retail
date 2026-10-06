@@ -1,4 +1,4 @@
-# Workspace-level tooling configuration. Each package (libs/common, services/*)
+# Workspace-level tooling configuration. Each package (common, services/*)
 # carries its own pyproject.toml with dependencies and pytest settings.
 
 [tool.ruff]
@@ -26,7 +26,7 @@ known-first-party = ["smartretail_common", "app", "main"]
 [tool.mypy]
 python_version = "3.12"
 # Editable installs use an import hook mypy cannot follow; point it at the source.
-mypy_path = "$MYPY_CONFIG_FILE_DIR/libs/common"
+mypy_path = "$MYPY_CONFIG_FILE_DIR/common"
 plugins = ["pydantic.mypy"]
 ignore_missing_imports = true
 check_untyped_defs = true

@@ -6,12 +6,12 @@
 | **Collaborators** | SarwanAhmed |
 | **Status** | **DRAFT** · IN-REVIEW · DONE |
 | **Created** | Sep 29, 2026 |
-| **Supersedes** | Platform and infrastructure content of [archive/0000](archive/0000-system-architecture.md) (non-HTTP components, infrastructure table, container counts, deployment), [archive/0001](archive/0001-foundation-and-core-services.md) (`libs/common`, repository layout, local setup), [archive/0002](archive/0002-core-business-logic-and-workflows.md) (Temporal and MinIO setup, outbox helper, idempotency helper, service tokens), [archive/0003](archive/0003-events-and-observability.md) (Kafka, Schema Registry, `outbox-relay`, RabbitMQ and Celery, Redis, the OpenTelemetry stack, Compose profiles), [archive/0004](archive/0004-retrieval-layer.md) (`indexer-worker` runtime, `ai` profile), [archive/0005](archive/0005-ai-assistant-and-streaming.md) (Celery bulk queue, budget fast path), [archive/0006](archive/0006-service-decomposition-and-data-model.md) (S4 mechanism, R8, deployment of roles and migrations) |
+| **Supersedes** | Platform and infrastructure content of [archive/0000](archive/0000-system-architecture.md) (non-HTTP components, infrastructure table, container counts, deployment), [archive/0001](archive/0001-foundation-and-core-services.md) (`common`, repository layout, local setup), [archive/0002](archive/0002-core-business-logic-and-workflows.md) (Temporal and MinIO setup, outbox helper, idempotency helper, service tokens), [archive/0003](archive/0003-events-and-observability.md) (Kafka, Schema Registry, `outbox-relay`, RabbitMQ and Celery, Redis, the OpenTelemetry stack, Compose profiles), [archive/0004](archive/0004-retrieval-layer.md) (`indexer-worker` runtime, `ai` profile), [archive/0005](archive/0005-ai-assistant-and-streaming.md) (Celery bulk queue, budget fast path), [archive/0006](archive/0006-service-decomposition-and-data-model.md) (S4 mechanism, R8, deployment of roles and migrations) |
 | **Depends on** | [RFC 0000 — Architecture](0000-architecture.md) |
 | **Depended on by** | [0002 gateway](0002-gateway-service.md) · [0003 identity](0003-identity-service.md) · [0004 catalog](0004-catalog-service.md) · [0005 order](0005-order-service.md) · [0006 inventory](0006-inventory-service.md) · [0007 notification](0007-notification-service.md) · [0008 analytics](0008-analytics-service.md) · [0009 assistant](0009-assistant-service.md) |
 
 > **Reading note.** This RFC specifies everything in SmartRetail that is not an HTTP
-> service: the shared library `libs/common`, the four worker runtimes
+> service: the shared library `common`, the four worker runtimes
 > (`outbox-relay`, `temporal-worker`, `celery-worker`, `indexer-worker`), the
 > infrastructure they run on (Kafka and Schema Registry, RabbitMQ, Redis, MinIO,
 > Temporal, PostgreSQL provisioning), the observability stack, and the local
@@ -39,7 +39,7 @@
 3. [Solution Overview](#3-solution-overview)
    - 3.1. [Specification](#31-specification)
      - 3.1.1. [Architectural changes](#311-architectural-changes)
-       - 3.1.1.1. [libs/common](#3111-libscommon)
+       - 3.1.1.1. [common](#3111-common)
        - 3.1.1.2. [outbox-relay](#3112-outbox-relay)
        - 3.1.1.3. [temporal-worker](#3113-temporal-worker)
        - 3.1.1.4. [celery-worker](#3114-celery-worker)
@@ -52,7 +52,7 @@
        - 3.1.1.11. [Observability stack](#31111-observability-stack)
        - 3.1.1.12. [Local environment — Compose, Makefile, Dockerfiles](#31112-local-environment--compose-makefile-dockerfiles)
      - 3.1.2. [API changes](#312-api-changes)
-       - 3.1.2.1. [libs/common public API](#3121-libscommon-public-api)
+       - 3.1.2.1. [common public API](#3121-common-public-api)
        - 3.1.2.2. [The event envelope on the wire](#3122-the-event-envelope-on-the-wire)
        - 3.1.2.3. [Avro schema registration flow](#3123-avro-schema-registration-flow)
        - 3.1.2.4. [Operational endpoints — /health, /health/ready, /metrics](#3124-operational-endpoints--health-healthready-metrics)
@@ -98,7 +98,7 @@ The eight services in [RFC 0000 §3.1.1.1](0000-architecture.md#3111-service-inv
 
 Three rules shape all of it.
 
-1. **The platform owns no business state.** No table in this RFC is a domain table. `libs/common` holds mechanisms, never vocabularies or rules (R8). Workers host code that belongs to a service; they do not own what that code writes (PLT-1).
+1. **The platform owns no business state.** No table in this RFC is a domain table. `common` holds mechanisms, never vocabularies or rules (R8). Workers host code that belongs to a service; they do not own what that code writes (PLT-1).
 2. **Every asynchronous path has a defined failure shape.** An event that cannot be published stays in the outbox. An event that cannot be processed goes to a DLQ after bounded retries. A task that cannot run is retried and recorded. A dependency that is down degrades a path rather than failing it, wherever the owning service can tolerate that.
 3. **Every component is observable in the same way.** One trace across HTTP, Kafka, Temporal and Celery; one metric naming scheme with one label vocabulary; one JSON log line shape carrying the trace ID.
 
@@ -116,8 +116,8 @@ The platform also carries the one constraint that is not a design choice: the la
 | G6 | RED metrics for every service and consumer, on a Grafana dashboard | Dashboard loads with live data; every panel has a query that returns |
 | G7 | Background work is off the request path | No handler performs media processing, email rendering, or rollup computation inline |
 | G8 | Failure diagnosis is possible for each of [Part A](../part-a.md) §6's five named flows | A walkthrough per flow, starting from a symptom and reaching a cause (§7) |
-| G9 | Cross-cutting conventions are implemented once — auth, errors, pagination, config, idempotency, tracing — and reused rather than reimplemented per service | Every service imports them from `libs/common`; no service defines its own error handler, JWT verifier or pagination envelope |
-| G10 | `libs/common` contains no business rule and no domain vocabulary (R8) | An AST scan of `libs/common` for any service's domain status literal returns nothing, and that scan is a unit test |
+| G9 | Cross-cutting conventions are implemented once — auth, errors, pagination, config, idempotency, tracing — and reused rather than reimplemented per service | Every service imports them from `common`; no service defines its own error handler, JWT verifier or pagination envelope |
+| G10 | `common` contains no business rule and no domain vocabulary (R8) | An AST scan of `common` for any service's domain status literal returns nothing, and that scan is a unit test |
 | G11 | Local setup is one command per concern and works from a cold clone | `make reset && make up-all && make migrate && make seed && make test` green on a machine that has never run it; API docs reachable |
 | G12 | Any subset of the stack can be run on its own | `make up-min`, `make up`, `make up-events`, `make up-observability`, `make up-ai`, `make up-all` each start a healthy subset |
 | G13 | Schema is version-controlled per service and migrations are an explicit step | Alembic takes every database from empty to head in CI and locally; no container migrates on start |
@@ -157,7 +157,7 @@ The platform also carries the one constraint that is not a design choice: the la
       ▼               ▼              ▼               ▼              ▼              ▼              ▼
   identity        catalog         order          inventory    notification     analytics      assistant
   (:8001)         (:8002)         (:8003)        (:8004)        (:8005)         (:8006)        (:8007)
-      │  every service imports libs/common: auth · config · logging · errors · pagination · db ·
+      │  every service imports common: auth · config · logging · errors · pagination · db ·
       │  idempotency · outbox · events · consumer base · tracing · metrics · DomainEnum
       ▼
  ┌──────────────── PostgreSQL 16 (pgvector image) — one instance, one database + role per service ──┐
@@ -189,8 +189,8 @@ The platform also carries the one constraint that is not a design choice: the la
 
 | ID | Decision | Implemented in |
 | --- | --- | --- |
-| A6 | Async all the way down — FastAPI `async def`, SQLAlchemy 2.0 async, `asyncpg`; no sync I/O inside the event loop | `libs/common` DB session (§3.1.1.1) |
-| A7 | RFC 9457 problem details, one shape everywhere, produced by one handler in `libs/common` | §3.1.1.1 |
+| A6 | Async all the way down — FastAPI `async def`, SQLAlchemy 2.0 async, `asyncpg`; no sync I/O inside the event loop | `common` DB session (§3.1.1.1) |
+| A7 | RFC 9457 problem details, one shape everywhere, produced by one handler in `common` | §3.1.1.1 |
 | A8 | `X-Request-ID` in, W3C `traceparent` out; from the event backbone onwards it is the OpenTelemetry trace ID | §3.1.1.11 |
 | A10 | Transactional outbox for every state-change event; `outbox-relay` publishes | §3.1.1.1, §3.1.1.2 |
 | A11 | Consumers are idempotent and keyed | Consumer base, §3.1.1.1 |
@@ -215,8 +215,8 @@ The platform also carries the one constraint that is not a design choice: the la
 | C17 | Notification fan-out between replicas is Redis Pub/Sub, one channel per connected user (mechanism here; delivery semantics in [0007](0007-notification-service.md)) | §3.1.1.8 |
 | D3 | Indexing is event-driven, never polled; `indexer-worker` is one more consumer on the shared base class | §3.1.1.5 |
 | E12 | Generation is synchronous-streaming for interactive use and Celery-backed for bulk | §3.1.1.4 |
-| R8 | `libs/common` contains no business rule | §3.1.1.1 R8 guard |
-| S4 | Enums as `text`; the mechanism (`DomainEnum`, `DomainEnumText`) lives in `libs/common`, the vocabularies in each service | §3.1.1.1; the rule is [RFC 0000 §3.1.3.1](0000-architecture.md#3131-schema-conventions-s1s15) |
+| R8 | `common` contains no business rule | §3.1.1.1 R8 guard |
+| S4 | Enums as `text`; the mechanism (`DomainEnum`, `DomainEnumText`) lives in `common`, the vocabularies in each service | §3.1.1.1; the rule is [RFC 0000 §3.1.3.1](0000-architecture.md#3131-schema-conventions-s1s15) |
 | S12, S13 | Identical `outbox` DDL in every producer; `processed_events` in every consumer | DDL in [RFC 0000 §3.1.3.2](0000-architecture.md#3132-shared-tables--outbox-and-processed_events) |
 | S14 | Per-service Alembic history, explicit step, working `downgrade` on every migration | §3.1.1.12 |
 
@@ -247,10 +247,10 @@ The platform also carries the one constraint that is not a design choice: the la
 - **PLT-23 — A consumer group is named after the consuming component,** and that name is the `consumer_group` value in `processed_events`.
 - **PLT-24 — One JSON log line schema** (§3.1.1.11).
 - **PLT-25 — Keys are generated, never committed** (`make keys`, §3.1.1.12).
-- **PLT-26 — The event-type registry lives in `libs/common`.** One table maps `event_type` → topic, schema file and `event_version`. The outbox DDL carries no `event_version`, so the version is a property of code shared by the writer and the relay, not of the row.
-- **PLT-27 — A `libs/common` change ships by rebuilding every image that consumes it,** together, with `make up`; modules that carry a cross-service contract change expand/contract (§3.1.1.1, "Change propagation and rollout").
+- **PLT-26 — The event-type registry lives in `common`.** One table maps `event_type` → topic, schema file and `event_version`. The outbox DDL carries no `event_version`, so the version is a property of code shared by the writer and the relay, not of the row.
+- **PLT-27 — A `common` change ships by rebuilding every image that consumes it,** together, with `make up`; modules that carry a cross-service contract change expand/contract (§3.1.1.1, "Change propagation and rollout").
 
-##### 3.1.1.1. libs/common
+##### 3.1.1.1. common
 
 **Responsibility.** Shared, non-domain code that every service imports so a cross-cutting convention has one implementation: JWT verification and the claim model, the role and scope dependencies, configuration, structured logging, the RFC 9457 error handler, pagination, the async DB session, the `Idempotency-Key` mechanism, the event envelope and Avro serialisation, the outbox writer, the consumer base with `processed_events` dedupe, the Kafka producer wrapper, tracing and metrics setup, the Temporal client factory, the Celery app factory, the Redis helpers (cache, rate limiter), the service-token client, health checks, and the `DomainEnum` / `DomainEnumText` pair. It is a package (`smartretail_common`) installed into every image's shared base layer ([archive/0000 §6.3](archive/0000-system-architecture.md#63-deployment-strategy)).
 
@@ -259,7 +259,7 @@ The platform also carries the one constraint that is not a design choice: the la
 **Module layout.**
 
 ```
-libs/common/smartretail_common/
+common/smartretail_common/
 ├── auth.py            # JWT verify (RS256, JWKS + mounted key), Principal, current_principal,
 │                      # optional_principal, require_roles, require_scope
 ├── service_token.py   # client-credentials token client for service→service calls, cached
@@ -295,7 +295,7 @@ libs/common/smartretail_common/
 | --- | --- | --- |
 | `subject` | `sub` | A user id (`uuid`) for a user token; `service:<name>` for a service token (e.g. `service:temporal-worker`, [archive/0002 §3.1.2](archive/0002-core-business-logic-and-workflows.md#312-api-changes)) |
 | `token_type` | derived | `user` or `service`, from the `sub` form |
-| `role` | `role` | `customer` \| `merchant` \| `admin` on a user token; absent on a service token. The set is `identity`'s `UserRole` ([0003](0003-identity-service.md)); `libs/common` treats it as an opaque string |
+| `role` | `role` | `customer` \| `merchant` \| `admin` on a user token; absent on a service token. The set is `identity`'s `UserRole` ([0003](0003-identity-service.md)); `common` treats it as an opaque string |
 | `merchant_id` | `merchant_id` | Present on a merchant's token; the scope every merchant-owned query filters by. Never taken from a body or query parameter ([RFC 0000 §6.2](0000-architecture.md#62-security-considerations)) |
 | `scopes` | `scope` | Space-separated scopes on a service token; empty on a user token |
 | `expires_at` | `exp` | Access tokens live 15 minutes ([0003](0003-identity-service.md)) |
@@ -457,7 +457,7 @@ The dedupe row and the effect are one transaction, which is why C4 and the dedup
 
 **Metrics setup.** `setup_metrics(app, settings)` installs the OTel meter provider with a Prometheus reader, mounts `/metrics`, and registers the standard instruments of §3.1.1.11 (HTTP server RED, HTTP client, DB pool, consumer, producer). Services add their own instruments through the same meter.
 
-**`DomainEnum` and `DomainEnumText` (S4).** The rule — enums are `text`, never a Postgres `ENUM` or a `CHECK`; the permitted set is a `DomainEnum` in the owning service's `app/models/enums.py`; strict on write, tolerant on read — and its rationale are defined in [RFC 0000 §3.1.3.1](0000-architecture.md#3131-schema-conventions-s1s15). `libs/common` supplies the mechanism only:
+**`DomainEnum` and `DomainEnumText` (S4).** The rule — enums are `text`, never a Postgres `ENUM` or a `CHECK`; the permitted set is a `DomainEnum` in the owning service's `app/models/enums.py`; strict on write, tolerant on read — and its rationale are defined in [RFC 0000 §3.1.3.1](0000-architecture.md#3131-schema-conventions-s1s15). `common` supplies the mechanism only:
 
 | Symbol | Contract |
 | --- | --- |
@@ -467,7 +467,7 @@ The dedupe row and the effect are one transaction, which is why C4 and the dedup
 | `render_item` hook | A helper each service's `alembic/env.py` passes to `context.configure(render_item=…, compare_type=True)`, so autogenerate renders `DomainEnumText` as `sa.Text()` rather than a constructor call missing its `enum_class` |
 | `widen_for_response(enum_class)` | A Pydantic `BeforeValidator` that widens a response field to `Enum \| str` for `passthrough` columns, so a tolerant ORM read is not cancelled by a strict response schema. Request schemas stay strict |
 
-**The R8 "no business rules" guard.** Two unit tests in `libs/common/tests/`, run in every service's CI job:
+**The R8 "no business rules" guard.** Two unit tests in `common/tests/`, run in every service's CI job:
 
 1. **Vocabulary scan.** Discover every `DomainEnum` subclass in `services/*/app/models/enums.py`, collect the union of their values, and walk the AST of every module under `smartretail_common` for string constants in that set. Any hit fails. An allow-list is supported but empty; adding to it is a review decision. This is the grep [archive/0006 §7](archive/0006-service-decomposition-and-data-model.md#7-test-plan) requires, made robust to formatting.
 2. **Import direction.** No module under `smartretail_common` imports `services.*` or any service package.
@@ -476,17 +476,17 @@ The remaining half of R8 — "does this helper encode a rule?" — is a review q
 
 **Configuration** (component). None beyond the table above.
 
-**Failure behaviour.** A `libs/common` defect is a platform-wide defect; the mitigation is that every service's CI runs the library's own tests, and that the library is versioned with the repository rather than published, so a change and its consumers are reviewed in one diff. Every helper that touches an optional dependency (Redis, the collector) fails open: a cache miss, an allowed request, a dropped span — never a failed request.
+**Failure behaviour.** A `common` defect is a platform-wide defect; the mitigation is that every service's CI runs the library's own tests, and that the library is versioned with the repository rather than published, so a change and its consumers are reviewed in one diff. Every helper that touches an optional dependency (Redis, the collector) fails open: a cache miss, an allowed request, a dropped span — never a failed request.
 
-**Change propagation and rollout (PLT-27).** The library is never deployed on its own. Each service's Dockerfile copies `libs/common` into its build and runs a regular (non-editable) `pip install`, so every image holds a **snapshot of the library taken at build time**. Editing `libs/common` changes nothing in a running container; a service sees the change only when its image is rebuilt and its container recreated. The package version stays `0.1.0` and services depend on it unpinned (`smartretail-common`), because the repository *is* the version.
+**Change propagation and rollout (PLT-27).** The library is never deployed on its own. Each service's Dockerfile copies `common` into its build and runs a regular (non-editable) `pip install`, so every image holds a **snapshot of the library taken at build time**. Editing `common` changes nothing in a running container; a service sees the change only when its image is rebuilt and its container recreated. The package version stays `0.1.0` and services depend on it unpinned (`smartretail-common`), because the repository *is* the version.
 
-| Step | Effect of a `libs/common` change |
+| Step | Effect of a `common` change |
 | --- | --- |
-| Edit `libs/common/…` | None at runtime. Running containers keep the copy they were built with |
-| `make dev-install` (local venv) | Installed editable (`pip install -e libs/common`), so tests and a local `uvicorn` see the change immediately; a running `uvicorn` still needs a restart |
+| Edit `common/…` | None at runtime. Running containers keep the copy they were built with |
+| `make dev-install` (local venv) | Installed editable (`pip install -e common`), so tests and a local `uvicorn` see the change immediately; a running `uvicorn` still needs a restart |
 | `make test` | Runs the library's suite and then every service's suite — the change is tested against all its consumers in one run |
 | `make lint` | mypy resolves `smartretail_common` from source (`mypy_path`), so a signature change surfaces in every consumer |
-| `make up` (`compose up -d --build --wait`) | The `COPY libs/common` layer is invalidated in every Dockerfile, so every consuming image rebuilds, and Compose recreates every container whose image changed. All services restart on the new library |
+| `make up` (`compose up -d --build --wait`) | The `COPY common` layer is invalidated in every Dockerfile, so every consuming image rebuilds, and Compose recreates every container whose image changed. All services restart on the new library |
 | `docker compose build <svc> && docker compose up -d <svc>` | Only `<svc>` gets the new library; every other service keeps the old one — a deliberate, temporary version skew |
 
 **Version skew is normal, so contract-bearing code changes expand/contract.** A rebuild is not atomic — Compose recreates containers one at a time, and a single service can be rebuilt on its own — so for some window two services run different copies of the library. That is harmless for modules whose behaviour stays inside one process (`logging.py`, `pagination.py`, `config.py`, `db.py`, `health.py`). It is not harmless for modules that implement a contract *between* services, because one side may be on the old copy:
@@ -589,7 +589,7 @@ Whether the outbox should gain `publish_attempts` / `last_error` columns so the 
 
 Inventory activities (`reserve_inventory`, `commit_inventory`, `release_inventory`, and the stock initialisation inside `sync_downstream`) call `inventory`'s internal routes with a service token whose `sub` is `service:temporal-worker` ([RFC 0006 §3.1.2.1](0006-inventory-service.md#3121-endpoints)); they never touch `inventory_db` (PLT-1). Activities owned by the workflow's own service call its service layer in-process with that service's role.
 
-**Hosting.** One container, one Python process, two `Worker` instances — one per task queue — sharing a client. Separate task queues mean a burst of orders cannot starve publishing and vice versa, and each can later move to its own container by configuration. The worker is deployed separately from the services it calls, so workflow code can be redeployed without restarting an API ([archive/0002 §6.3](archive/0002-core-business-logic-and-workflows.md#63-deployment-strategy)). Services that *start* workflows (`catalog`, `order`) do so through the `libs/common` Temporal client factory; they do not run workers.
+**Hosting.** One container, one Python process, two `Worker` instances — one per task queue — sharing a client. Separate task queues mean a burst of orders cannot starve publishing and vice versa, and each can later move to its own container by configuration. The worker is deployed separately from the services it calls, so workflow code can be redeployed without restarting an API ([archive/0002 §6.3](archive/0002-core-business-logic-and-workflows.md#63-deployment-strategy)). Services that *start* workflows (`catalog`, `order`) do so through the `common` Temporal client factory; they do not run workers.
 
 **Default activity policy.** Owning RFCs override per activity; these are the defaults every activity inherits.
 
@@ -727,7 +727,7 @@ Task names are fully qualified in code (`smartretail.<owner>.<task>`); the routi
 
 **Partitioning.** 3 partitions per topic with one broker. That is meaningful: it forces the per-key ordering design to be real and multi-partition consumer behaviour to be tested, which a single partition would hide (`0003-Q9`). Consumers scale horizontally up to the partition count.
 
-**Producer and consumer configuration** (set by `libs/common`, not by services).
+**Producer and consumer configuration** (set by `common`, not by services).
 
 | Client | Setting | Value |
 | --- | --- | --- |
@@ -915,7 +915,7 @@ Dashboards provide no alerting (§2.2).
 | Forbidden labels | `user_id`, `merchant_id`, `customer_id`, `order_id`, `product_id`, `variant_id`, `event_id`, `client_id`, `trace_id`, email, IP — anything unbounded. A link from a metric to a request is an **exemplar**, not a label |
 | Histograms | Latency buckets `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10` s by default; streaming endpoints add `30, 60, 120` |
 
-**Standard instruments** registered by `libs/common` in every component that has the relevant code path:
+**Standard instruments** registered by `common` in every component that has the relevant code path:
 
 | Metric | Type | Labels |
 | --- | --- | --- |
@@ -988,8 +988,7 @@ SmartRetail/
 │                                # the diagnosis walkthroughs, AI section and cost model
 ├── pyproject.toml               # workspace; ruff, mypy, pytest config
 ├── docs/                        # specification documents and RFCs
-├── libs/
-│   └── common/                  # smartretail_common (§3.1.1.1) + its tests
+├── common/                      # smartretail_common (§3.1.1.1) + its tests
 ├── services/
 │   ├── gateway/app/…            # no alembic — no store
 │   ├── identity/{app,alembic,tests}/
@@ -1069,20 +1068,20 @@ Expect roughly 8 GB for the full stack; running everything plus an IDE on 16 GB 
 
 A first-time reader runs `make keys && make up && make migrate && make topics && make seed`. `make up` runs `make keys` and `make topics` itself when their outputs are missing, so the three-command path of the README (`make up && make migrate && make seed`) still works.
 
-**Multi-stage Dockerfiles.** One per service and worker, sharing a base layer for `libs/common` ([archive/0000 §6.3](archive/0000-system-architecture.md#63-deployment-strategy)):
+**Multi-stage Dockerfiles.** One per service and worker, sharing a base layer for `common` ([archive/0000 §6.3](archive/0000-system-architecture.md#63-deployment-strategy)):
 
 ```dockerfile
-# ---- base: interpreter + libs/common, shared by every image (cached once)
+# ---- base: interpreter + common, shared by every image (cached once)
 FROM python:3.12-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN useradd --uid 10001 --create-home app
-COPY libs/common /src/libs/common
-RUN pip install --no-cache-dir /src/libs/common
+COPY common /src/common
+RUN pip install --no-cache-dir /src/common
 
 # ---- builder: the service's dependencies into a venv
 FROM base AS builder
 COPY services/<svc>/pyproject.toml /src/services/<svc>/
-RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir /src/libs/common /src/services/<svc>
+RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir /src/common /src/services/<svc>
 
 # ---- runtime: venv + code, non-root
 FROM python:3.12-slim AS runtime
@@ -1112,7 +1111,7 @@ Worker images use the same stages with a different `CMD`. Images carry no secret
 
 The platform exposes no public business endpoint. Its interfaces are internal: the library API services import, the event envelope on the wire, the schema registration flow, the operational endpoints every component serves, and the names workers and services agree on.
 
-##### 3.1.2.1. libs/common public API
+##### 3.1.2.1. common public API
 
 What a service may import. Anything not listed is private to the package and may change without notice.
 
@@ -1151,7 +1150,7 @@ The envelope's fields and meaning are defined once in [RFC 0000 §3.1.2.4](0000-
 | Value | Confluent Avro: magic byte, schema id, then one Avro record containing the envelope fields and a typed `payload` record |
 | Headers | `traceparent` (and `tracestate` if present), `event_id`, `event_type`, `producer` — duplicated from the envelope so a tool can filter without deserialising |
 
-Each topic's schema is the shared envelope fields from `libs/common/events/schemas/envelope.avsc`, expanded by the registration script, plus that topic's payload record:
+Each topic's schema is the shared envelope fields from `common/events/schemas/envelope.avsc`, expanded by the registration script, plus that topic's payload record:
 
 ```json
 {
@@ -1177,7 +1176,7 @@ Each topic's schema is the shared envelope fields from `libs/common/events/schem
 ##### 3.1.2.3. Avro schema registration flow
 
 ```
- developer edits libs/common/events/schemas/<topic>.avsc
+ developer edits common/events/schemas/<topic>.avsc
         │
         ▼
  CI: scripts/topics.py --check
@@ -1276,7 +1275,7 @@ Every key the platform writes, with its TTL. A key pattern not in this table doe
 | Pattern | DB | TTL | Written by | Use |
 | --- | --- | --- | --- | --- |
 | `rl:{scope}:{identifier}:{window_start}` | 0 | The rule's window — 60 s for per-minute rules, 3600 s for per-hour rules (PLT-10) | `gateway`, `notification` (ack), `assistant` | Fixed-window rate-limit counters. `scope` is a rule name (`login_ip`, `login_email`, `orders_user`, `default_ip`, `search_ip`, `search_user`, `assistant_user`, `assistant_anon`, `generate_merchant`, `ack_client`); `identifier` is the IP hash, user id, email hash or `(user, client)` pair |
-| `idem:{user_id}:{key}` | 0 | 24 h | `order` via `libs/common.idempotency` | Idempotency fast path, ahead of the Postgres claim. Value: `{request_hash, status, body}` of a **completed** request only (PLT-19) |
+| `idem:{user_id}:{key}` | 0 | 24 h | `order` via `common.idempotency` | Idempotency fast path, ahead of the Postgres claim. Value: `{request_hash, status, body}` of a **completed** request only (PLT-19) |
 | `cache:products:{hash}` | 0 | 60 s | `catalog` | Browse query results, keyed by a hash of the full filter set; invalidated by the `catalog` consumer on `product.updated` |
 | `cache:inventory:{variant_id}` | 0 | 10 s | `inventory` | Availability — short, because stock is the fastest-moving fact in the system; also absorbs the assistant's live-hydration reads |
 | `nt:user:{user_id}` | 0 | — (Pub/Sub channel, not a stored key) | `notification` | Fan-out channel (C17). The message body carries `origin_client_id` and `scope`; the delivering replica filters per connection ([0007](0007-notification-service.md)) |
@@ -1359,20 +1358,20 @@ Ordered so that each platform piece exists before the first service that needs i
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
 | P1 | Repository skeleton, tooling, `.env.example`, Makefile, ruff + mypy config, pytest config | `make lint` and `make test` run against an empty suite | — |
-| P2 | `libs/common` core: settings base, async DB session, JSON logging with request-ID contextvar, problem-detail errors, pagination, `DomainEnum` and `DomainEnumText` with the `render_item` hook | Importable package, unit-tested. The S4 pair has tests for strict write, tolerant read, and the R8 vocabulary scan | P1 |
+| P2 | `common` core: settings base, async DB session, JSON logging with request-ID contextvar, problem-detail errors, pagination, `DomainEnum` and `DomainEnumText` with the `render_item` hook | Importable package, unit-tested. The S4 pair has tests for strict write, tolerant read, and the R8 vocabulary scan | P1 |
 | P3 | Compose `core`: Postgres 16 (pgvector image) with the database-per-service init script, roles, grants, healthchecks, named volume; `make keys` | `docker compose up postgres` healthy; databases and roles exist; a role cannot connect to another's database | P1 |
-| P4 | `libs/common` auth: RS256 verification with mounted key and JWKS refresh, `Principal`, `require_roles`, `optional_principal` | Unit tests for verify, expiry, tamper, wrong key, claim contents, dependency allow/deny/missing/malformed | P2 |
+| P4 | `common` auth: RS256 verification with mounted key and JWKS refresh, `Principal`, `require_roles`, `optional_principal` | Unit tests for verify, expiry, tamper, wrong key, claim contents, dependency allow/deny/missing/malformed | P2 |
 | P5 | Multi-stage Dockerfiles with the shared base layer; non-root; health checks | Every image builds; `make up-min` healthy | P3 |
 | P6 | Temporal + MinIO in Compose under `workflow`; `temporal-worker` skeleton; bucket init; connectivity smoke test | Temporal UI reachable; worker registers on both task queues; bucket exists | P5 |
-| P7 | `libs/common`: outbox model and writer, idempotency mechanism, service-token client and `require_scope`, Temporal client factory, default activity options | Unit-tested, importable | P2, P6 |
+| P7 | `common`: outbox model and writer, idempotency mechanism, service-token client and `require_scope`, Temporal client factory, default activity options | Unit-tested, importable | P2, P6 |
 | P8 | Worker binding test and PLT-1 wiring in `temporal-worker` | A worker can import each service's activities with that service's settings only | P7 |
 | P9 | Kafka (KRaft) + Schema Registry under `events`; `make topics` | Broker healthy; topics and DLQs exist; console produce/consume works | P5 |
-| P10 | Avro schemas for every topic in `libs/common/events/schemas/`, the envelope template (with `client_id` and `traceparent`), registration script and CI compatibility check | Registry holds every schema; compatibility `BACKWARD`; a v1 consumer reads a v2 record and vice versa | P9 |
-| P11 | `libs/common` events: envelope, request context with `client_id`, Avro serde, producer wrapper, consumer base with dedupe, retry, pause and DLQ | Unit-tested | P10 |
+| P10 | Avro schemas for every topic in `common/events/schemas/`, the envelope template (with `client_id` and `traceparent`), registration script and CI compatibility check | Registry holds every schema; compatibility `BACKWARD`; a v1 consumer reads a v2 record and vice versa | P9 |
+| P11 | `common` events: envelope, request context with `client_id`, Avro serde, producer wrapper, consumer base with dedupe, retry, pause and DLQ | Unit-tested | P10 |
 | P12 | `outbox-relay`: advisory lock, poll, `SKIP LOCKED` claim, produce, mark published, poison hold, metrics — **one topic end to end** | Crash-restart test shows no loss (G1) | P11 |
 | P13 | Relay widened to all five producer databases; `outbox_relay` grants in each producer's migration | Every outbox row reaches its topic | P12 |
 | P14 | OTel Collector, Jaeger, Prometheus, Grafana under `observability`; provisioning from `ops/` | All four UIs reachable | P5 |
-| P15 | `libs/common` tracing: FastAPI, SQLAlchemy, `httpx`, `redis` instrumentation; OTLP exporter; trace ID in the log formatter; gateway sets `X-Request-ID` to the trace ID | A gateway → catalog call is one trace with SQL spans | P14 |
+| P15 | `common` tracing: FastAPI, SQLAlchemy, `httpx`, `redis` instrumentation; OTLP exporter; trace ID in the log formatter; gateway sets `X-Request-ID` to the trace ID | A gateway → catalog call is one trace with SQL spans | P14 |
 | P16 | Trace context into and out of the outbox and envelope; producer and consumer spans (C11, PLT-6) | A trace spans producer and consumer | P15, P13 |
 | P17 | Temporal instrumentation — interceptor on client and worker | The trace reaches the workflow and its activities | P15, P6 |
 | P18 | Metrics: Prometheus reader, `/metrics` on every component, standard instruments; worker ops port; scrape config | Prometheus scrapes every target successfully | P15 |
@@ -1389,14 +1388,14 @@ Ordered so that each platform piece exists before the first service that needs i
 | Component | Milestone |
 | --- | --- |
 | Repository layout, Makefile, `.env.example`, `make keys` | M1 |
-| `libs/common` core — config, logging, errors, pagination, DB session, `DomainEnum`/`DomainEnumText`, R8 guard, auth and `require_roles` | M1 |
+| `common` core — config, logging, errors, pagination, DB session, `DomainEnum`/`DomainEnumText`, R8 guard, auth and `require_roles` | M1 |
 | PostgreSQL instance, init script, roles; Compose `core` profile; multi-stage Dockerfiles; `make up`/`migrate`/`seed`/`test`/`lint`/`fmt`/`reset` | M1 |
 | Temporal server + UI, `temporal-worker`, task queues, namespace, determinism and versioning rules | M2 |
 | MinIO and the media bucket | M2 |
-| `libs/common` outbox writer, idempotency mechanism (Postgres claim), service-token client and `require_scope`, Temporal client factory | M2 |
+| `common` outbox writer, idempotency mechanism (Postgres claim), service-token client and `require_scope`, Temporal client factory | M2 |
 | Compose `workflow` profile | M2 |
 | Kafka + Schema Registry, topics, DLQs, Avro schemas and registration flow, `make topics` | M3 |
-| `libs/common` envelope, serde, producer, consumer base with dedupe/retry/DLQ/pause | M3 |
+| `common` envelope, serde, producer, consumer base with dedupe/retry/DLQ/pause | M3 |
 | `outbox-relay`, `outbox_relay` role, outbox sweep | M3 |
 | RabbitMQ, `celery-worker`, Beat, routing and retry defaults | M3 |
 | Redis and every Part A keyspace (rate limits, idempotency fast path, caches, notification pub/sub, tickets, presence, Celery results) | M3 |
@@ -1454,7 +1453,7 @@ Ordered so that each platform piece exists before the first service that needs i
 | DLQ without an automatic replay loop | A human decides when to replay | Automatic replay of a poison message is an infinite loop. The replay tool exists; the trigger is deliberate |
 | Compacted topics outlive dedupe retention | A full replay can re-deliver an event whose dedupe row was swept | Handlers of compacted topics are required to be idempotent by state; the replay test exercises it |
 | Single-node Kafka, Redis, Mongo, Temporal; in-memory Jaeger | No replication; restarts pause pipelines or lose trace history | Local environment by design; every one is a configuration change, none a design decision that blocks scaling |
-| A shared `libs/common` package | A change there touches every service; it can grow into a hidden monolith | Restricted by rule to non-domain concerns (R8), with a vocabulary scan and an import-direction test; any business rule that appears in it is a review failure |
+| A shared `common` package | A change there touches every service; it can grow into a hidden monolith | Restricted by rule to non-domain concerns (R8), with a vocabulary scan and an import-direction test; any business rule that appears in it is a review failure |
 | Limit/offset pagination | Deep offsets scan; concurrent inserts can shift a page | Pages are shallow and heavily filtered. Cursor pagination is additive when a path needs it |
 | Explicit migrations | One more command in the bring-up | Prevents replica races and makes schema changes visible |
 
@@ -1476,7 +1475,7 @@ Ordered so that each platform piece exists before the first service that needs i
 | Q-PLT-3 | Is PLT-6 (`outbox.traceparent`, `outbox.actor_id`, envelope `traceparent`) accepted into RFC 0000? | Proposed. Without it traces join by ID but lose parent/child structure across Kafka, and the envelope's `actor_id` has no source column | Before the relay is built |
 | Q-PLT-4 | Are 30 days of `processed_events` (PLT-17) and 7 days of published outbox rows (PLT-18) the right retentions? | Yes for local use. Dedupe must outlive the longest *time-based* topic retention (7 days) with margin; compacted topics are covered by state-idempotent handlers | Part A review |
 | Q-PLT-5 | Does analytics need a Mongo replica set for transactional dedupe? | Owned by [0008](0008-analytics-service.md); the Compose change is ready (§3.1.3.6) | Before the analytics consumer is built |
-| Q-PLT-6 | Should each image record the `libs/common` git SHA at build time and report it on `/health`, so version skew (PLT-27) is visible? | Not yet — `make up` rebuilds every consumer together, so skew lasts only as long as a deliberate single-service rebuild | Part A review |
+| Q-PLT-6 | Should each image record the `common` git SHA at build time and report it on `/health`, so version skew (PLT-27) is visible? | Not yet — `make up` rebuilds every consumer together, so skew lasts only as long as a deliberate single-service rebuild | Part A review |
 
 ---
 
@@ -1535,8 +1534,8 @@ Ordered so that each platform piece exists before the first service that needs i
 - Until PLT-6 is accepted, traces cross Kafka by trace ID only, without parent/child linkage.
 - Worker processes hold more than one service's credentials (PLT-1, Q-PLT-1).
 - A poison outbox row stalls its aggregate until fixed (PLT-4).
-- The implemented Dockerfiles (`services/*/Dockerfile`) do not yet use the shared `base` stage shown in §3.1.1.12: each copies `libs/common` into its own builder stage and installs it in the same `RUN` as the service's dependencies, so any `libs/common` change reinstalls every third-party dependency of every image.
-- The `libs/common` version is fixed at `0.1.0`, so nothing in a running container says which copy of the library it was built with (Q-PLT-6).
+- The implemented Dockerfiles (`services/*/Dockerfile`) do not yet use the shared `base` stage shown in §3.1.1.12: each copies `common` into its own builder stage and installs it in the same `RUN` as the service's dependencies, so any `common` change reinstalls every third-party dependency of every image.
+- The `common` version is fixed at `0.1.0`, so nothing in a running container says which copy of the library it was built with (Q-PLT-6).
 
 ---
 
@@ -1644,8 +1643,8 @@ Ordered so that each platform piece exists before the first service that needs i
 
 - **One `docker-compose.yml`** at the repository root with the five profiles of §3.1.1.12. `make up` runs `core` + `workflow` + `events`; `make up-all` runs every profile (PLT-20).
 - **One Makefile** as the single entry point (§3.1.1.12).
-- **Multi-stage Dockerfiles**, non-root, one per service and worker, sharing a base layer for `libs/common`.
-- **`libs/common` changes** — reach a service only through a rebuild of its image; rebuild every consumer together with `make up`, and change contract-bearing modules backward-compatibly first (PLT-27, §3.1.1.1).
+- **Multi-stage Dockerfiles**, non-root, one per service and worker, sharing a base layer for `common`.
+- **`common` changes** — reach a service only through a rebuild of its image; rebuild every consumer together with `make up`, and change contract-bearing modules backward-compatibly first (PLT-27, §3.1.1.1).
 - **Configuration** is twelve-factor, environment-only, validated at startup; a missing variable fails the container immediately.
 - **Database provisioning** — the Postgres init script creates every database with a dedicated role, granted only on its own database, plus Temporal's two databases and the relay role.
 - **Migrations** — per service, explicit, never on startup, every one with a working `downgrade`; `alembic check` in CI.
@@ -1665,12 +1664,12 @@ Ordered so that each platform piece exists before the first service that needs i
 
 **Unit** — no I/O.
 
-- `libs/common` auth: sign and verify, expiry rejection, signature-tamper rejection, wrong-key rejection, unknown `kid` triggers a JWKS refresh then rejects, claim contents mapped into `Principal`.
+- `common` auth: sign and verify, expiry rejection, signature-tamper rejection, wrong-key rejection, unknown `kid` triggers a JWKS refresh then rejects, claim contents mapped into `Principal`.
 - `require_roles`: allow, deny, missing token, malformed token; service token rejected on a user route. `require_scope`: user token rejected on an internal route; wrong scope → `403`.
 - Problem-detail serialisation for every `DomainError` subclass, validation `violations[]`, and the generic `500` carrying no exception text.
 - Pagination: default, limit ceiling clamped at 100, negative values rejected.
 - `DomainEnum`/`DomainEnumText`: strict write (unknown value raises, surfacing as `StatementError` with `UnknownEnumValueError` on `.orig`, and no row is written); tolerant read for `passthrough`, `fallback` and `raise`; `render_item` renders `sa.Text()`.
-- **R8**: the vocabulary scan over `libs/common` returns nothing; no module imports `services.*`.
+- **R8**: the vocabulary scan over `common` returns nothing; no module imports `services.*`.
 - Idempotency: key canonicalisation, request hashing (key order and whitespace do not change the hash), same-key-different-body detection, fast-path replay only for completed entries.
 - Envelope construction, correlation propagation, and Avro round-trip for every topic schema.
 - Outbox helper: unknown `event_type` rejected; payload invalid against its schema rejected at write; `client_id`, `actor_id`, `traceparent` taken from context.
@@ -1754,7 +1753,7 @@ Ordered so that each platform piece exists before the first service that needs i
 
 ## 8. Impact Analysis
 
-**On every service.** Each service imports `libs/common` for auth, config, logging, errors, pagination and its DB session, so its own code is its domain. Each producer gains an `outbox` and grants the relay on it; each consumer gains `processed_events` and a class on the consumer base; each gains a `/metrics` endpoint and an OTLP exporter by calling two setup functions. Behavioural changes a service author must know about are in §3.1.4.
+**On every service.** Each service imports `common` for auth, config, logging, errors, pagination and its DB session, so its own code is its domain. Each producer gains an `outbox` and grants the relay on it; each consumer gains `processed_events` and a class on the consumer base; each gains a `/metrics` endpoint and an OTLP exporter by calling two setup functions. Behavioural changes a service author must know about are in §3.1.4.
 
 **On other RFCs.**
 
@@ -1767,7 +1766,7 @@ Ordered so that each platform piece exists before the first service that needs i
 | Every consumer | Handlers of compacted topics are idempotent by state (§3.1.3.3) | Dedupe retention is shorter than compaction's horizon |
 | [0009 assistant](0009-assistant-service.md) | `budget:*` keyspace, `celery-worker-ai`, `assistant` queue | The keyspace and worker are platform; the budget rules are 0009's |
 
-**On effort.** The platform is front-loaded: the `libs/common` core and the local environment before the first service, Temporal and MinIO before the sagas, and the event backbone with the observability stack as the heaviest single block. The action plan's ordering is the mitigation — P12 proves the whole event path on one topic before P13 widens it, and observability (P14–P19) lands early enough to debug everything after it.
+**On effort.** The platform is front-loaded: the `common` core and the local environment before the first service, Temporal and MinIO before the sagas, and the event backbone with the observability stack as the heaviest single block. The action plan's ordering is the mitigation — P12 proves the whole event path on one topic before P13 widens it, and observability (P14–P19) lands early enough to debug everything after it.
 
 **Risks.**
 
@@ -1780,13 +1779,13 @@ Ordered so that each platform piece exists before the first service that needs i
 | Consumer idempotency implemented shallowly and only failing on replay | Medium | High | The replay test (G3) is an acceptance criterion, not an optional extra |
 | Trace context silently dropped across Kafka, Temporal or Celery, leaving fragmented traces | Medium | Medium | G5 is asserted programmatically against the Jaeger API; PLT-6 persists context across the outbox gap |
 | Relay reordering an aggregate's events across instances | Medium | High | PLT-2 advisory lock; the ordering test runs across a hand-over |
-| `libs/common` accumulating domain logic and becoming a hidden monolith | Medium | Medium | R8 scan and import-direction test in CI; review check at every design review |
+| `common` accumulating domain logic and becoming a hidden monolith | Medium | Medium | R8 scan and import-direction test in CI; review check at every design review |
 | Event schema churn breaking consumers | Medium | Medium | Registry with `BACKWARD` compatibility; additive-only changes; producers cannot auto-register |
 | A worker task reaching another service's database | Low | High | PLT-1 binding test |
 | Gateway buffering silently degrading SSE into delayed delivery | Medium | Medium | Owned by [0002](0002-gateway-service.md), which tests it by measurement; the platform's part is that streaming spans stay open |
 | Laptop cannot run the full stack for the review | Medium | High | Profiles from the start; observability off by default; the review runs the profiles each walkthrough needs |
 
-**On reviewers.** A review of the platform should be able to check: an event survives a relay crash; replaying a topic changes nothing; a poison message does not stop the pipeline; one checkout is one trace across five components; every component has `/metrics` and a dashboard panel; `libs/common` contains no domain vocabulary; each of Part A §6's flows can be diagnosed from a symptom; and the whole stack comes up from a cold clone.
+**On reviewers.** A review of the platform should be able to check: an event survives a relay crash; replaying a topic changes nothing; a poison message does not stop the pipeline; one checkout is one trace across five components; every component has `/metrics` and a dashboard panel; `common` contains no domain vocabulary; each of Part A §6's flows can be diagnosed from a symptom; and the whole stack comes up from a cold clone.
 
 ---
 

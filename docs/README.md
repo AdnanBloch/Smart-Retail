@@ -20,7 +20,7 @@ configuration, observability, security, and tests. Read 0000 first.
 | # | RFC | Covers | Status |
 | --- | --- | --- | --- |
 | 0000 | [System Architecture](rfcs/0000-architecture.md) | Whole platform: service inventory and the ownership test, boundary rules R1–R8, decisions A1–A14, critical flows, API conventions, event catalogue and envelope, schema conventions S1–S15, shared `outbox`/`processed_events` tables, table index, ownership map | **DRAFT** |
-| 0001 | [Platform & Shared Infrastructure](rfcs/0001-platform-and-shared-infrastructure.md) | `libs/common`, `outbox-relay`, `temporal-worker`, `celery-worker`, `indexer-worker` runtime, Kafka + Schema Registry, RabbitMQ, Redis, MinIO, Temporal, the observability stack, Compose, Makefile | **DRAFT** |
+| 0001 | [Platform & Shared Infrastructure](rfcs/0001-platform-and-shared-infrastructure.md) | `common`, `outbox-relay`, `temporal-worker`, `celery-worker`, `indexer-worker` runtime, Kafka + Schema Registry, RabbitMQ, Redis, MinIO, Temporal, the observability stack, Compose, Makefile | **DRAFT** |
 | 0002 | [`gateway` Service](rfcs/0002-gateway-service.md) | Routing, early JWT rejection, correlation IDs, CORS, rate limiting, SSE proxying, aggregated docs | **DRAFT** |
 | 0003 | [`identity` Service](rfcs/0003-identity-service.md) | Users, credentials, roles, merchant profiles, tokens and sessions, JWKS | **DRAFT** |
 | 0004 | [`catalog` Service](rfcs/0004-catalog-service.md) | Products, variants, categories, media, audit trail, the product publishing workflow | **DRAFT** |

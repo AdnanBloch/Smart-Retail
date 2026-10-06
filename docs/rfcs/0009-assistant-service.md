@@ -263,7 +263,7 @@ Two rejected candidates land here: **`search`** (no owned state — the index is
 | R5 / A13 | Hydration calls are *live lookups* ([RFC 0000 §3.1.3.5](0000-architecture.md#3135-cross-boundary-reference-kinds)) and degrade rather than block (AST-2) |
 | R6 / A14 | `product_status`, `price`, `currency`, `merchant_id`, `category_id` on chunks are projections; displayed price is live |
 | R7 | Search keeps serving from local chunks when `catalog` or `inventory` is down |
-| R8 | Chunking, fusion, prompts and budgets live in the service, never in `libs/common` |
+| R8 | Chunking, fusion, prompts and budgets live in the service, never in `common` |
 | A4 / A5 | Every request re-verifies the RS256 JWT locally; the gateway is not trusted |
 | A6 | Async throughout — FastAPI, SQLAlchemy async, `asyncpg`, async provider clients |
 | A7 | RFC 9457 problem details, including the `error` SSE event body |
@@ -1299,7 +1299,7 @@ Ordered so retrieval quality is measurable before it is optimised (the evaluatio
 | AST-14 | Metric names and labels | The sources name the quantities, not the series |
 | AST-15 | Consumer group `assistant-indexer` | Needed for `processed_events.consumer_group` |
 | AST-16 | `prompt_templates` uniques with `NULLS NOT DISTINCT` | "Exactly one active" and "unique together" must hold when `content_type` is null |
-| AST-17 | `POST /generate/bulk` takes an `Idempotency-Key` (Redis `idem:` fast path via `libs/common`) | The API convention requires it for non-idempotent POSTs that create state; the durable claim is AST-Q4 |
+| AST-17 | `POST /generate/bulk` takes an `Idempotency-Key` (Redis `idem:` fast path via `common`) | The API convention requires it for non-idempotent POSTs that create state; the durable claim is AST-Q4 |
 | AST-18 | Configuration variable names beyond the five named in the source | Values come from the source decisions |
 
 **Why the assistant is one service.** Retrieval and generation share the chunk store (the chunk text *is* the generation context), the embedding client, and the conversation store. Split, every chat turn gains a synchronous network hop for no ownership gain — neither half owns a fact the other does not also need. The ownership test yields one service with two routers (D12, closing Q1 (0000)).

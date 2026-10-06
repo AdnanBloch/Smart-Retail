@@ -7,10 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 FROM base AS builder
-COPY libs/common /src/libs/common
+COPY common /src/common
 COPY services/identity/pyproject.toml /src/services/identity/pyproject.toml
 RUN python -m venv /venv \
- && /venv/bin/pip install --no-cache-dir /src/libs/common /src/services/identity
+ && /venv/bin/pip install --no-cache-dir /src/common /src/services/identity
 
 FROM base AS runtime
 RUN useradd --uid 10001 --create-home app

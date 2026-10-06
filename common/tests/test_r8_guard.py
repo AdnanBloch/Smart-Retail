@@ -1,12 +1,12 @@
-"""R8: libs/common holds no domain vocabulary and never imports a service."""
+"""R8: common holds no domain vocabulary and never imports a service."""
 
 import ast
 from pathlib import Path
 
 LIB = Path(__file__).resolve().parents[1] / "smartretail_common"
-REPO = Path(__file__).resolve().parents[3]
+REPO = Path(__file__).resolve().parents[2]
 
-# Values allowed to appear in libs/common despite matching a service enum,
+# Values allowed to appear in common despite matching a service enum,
 # each with a reason. Keep this empty unless a reviewer agrees.
 ALLOW_LIST: dict[str, str] = {
     # RFC 0000 I4: merchant_id is the subject of a merchant token; the
@@ -17,7 +17,7 @@ ALLOW_LIST: dict[str, str] = {
 
 def _service_enum_values() -> set[str]:
     values: set[str] = set()
-    for path in REPO.glob("services/*/app/domain/enums.py"):
+    for path in REPO.glob("services/*/app/**/enums.py"):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and any(
@@ -45,7 +45,7 @@ def test_no_service_vocabulary_in_common() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and node.value in vocabulary:
                 hits.append(f"{path.name}:{node.lineno} {node.value!r}")
-    assert not hits, f"domain vocabulary found in libs/common: {hits}"
+    assert not hits, f"domain vocabulary found in common: {hits}"
 
 
 def test_common_never_imports_services() -> None:
@@ -61,3 +61,8 @@ def test_common_never_imports_services() -> None:
                 f"{path.name}: {n}" for n in names if n.split(".")[0] in {"app", "services"}
             ]
     assert not offenders, offenders
+
+
+def test_guard_finds_service_vocabularies() -> None:
+    # If the enums glob stops matching, the guard above passes vacuously.
+    assert _service_enum_values(), "no service enums found; is the glob in sync with the layout?"

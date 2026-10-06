@@ -186,7 +186,7 @@ The process is multi-step, crosses service boundaries (`catalog`, `inventory`, t
 | R5 / A13 | Sync calls only where the caller cannot proceed | `order → catalog` at creation is **the one such call in the system** |
 | R6 / A14 | Data crossing a boundary is snapshotted | Line items store name, SKU, options and price as they were at purchase |
 | R7 | Serve reads you hold without others being up | Order reads need only `order_db`; JWTs verify locally (A4, A5) |
-| R8 | `libs/common` holds no business rule | The idempotency *mechanism* may be shared; the order rules and vocabularies live in `services/order` |
+| R8 | `common` holds no business rule | The idempotency *mechanism* may be shared; the order rules and vocabularies live in `services/order` |
 | A9 | Payments and carriers simulated behind an interface | `PaymentProvider`, `ShippingProvider`, deterministic fakes (§3.1.1.4) |
 | A10 / B11 | Transactional outbox for every state-change event | Every status or sub-state change and its outbox row commit together |
 | A12 | Temporal owns processes, Kafka owns facts, Celery owns one-shot jobs | `OrderWorkflow` is the process; `order.*` are the facts; key sweeping is a Celery Beat task |
@@ -224,7 +224,7 @@ services/order/
 │   │   ├── idempotency.py       claim / replay / complete / release (B7)
 │   │   ├── snapshot.py          catalog lookup → OrderLineSnapshot
 │   │   ├── shipment_service.py  apply_carrier_update() — shared by webhook and admin route
-│   │   └── outbox.py            order-event payload builders (envelope from libs/common)
+│   │   └── outbox.py            order-event payload builders (envelope from common)
 │   ├── providers/
 │   │   ├── payment.py           PaymentProvider protocol + FakePaymentProvider
 │   │   └── shipping.py          ShippingProvider protocol + FakeShippingProvider
@@ -731,7 +731,7 @@ Owned elsewhere but load-bearing for `order`: the gateway's order rate limit of 
 
 ##### 3.1.1.7. Observability
 
-**Metrics** (Prometheus via the OTel Collector, `/metrics`; names ORD-15). RED metrics for every route come from `libs/common`.
+**Metrics** (Prometheus via the OTel Collector, `/metrics`; names ORD-15). RED metrics for every route come from `common`.
 
 | Metric | Type | Labels | Answers |
 | --- | --- | --- | --- |
@@ -989,7 +989,7 @@ Ordered so that the order workflow has something real to reserve against — `in
 
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
-| O1 | `order` service skeleton, settings, Alembic with the S4 `render_item` hook; `0001_initial` | Migration to head; `alembic check` clean | `libs/common` outbox, idempotency and Temporal client helpers; service-token mint and verify ([RFC 0001](0001-platform-and-shared-infrastructure.md), [RFC 0003](0003-identity-service.md)) |
+| O1 | `order` service skeleton, settings, Alembic with the S4 `render_item` hook; `0001_initial` | Migration to head; `alembic check` clean | `common` outbox, idempotency and Temporal client helpers; service-token mint and verify ([RFC 0001](0001-platform-and-shared-infrastructure.md), [RFC 0003](0003-identity-service.md)) |
 | O2 | Domain: enums, `ORDER_/PAYMENT_/SHIPMENT_TRANSITIONS`, `transition()`, money | 67 illegal-pair tests and the structural tests green | O1 |
 | O3 | `OrderService.advance()` — version check, transition, history row, outbox row in one transaction | Rollback leaves no outbox row (G6) | O2 |
 | O4 | Idempotency: claim, replay, conflict, in-progress, mismatch, lease reclaim, release on dependency failure | Concurrent-duplicate test (G3) | O1 |

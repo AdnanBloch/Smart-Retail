@@ -9,7 +9,7 @@
 | **Supersedes** | The gateway content of [archive/0000-system-architecture.md](archive/0000-system-architecture.md), [archive/0001-foundation-and-core-services.md](archive/0001-foundation-and-core-services.md), [archive/0003-events-and-observability.md](archive/0003-events-and-observability.md), [archive/0004-retrieval-layer.md](archive/0004-retrieval-layer.md), [archive/0005-ai-assistant-and-streaming.md](archive/0005-ai-assistant-and-streaming.md), and [archive/0006-service-decomposition-and-data-model.md](archive/0006-service-decomposition-and-data-model.md) |
 | **Depends on** | [RFC 0000 — Architecture](0000-architecture.md) · [RFC 0001 — Platform and Shared Infrastructure](0001-platform-and-shared-infrastructure.md) · [RFC 0003 — `identity`](0003-identity-service.md) (token format, public key) · every upstream it routes to: [0004](0004-catalog-service.md), [0005](0005-order-service.md), [0006](0006-inventory-service.md), [0007](0007-notification-service.md), [0008](0008-analytics-service.md), [0009](0009-assistant-service.md) |
 
-> **Reading note.** This RFC specifies the `gateway` — the single public entry point at `:8000` — in full: its routing table, its early token rejection and coarse role checks, correlation and trace headers, `X-Client-Id` handling, CORS, rate limiting, SSE pass-through, aggregated OpenAPI, health, upstream timeouts, error normalisation and request size limits. It is the one service with no store, by deliberate exception to the ownership test. Cross-cutting rules — the ownership test, boundary rules R1–R8, the authentication/authorisation split, decisions A1–A14, API conventions and the event envelope — are defined once in [RFC 0000](0000-architecture.md) and are referenced here, not restated. Redis, the OTel stack and `libs/common` (JWT verification, problem details, logging) are hosted and specified in [RFC 0001](0001-platform-and-shared-infrastructure.md).
+> **Reading note.** This RFC specifies the `gateway` — the single public entry point at `:8000` — in full: its routing table, its early token rejection and coarse role checks, correlation and trace headers, `X-Client-Id` handling, CORS, rate limiting, SSE pass-through, aggregated OpenAPI, health, upstream timeouts, error normalisation and request size limits. It is the one service with no store, by deliberate exception to the ownership test. Cross-cutting rules — the ownership test, boundary rules R1–R8, the authentication/authorisation split, decisions A1–A14, API conventions and the event envelope — are defined once in [RFC 0000](0000-architecture.md) and are referenced here, not restated. Redis, the OTel stack and `common` (JWT verification, problem details, logging) are hosted and specified in [RFC 0001](0001-platform-and-shared-infrastructure.md).
 
 ---
 
@@ -174,11 +174,11 @@ It fails test 1 — it owns no state — and is a deliberate exception. Cross-cu
 | R4 — cross-service reads go through an API or event | The gateway reads nothing from any service except each upstream's `/openapi.json` and the identity JWKS, both public HTTP surfaces |
 | R5 — synchronous cross-service calls only where the caller cannot proceed | Proxying is not a cross-service call in the R5 sense — the gateway is on the client's request path, not a caller with a question of its own. It never calls two upstreams for one client request |
 | R7 — a service may not require another to be up to serve reads it has data for | Token verification is local, so `identity` being down does not stop the gateway admitting authenticated traffic |
-| R8 — `libs/common` contains no business rule | The gateway uses `libs/common` for JWT verification, the claim model, problem details, logging and tracing. The route table lives in `services/gateway/`, not in `libs/common` |
+| R8 — `common` contains no business rule | The gateway uses `common` for JWT verification, the claim model, problem details, logging and tracing. The route table lives in `services/gateway/`, not in `common` |
 | A4 — RS256; `identity` is the only signer | The gateway holds the public key only |
 | A5 — every service re-verifies the token; the gateway rejects early and is not trusted | Defines the gateway's authorisation role. It forwards `Authorization` unchanged and never substitutes its own assertion (GW-5). (Archive 0001 recorded the same decision as its local A6.) |
 | A6 — async all the way down | `async def` handlers; `httpx.AsyncClient` for upstream calls; `redis.asyncio` for counters |
-| A7 — RFC 9457 problem details everywhere | Every response the gateway originates is a problem detail produced by the shared `libs/common` handler (GW-11) |
+| A7 — RFC 9457 problem details everywhere | Every response the gateway originates is a problem detail produced by the shared `common` handler (GW-11) |
 | A8 — `X-Request-ID` in, `traceparent` out | The gateway is where the correlation ID is generated and first echoed |
 | C11, C12 — trace context over HTTP; the trace ID replaces the request ID | The gateway creates the root server span and makes `X-Request-ID` an alias of its trace ID (GW-10) |
 | C13 — Redis for gateway rate limiting | The only reason the gateway talks to Redis |
@@ -203,7 +203,7 @@ services/gateway/
 │   │   └── env.py         # GatewaySettings (pydantic-settings), validated at startup
 │   ├── infrastructure/
 │   │   ├── logger.py      # JSON logging setup
-│   │   └── security.py    # auth policy over libs/common JWT verification; service-token detection
+│   │   └── security.py    # auth policy over common JWT verification; service-token detection
 │   ├── middleware/
 │   │   ├── correlation.py # X-Request-ID / traceparent (GW-10)
 │   │   ├── size_limit.py  # 413 (GW-14)
@@ -272,7 +272,7 @@ services/gateway/
 | `RouteRule` | `prefix`, `methods`, `upstream`, `auth_policy`, `roles` (set, may be empty), `rate_classes` (list), `timeout_class`, `body_limit`, `stream` (bool), `public_docs` (bool) | Prefixes are unique; the table is checked at startup for overlapping rules with different upstreams (fails the container); every `upstream` names a configured upstream |
 | `Upstream` | `name`, `base_url`, `httpx.AsyncClient` (pooled) | One client per upstream; an empty `base_url` means "not deployed" (→ `503`) |
 | `RateClass` | `scope`, `limit`, `window_seconds`, `identifier` | `window_seconds ∈ {60, 3600}`; `identifier ∈ {ip, email_hash, user, user_client}` |
-| `EdgeCaller` | `sub`, `role`, `merchant_id?`, `exp`, `is_service` | Built from the verified token by `libs/common`; used for coarse checks, rate-limit identifiers and log fields only, never forwarded |
+| `EdgeCaller` | `sub`, `role`, `merchant_id?`, `exp`, `is_service` | Built from the verified token by `common`; used for coarse checks, rate-limit identifiers and log fields only, never forwarded |
 
 **Configuration vocabularies** (code constants, not persisted, listed with every value):
 
@@ -411,7 +411,7 @@ Twelve-factor, environment only, validated at startup by `pydantic-settings`; a 
 | `RL_CHAT_PER_USER_PER_MIN` | `10` | |
 | `RL_GENERATE_PER_MERCHANT_PER_HOUR` | `20` | |
 | `RL_NOTIF_ACK_PER_CLIENT_PER_MIN` | `12` | |
-| `OTEL_SERVICE_NAME` | `gateway` | Standard OTel variables, consumed by the `libs/common` tracing setup |
+| `OTEL_SERVICE_NAME` | `gateway` | Standard OTel variables, consumed by the `common` tracing setup |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4317` | |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | 100% locally; turning it down is a variable (archive 0003 Q5) |
 | `LOG_LEVEL` | `INFO` | |
@@ -438,7 +438,7 @@ Twelve-factor, environment only, validated at startup by `pydantic-settings`; a 
 | `gateway_openapi_upstream_fetch_failures_total` | counter | `upstream` | Documentation degradation |
 | `gateway_jwks_refresh_total` | counter | `outcome` (`ok` \| `error`) | Key-refresh health, when JWKS mode is on |
 
-**Spans.** FastAPI and httpx auto-instrumentation from `libs/common`:
+**Spans.** FastAPI and httpx auto-instrumentation from `common`:
 
 | Span | Kind | Key attributes | Notes |
 | --- | --- | --- | --- |
@@ -449,7 +449,7 @@ Twelve-factor, environment only, validated at startup by `pydantic-settings`; a 
 
 For streams, **both the server and client spans end when the stream ends, not at first byte**, with span event `first_byte` at the first relayed body byte and attributes `smartretail.stream.bytes` and `smartretail.stream.initiator`. Request and response bodies are never recorded; headers are allow-listed (`Content-Type`, `Content-Length`, `Accept`, `User-Agent`, `X-Request-ID`, `Idempotency-Key` presence only); `Authorization`, `Cookie` and the stream ticket are never recorded (GW-18).
 
-**Log fields.** One JSON access-log line per request, via the `libs/common` formatter: `timestamp`, `level`, `service=gateway`, `trace_id`, `request_id` (equal to `trace_id`), `client_request_id`, `method`, `route`, `path` (ticket redacted), `upstream`, `status`, `origin`, `duration_ms`, `bytes_in`, `bytes_out`, `stream`, `stream_initiator`, `user_id` (`sub` or null), `role`, `client_ip`, `client_id_present`, `ratelimit_scope`, `ratelimit_outcome`, `error_type` (problem `type` when the gateway originated the response). Never: `Authorization`, bodies, the login email (not even hashed), the ticket.
+**Log fields.** One JSON access-log line per request, via the `common` formatter: `timestamp`, `level`, `service=gateway`, `trace_id`, `request_id` (equal to `trace_id`), `client_request_id`, `method`, `route`, `path` (ticket redacted), `upstream`, `status`, `origin`, `duration_ms`, `bytes_in`, `bytes_out`, `stream`, `stream_initiator`, `user_id` (`sub` or null), `role`, `client_ip`, `client_id_present`, `ratelimit_scope`, `ratelimit_outcome`, `error_type` (problem `type` when the gateway originated the response). Never: `Authorization`, bodies, the login email (not even hashed), the ticket.
 
 **Dashboards.** The gateway panel set in the provisioned Grafana "platform overview" and "per-service RED" dashboards ([RFC 0001](0001-platform-and-shared-infrastructure.md)): edge RPS and error rate by upstream and `origin`; edge vs upstream p50/p95/p99; auth rejections by reason; rate-limit decisions by scope with `failed_open` highlighted; active SSE streams by upstream; SSE time-to-first-byte p95; disconnects by initiator.
 
@@ -595,7 +595,7 @@ traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 }
 ```
 
-`scope` names the class but never the identifier (no IP, no email hash). `Retry-After` is always present (archive 0003 §3.1.4). The `type` base URI is the platform error base defined in `libs/common`.
+`scope` names the class but never the identifier (no IP, no email hash). `Retry-After` is always present (archive 0003 §3.1.4). The `type` base URI is the platform error base defined in `common`.
 
 <a id="error-normalisation"></a>**Error normalisation — responses the gateway originates.** All are RFC 9457 with the standard fields `{type, title, status, detail, instance, request_id}` from the shared handler (A7), and all carry `X-Request-ID`, `traceparent` and CORS headers.
 
@@ -719,10 +719,10 @@ Ordered so that the proxy core is proven end to end before edge policies are lay
 
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
-| GW-T1 | Service skeleton, `GatewaySettings`, Dockerfile (multi-stage, non-root), Compose entry on `:8000` under the `core` profile | Container healthy; `/health` and `/health/ready` answer | `libs/common` settings and logging ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
+| GW-T1 | Service skeleton, `GatewaySettings`, Dockerfile (multi-stage, non-root), Compose entry on `:8000` under the `core` profile | Container healthy; `/health` and `/health/ready` answer | `common` settings and logging ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
 | GW-T2 | Route table and matcher; streamed forwarding with header hygiene; one pooled client per upstream; `404`/`405` | `identity` and `catalog` reachable through `:8000`; route-table test enumerates every rule | GW-T1 |
 | GW-T3 | Correlation middleware: `X-Request-ID` generation and echo on every response, including gateway-originated errors | Every response carries `X-Request-ID`; the same id appears in gateway and upstream logs | GW-T2 |
-| GW-T4 | Auth policies (`public`, `optional`, `bearer`, `ticket`, `hmac`, `blocked`) over `libs/common` verification; coarse role sets; service-token refusal; `X-User-*` stripping | Rejection-reason tests; GW-G3 direct-call tests | GW-T2, `identity` token issuance ([RFC 0003](0003-identity-service.md)) |
+| GW-T4 | Auth policies (`public`, `optional`, `bearer`, `ticket`, `hmac`, `blocked`) over `common` verification; coarse role sets; service-token refusal; `X-User-*` stripping | Rejection-reason tests; GW-G3 direct-call tests | GW-T2, `identity` token issuance ([RFC 0003](0003-identity-service.md)) |
 | GW-T5 | Upstream timeouts and error normalisation: `502`/`503`/`504`, non-problem `5xx` wrapping, pass-through of problem details | Fault-injection tests (stopped, slow, garbage upstream) | GW-T2 |
 | GW-T6 | CORS allow-list on all responses; preflight at the edge | Browser-origin tests, including CORS headers on `401` and `429` | GW-T3 |
 | GW-T7 | Request size limits (default, upload route), `413` | Oversize tests, chunked and `Content-Length` | GW-T2 |
@@ -786,7 +786,7 @@ Ordered so that the proxy core is proven end to end before edge policies are lay
 
 | Requirement | Hand-written FastAPI | Traefik / Kong / Envoy |
 | --- | --- | --- |
-| JWT verification sharing `libs/common` (one implementation, one claim model, one set of tests) | Direct import | A second implementation in a plugin or filter, drifting from the services' |
+| JWT verification sharing `common` (one implementation, one claim model, one set of tests) | Direct import | A second implementation in a plugin or filter, drifting from the services' |
 | Per-email login limit (needs the body) and per-`sub` limits (needs verified claims) | A few lines after auth | Custom plugin (Lua / Go / Wasm) or not expressible |
 | Strip-don't-reject for `X-Client-Id` | One middleware | Custom plugin |
 | RFC 9457 bodies for every edge error, from the shared handler | Shared handler | Per-error templating in proxy configuration |
@@ -822,7 +822,7 @@ Everything the platform needs is on the rows where the hand-written gateway wins
 
 | # | Question | Current position | Needs a decision by |
 | --- | --- | --- | --- |
-| Q5 *(archive 0000; the same question as archive 0001 Q1)* | Should the gateway stay hand-written, or move to Traefik/Kong (or Envoy)? | **Hand-written** (GW-20). Rate limiting needs the body and verified claims; SSE needs a terminal error frame; JWT verification must share `libs/common`. Revisit on the triggers in §3.2: TLS required, measured edge overhead dominating the hot path, or genuinely declarative routing rules | Decided here |
+| Q5 *(archive 0000; the same question as archive 0001 Q1)* | Should the gateway stay hand-written, or move to Traefik/Kong (or Envoy)? | **Hand-written** (GW-20). Rate limiting needs the body and verified claims; SSE needs a terminal error frame; JWT verification must share `common`. Revisit on the triggers in §3.2: TLS required, measured edge overhead dominating the hot path, or genuinely declarative routing rules | Decided here |
 | GW-Q1 | Should rate limiting upgrade from fixed window to GCRA? | Not now. Fixed window is adequate for abuse and spend controls. GCRA is a one-key, one-script change behind the same `rl:*` pattern if boundary bursts ever matter | Revisit if a limit is observed being gamed at the boundary |
 | GW-Q2 | Is a circuit breaker needed per upstream? | Not built. With a 2s connect timeout, a 10s read timeout and per-upstream pools, a dead upstream fails fast and cannot starve others. A breaker adds per-replica state and a half-open probe policy for little gain at seven upstreams | Revisit if slow (not dead) upstream failures are seen exhausting a pool |
 | GW-Q3 | On Redis failure, fail open entirely, or fall back to an in-process per-replica limiter? | Fail open. A per-replica fallback multiplies every limit by the replica count and behaves differently from the normal path; its value is narrow (the login class during a Redis outage) | Revisit if login brute-force during Redis outages becomes a concern |
@@ -842,12 +842,12 @@ Everything the platform needs is on the rows where the hand-written gateway wins
 | FastAPI | 0.115.x | HTTP layer, operational endpoints, Swagger UI |
 | Uvicorn (`uvloop`, `httptools`) | 0.32.x | ASGI server; graceful shutdown |
 | httpx | 0.28.x | Upstream proxying with streamed request and response bodies; test client |
-| PyJWT (via `libs/common`) | 2.10.x | RS256 verification |
+| PyJWT (via `common`) | 2.10.x | RS256 verification |
 | Pydantic / pydantic-settings | 2.x | Settings validation |
 | `redis[hiredis]` | 5.x | Async Redis client for rate-limit counters |
 | OpenTelemetry SDK + FastAPI and httpx instrumentations | 1.28.x | Spans, context propagation |
 | `prometheus-client` | current | `/metrics` exposition |
-| `libs/common` | in-repo | JWT verification and claim model, problem-detail handler, JSON logging, tracing setup |
+| `common` | in-repo | JWT verification and claim model, problem-detail handler, JSON logging, tracing setup |
 | Redis | 7.4 | Rate-limit counters ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
 | OTel Collector | 0.112.x | Span and metric export target |
 
@@ -950,7 +950,7 @@ No `sse-starlette`: the gateway relays upstream bytes and never constructs an SS
 ### 6.3. Deployment strategy
 
 - **Compose.** One service, `gateway`, on `:8000`, in the `core` profile, with `depends_on` on nothing hard — it starts without upstreams or Redis and reports them in `/health/ready`'s informational block.
-- **Image.** Multi-stage Dockerfile, non-root user, sharing the `libs/common` base layer.
+- **Image.** Multi-stage Dockerfile, non-root user, sharing the `common` base layer.
 - **Keys.** The public key is mounted read-only from the gitignored key directory, or fetched from `identity`'s JWKS when `JWT_JWKS_URL` is set.
 - **Configuration.** Environment only, validated at startup; `*` in the CORS list, an overlapping route table, or an unloadable key fails the container loudly.
 - **No migrations**, so the gateway deploys and rolls back independently of every other service. Rolling back the gateway never touches data.
@@ -1016,7 +1016,7 @@ No `sse-starlette`: the gateway relays upstream bytes and never constructs an SS
 
 ## 8. Impact Analysis
 
-**On upstream services.** None need to implement CORS, rate limiting, correlation-ID generation or aggregated docs. Each must: mount its routes under its `/api/v1/...` prefix unchanged; produce RFC 9457 errors via `libs/common` (so the gateway relays rather than wraps them); re-verify the token and never read an identity header (A5, GW-5); propagate the inbound `traceparent` and `X-Request-ID`; and, for streaming services, rely on the gateway to relay bytes verbatim and to close their socket on client disconnect.
+**On upstream services.** None need to implement CORS, rate limiting, correlation-ID generation or aggregated docs. Each must: mount its routes under its `/api/v1/...` prefix unchanged; produce RFC 9457 errors via `common` (so the gateway relays rather than wraps them); re-verify the token and never read an identity header (A5, GW-5); propagate the inbound `traceparent` and `X-Request-ID`; and, for streaming services, rely on the gateway to relay bytes verbatim and to close their socket on client disconnect.
 
 **On clients.** One base URL; one error shape; `X-Request-ID` on every response for support correlation; `Retry-After` and `RateLimit-*` to back off correctly; `X-Client-Id` optional and never able to fail a request.
 
@@ -1047,7 +1047,7 @@ No `sse-starlette`: the gateway relays upstream bytes and never constructs an SS
 **RFC set**
 
 - [RFC 0000 — Architecture](0000-architecture.md): [surface map](0000-architecture.md#3121-surface-map), [API conventions](0000-architecture.md#3122-api-conventions), [auth split](0000-architecture.md#3114-authentication-and-authorisation-split), [A1–A14](0000-architecture.md#3115-cross-cutting-decisions-a1a14), [event envelope](0000-architecture.md#3124-event-envelope)
-- [RFC 0001 — Platform and Shared Infrastructure](0001-platform-and-shared-infrastructure.md) — `libs/common`, Redis keyspaces, OTel stack, Compose
+- [RFC 0001 — Platform and Shared Infrastructure](0001-platform-and-shared-infrastructure.md) — `common`, Redis keyspaces, OTel stack, Compose
 - [RFC 0003 — `identity`](0003-identity-service.md) — token format, JWKS, service tokens
 - [RFC 0007 — `notification`](0007-notification-service.md) — the notification SSE stream, stream tickets, `X-Client-Id` consumption
 - [RFC 0009 — `assistant`](0009-assistant-service.md) — the assistant SSE contract, token budgets

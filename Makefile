@@ -6,7 +6,7 @@ COMPOSE := docker compose --profile core
 VENV ?= .venv
 PY := $(abspath $(VENV))/bin/python
 STORE_SERVICES := identity catalog
-PACKAGES := libs/common services/identity services/catalog services/gateway
+PACKAGES := common services/identity services/catalog services/gateway
 TEST_PG := smartretail-test-pg
 TEST_PG_PORT := 55432
 
@@ -50,7 +50,7 @@ seed: ## Seed admin, demo accounts and categories (idempotent)
 	$(COMPOSE) run --rm --no-deps catalog python -m app.infrastructure.seed
 
 dev-install: ## Install every package and dev tool into $(VENV)
-	$(PY) -m pip install -q -e libs/common ./services/identity ./services/catalog ./services/gateway
+	$(PY) -m pip install -q -e common ./services/identity ./services/catalog ./services/gateway
 	$(PY) -m pip install -q "pytest>=8,<9" "pytest-asyncio>=0.24,<0.26" "ruff>=0.8,<0.9" "mypy>=1.13"
 
 test-db: ## Start a throwaway Postgres for integration tests (127.0.0.1:$(TEST_PG_PORT))

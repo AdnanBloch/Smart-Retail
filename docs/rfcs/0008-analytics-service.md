@@ -150,7 +150,7 @@ The design has four moving parts:
 | `counters`, `daily_metrics`, `product_stats`, `failure_stats`, `raw_events`, `assistant_conversions`, and its `processed_events` (Mongo variant) | Any source fact — users, products, orders, stock, conversations. It holds derived copies, never the truth |
 | The metric definitions (§3.1.1.2) and their read APIs | Event payload schemas — each producer owns its topic's schema ([RFC 0000](0000-architecture.md#3123-event-catalogue)) |
 | The `rebuild_daily_rollups` task logic and the backfill CLI | The Celery worker, Beat scheduler and RabbitMQ that host the task ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
-| Consumer handler logic for every topic | The consumer base class — dedupe hook, retry, DLQ routing, lag metrics — in `libs/common` ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
+| Consumer handler logic for every topic | The consumer base class — dedupe hook, retry, DLQ routing, lag metrics — in `common` ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
 | Its Mongo credential and its database | The MongoDB container ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
 | — | Token-budget and spend reporting (`assistant`, [RFC 0009](0009-assistant-service.md)) |
 | — | Prometheus RED metrics of other services ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
@@ -173,7 +173,7 @@ The service-inventory rationale ([archive 0000](archive/0000-system-architecture
 | R5 / A13 | It makes **no** synchronous cross-service call, in or out of the order path. The one permitted synchronous call in the system (`order → catalog`) does not involve it |
 | R6 / A14 | Product names in `product_stats` are snapshots from order lines, never looked up live |
 | R7 | Its reads never require another service to be up; Kafka being down stops ingestion, not reads |
-| R8 | Metric definitions live in `analytics`' service layer, not in `libs/common` |
+| R8 | Metric definitions live in `analytics`' service layer, not in `common` |
 | A1, A2 | A service with its own database. A2's shared Postgres instance does not apply: `analytics_db` is MongoDB ([store selection](0000-architecture.md#3137-store-selection)) |
 | A4, A5 | Every endpoint verifies the RS256 JWT locally against `identity`'s JWKS; the gateway's check is not trusted |
 | A6 | Async throughout: Motor for MongoDB, the async consumer base class |
@@ -283,7 +283,7 @@ A later interaction by the same user while a window is `open` does not open a se
 
 ###### The consumer — handler logic
 
-One process per replica, one consumer group `analytics`, subscribed to every catalogue topic (Q2, archive 0003: per service, not per topic; fewer containers, and ordering is per key anyway). The base class from `libs/common` supplies decode, trace restoration, retry and DLQ; `analytics` supplies the dedupe implementation for Mongo and the handlers.
+One process per replica, one consumer group `analytics`, subscribed to every catalogue topic (Q2, archive 0003: per service, not per topic; fewer containers, and ordering is per key anyway). The base class from `common` supplies decode, trace restoration, retry and DLQ; `analytics` supplies the dedupe implementation for Mongo and the handlers.
 
 ```
 on message(envelope):
@@ -424,7 +424,7 @@ Settings are Pydantic settings from environment variables. Values marked *(ANL)*
 
 | Name | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `kafka_consumer_lag` | gauge | `group="analytics"`, `topic`, `partition` | **Consumer lag** — high-water mark minus committed offset. Emitted by the `libs/common` consumer base ([RFC 0001](0001-platform-and-shared-infrastructure.md)); dashboarded, not alerted (Q7, archive 0003) |
+| `kafka_consumer_lag` | gauge | `group="analytics"`, `topic`, `partition` | **Consumer lag** — high-water mark minus committed offset. Emitted by the `common` consumer base ([RFC 0001](0001-platform-and-shared-infrastructure.md)); dashboarded, not alerted (Q7, archive 0003) |
 | `analytics_events_ingested_total` | counter | `topic`, `outcome = applied \| duplicate \| stale \| dlq` | Every consumed event's fate. `duplicate` should be rare and rises after a rebalance or replay |
 | `analytics_ingest_duration_seconds` | histogram | `topic` | Decode to commit |
 | `analytics_txn_retries_total` | counter | `reason = write_conflict \| transient` | MongoDB transaction retries |
@@ -434,7 +434,7 @@ Settings are Pydantic settings from environment variables. Values marked *(ANL)*
 | `analytics_reconcile_duration_seconds` | histogram | — | Run time |
 | `analytics_reconcile_drift_total` | counter | `collection` | Buckets the job had to correct. Expected zero |
 | `analytics_counter` | gauge | `name` | Current value of each `counters` document, refreshed every 30s; feeds the business-metrics dashboard |
-| `http_server_*` (RED) | — | `route`, `method`, `status` | Standard RED set from `libs/common` |
+| `http_server_*` (RED) | — | `route`, `method`, `status` | Standard RED set from `common` |
 
 **Spans.** `analytics.consume {topic}` (child of the producer's span via the restored `traceparent`, C11), `analytics.apply` with `event_type` and op count, MongoDB driver spans (PyMongo instrumentation), `analytics.reconcile` per run and per date, and FastAPI request spans for reads.
 
@@ -810,7 +810,7 @@ Ordered so that the dedupe-plus-effect transaction is proven on one topic before
 | --- | --- | --- | --- |
 | ANL-T1 | MongoDB single-node replica set in Compose; `analytics` skeleton on :8006; settings; `/health`, `/health/ready`, `/metrics`; Mongo user with `readWrite` on `analytics_db` only (archive 0003 T17) | Connectivity; transactions available; R1 grant test green | Platform Kafka and Mongo ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
 | ANL-T2 | `models/`: collections, indexes and TTLs via `ensure_indexes()`; `a001_initial` (archive 0003 T17) | Index creation idempotent; TTLs present | ANL-T1 |
-| ANL-T3 | Mongo dedupe adapter for the `libs/common` consumer base; the ANL-1 transaction; ANL-2 stale guard | One topic (`identity.user.registered`) end to end; crash-point tests green (ANL-G4) | ANL-T2, `libs/common` consumer base |
+| ANL-T3 | Mongo dedupe adapter for the `common` consumer base; the ANL-1 transaction; ANL-2 stale guard | One topic (`identity.user.registered`) end to end; crash-point tests green (ANL-G4) | ANL-T2, `common` consumer base |
 | ANL-T4 | `services/rollups.py` handlers for every commerce topic with ingest-time aggregation (C9) (archive 0003 T18) | Counters and buckets move on consumption; replay test green (ANL-G3) | ANL-T3 |
 | ANL-T5 | DLQ observer group (ANL-9) | DLQ arrivals appear in `failure_stats` | ANL-T3 |
 | ANL-T6 | The nine [Part A](../part-a.md) §5 metrics in `services/metrics.py` and their read APIs, merchant-scoped in the pipeline (archive 0003 T19) | One test per metric (ANL-G1); merchant isolation (ANL-G7) | ANL-T4 |
@@ -914,10 +914,10 @@ Ordered so that the dedupe-plus-effect transaction is proven on one topic before
 | --- | --- | --- |
 | MongoDB | 7.x | `analytics_db`; 7.0 for `$percentile` (ANL-7) and transactions on a replica set (ANL-1) |
 | Motor | 3.6.x | Async MongoDB driver (A6) |
-| `confluent-kafka[avro]` | 2.6.x | Consumer, via the `libs/common` base |
+| `confluent-kafka[avro]` | 2.6.x | Consumer, via the `common` base |
 | Celery | 5.4.x | `rebuild_daily_rollups` |
 | OpenTelemetry SDK + instrumentations (FastAPI, PyMongo) | 1.28.x | Traces and metrics |
-| `libs/common` | — | JWT verification, consumer base class, problem details, telemetry ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
+| `common` | — | JWT verification, consumer base class, problem details, telemetry ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
 | Every producer's topic and payload | — | §3.1.2.4 |
 
 **Blockers.** None. The assistant half depends on `assistant` emitting `assistant.interaction` through its outbox ([RFC 0009](0009-assistant-service.md), E13).

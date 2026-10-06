@@ -10,7 +10,7 @@
 | **Supersedes** | [archive/0000 — System Architecture](archive/0000-system-architecture.md) (in full) · [archive/0006 — Service Decomposition & Data Model](archive/0006-service-decomposition-and-data-model.md) (the cross-cutting half; per-table columns moved to the service RFCs) · the cross-cutting conventions of [archive/0001](archive/0001-foundation-and-core-services.md), [archive/0002](archive/0002-core-business-logic-and-workflows.md) and [archive/0003](archive/0003-events-and-observability.md) |
 | **Depends on** | — (the root of the RFC set). Implemented through [RFC 0001 — Platform & Shared Infrastructure](0001-platform-and-shared-infrastructure.md) and the service RFCs [0002](0002-gateway-service.md)–[0009](0009-assistant-service.md) |
 
-> **How to read this RFC.** This is the single cross-cutting architecture document for SmartRetail. It holds only what must be consistent *across* services: the service inventory and the test that produced it, the boundary rules (R1–R8), the cross-cutting decisions (A1–A14), the authentication/authorisation split, the three critical flows, the API conventions, the event catalogue and envelope, the schema conventions (S1–S15), the shared `outbox` and `processed_events` DDL, the cross-service entity model, the index of every table, the reference kinds and the ownership map. Everything about one service — its endpoints, state machines, workflows, configuration, metrics and the full column list of every table it owns — lives in that service's RFC (0002–0009). Hosting, runtime and infrastructure — `libs/common`, the workers, Kafka, Redis, Compose — live in [RFC 0001](0001-platform-and-shared-infrastructure.md). Where this RFC fixes a convention, RFC 0001 says how it is implemented and the service RFCs say how they apply it; none of them may silently contradict it.
+> **How to read this RFC.** This is the single cross-cutting architecture document for SmartRetail. It holds only what must be consistent *across* services: the service inventory and the test that produced it, the boundary rules (R1–R8), the cross-cutting decisions (A1–A14), the authentication/authorisation split, the three critical flows, the API conventions, the event catalogue and envelope, the schema conventions (S1–S15), the shared `outbox` and `processed_events` DDL, the cross-service entity model, the index of every table, the reference kinds and the ownership map. Everything about one service — its endpoints, state machines, workflows, configuration, metrics and the full column list of every table it owns — lives in that service's RFC (0002–0009). Hosting, runtime and infrastructure — `common`, the workers, Kafka, Redis, Compose — live in [RFC 0001](0001-platform-and-shared-infrastructure.md). Where this RFC fixes a convention, RFC 0001 says how it is implemented and the service RFCs say how they apply it; none of them may silently contradict it.
 
 ---
 
@@ -98,7 +98,7 @@ The two archived RFCs each had a G1–G7 list; they are merged here. The *Archiv
 | G7 | 0006 G6 | Schema conventions fixed once, applied by every service | §3.1.3.1; deviations are review failures |
 | G8 | 0000 G3 | A named event catalogue with a fixed envelope and versioning rule | §3.1.2.3–§3.1.2.4; every event any service produces appears in the catalogue |
 | G9 | 0000 G4 | End-to-end flows for the three critical paths — publish, checkout, assistant query | §3.1.1.6; each flow is traceable across services by a single correlation ID once tracing is in place |
-| G10 | 0000 G5 | Cross-cutting conventions agreed once: auth, errors, pagination, config, idempotency, tracing | §3.1.2.2; implemented in `libs/common` ([RFC 0001](0001-platform-and-shared-infrastructure.md)), reused rather than reimplemented per service |
+| G10 | 0000 G5 | Cross-cutting conventions agreed once: auth, errors, pagination, config, idempotency, tracing | §3.1.2.2; implemented in `common` ([RFC 0001](0001-platform-and-shared-infrastructure.md)), reused rather than reimplemented per service |
 | G11 | 0000 G6 | A component → delivery-phase map, so no phase is surprised by what it has to stand up | §3.1.5, Delivery phasing |
 | G12 | 0000 G7 | Every deferral recorded with the RFC that owns it, so scope boundaries are decisions and not omissions | Non-goals table below and each RFC's §2.2 |
 
@@ -107,7 +107,7 @@ The two archived RFCs each had a G1–G7 list; they are merged here. The *Archiv
 | Excluded | Why / where it lives |
 | --- | --- |
 | Per-service implementation detail — endpoint bodies, per-table column definitions, state-machine transition tables, test cases | The owning service RFC ([0002](0002-gateway-service.md)–[0009](0009-assistant-service.md)). This document stops at the boundary and the contract. The permitted enum *values* are summarised here (S4); the permitted *transitions* live with the behaviour, in each service RFC's §3.1.1.3 |
-| Kafka topic configuration, Redis keyspaces, object-storage layout, ORM implementation detail, `libs/common` internals | Not cross-service contracts. [RFC 0001](0001-platform-and-shared-infrastructure.md) |
+| Kafka topic configuration, Redis keyspaces, object-storage layout, ORM implementation detail, `common` internals | Not cross-service contracts. [RFC 0001](0001-platform-and-shared-infrastructure.md) |
 | Query-plan tuning and index sizing against real data | Per service, against real query shapes. Indexes that are part of the *design* — the HNSW parameters, every unique constraint, the outbox partial index — are specified with their tables |
 | Kubernetes, cloud deployment, managed services, CI/CD pipelines | The target environment for the whole assignment is Docker Compose on a developer machine ([Execution Guidelines](../execution-guidelines.md)) |
 | Multi-region, multi-tenancy beyond merchant scoping, disaster recovery, physical sharding, partitioning, read replicas | No requirement asks for them, they would distort every boundary below, and nothing here prevents them |
@@ -146,7 +146,7 @@ The two archived RFCs each had a G1–G7 list; they are merged here. The *Archiv
 | `celery-worker` (+ Beat) | Background tasks off RabbitMQ — notification dispatch, media processing, scheduled rollups and sweeps, bulk generation | [RFC 0001](0001-platform-and-shared-infrastructure.md) | Each task's owning service RFC, §3.1.1.4 |
 | `indexer-worker` | Consumes `catalog.product.*`, chunks and embeds product text, writes `assistant_db` | [RFC 0001](0001-platform-and-shared-infrastructure.md) | [RFC 0009](0009-assistant-service.md#3114-workflows-and-async-jobs) |
 | `outbox-relay` | Reads each producing service's transactional outbox and publishes to Kafka (C1, C2) | [RFC 0001](0001-platform-and-shared-infrastructure.md) | — (no business logic; the outbox DDL is §3.1.3.2) |
-| `libs/common` | Shared non-domain code: auth, config, logging, errors, pagination, DB session, `DomainEnum` / `DomainEnumText` (S4), outbox and idempotency helpers, service-token mint/verify, event envelope, Avro serialiser, consumer base class, tracing setup, Temporal client factory. **Contains no business rule and no vocabulary** (R8) | [RFC 0001](0001-platform-and-shared-infrastructure.md) | — |
+| `common` | Shared non-domain code: auth, config, logging, errors, pagination, DB session, `DomainEnum` / `DomainEnumText` (S4), outbox and idempotency helpers, service-token mint/verify, event envelope, Avro serialiser, consumer base class, tracing setup, Temporal client factory. **Contains no business rule and no vocabulary** (R8) | [RFC 0001](0001-platform-and-shared-infrastructure.md) | — |
 
 Infrastructure: one PostgreSQL 16 instance (one logical database and role per service, A2), MongoDB, Redis, Kafka (KRaft) + Schema Registry, RabbitMQ, MinIO, Temporal server + UI, and the OTel Collector → Jaeger / Prometheus → Grafana stack. All are specified in [RFC 0001](0001-platform-and-shared-infrastructure.md).
 
@@ -275,7 +275,7 @@ These hold for every service at all times and are what the reviews check.
 | R5 | Synchronous cross-service calls only where the caller cannot proceed without the answer | One such write-path call exists: `order → catalog` at creation. See §3.3.1 ARC-Q2 for the assistant's read-path hydration |
 | R6 | Data crossing a boundary is snapshotted or projected, never referenced live | §3.1.3.5 reference kinds |
 | R7 | A service may not require another to be up in order to serve reads it already has data for | Local JWT verification; events over calls |
-| R8 | `libs/common` contains no business rule | Review check, plus the vocabulary grep test in §7 |
+| R8 | `common` contains no business rule | Review check, plus the vocabulary grep test in §7 |
 
 ##### 3.1.1.4. Authentication and authorisation split
 
@@ -300,7 +300,7 @@ Full detail: [RFC 0003](0003-identity-service.md#3121-endpoints).
 | --- | --- | --- |
 | `gateway` | Is there a valid, unexpired token? Coarse route-level role check (e.g. `/api/v1/analytics/*` is `admin`-only) | Be the only check. It is an optimisation that rejects early, never the security boundary |
 | Owning service | Does *this* subject, with *these* claims, get to perform *this* action on *this* row? Role check plus ownership check plus merchant scoping | Trust a role, user id, or merchant id from the request body or a header — claims come from the verified token only |
-| `libs/common` | Supplies the verification, the claim model, and the dependency that services declare their requirements with | Contain domain rules. It answers "who is this", not "may they" |
+| `common` | Supplies the verification, the claim model, and the dependency that services declare their requirements with | Contain domain rules. It answers "who is this", not "may they" |
 
 Concretely: `identity` says a caller is merchant `M` with role `merchant`; `catalog` decides whether merchant `M` may edit product `P`, by checking `P.merchant_id`. Neither decision is made anywhere else.
 
@@ -323,7 +323,7 @@ These bind every service. Service RFCs may add decisions (with their own prefixe
 - **A4 — RS256 JWTs; `identity` is the only signer.** Every other component holds the public key and verifies locally, with no network call on the request path.
 - **A5 — Every service re-verifies the token.** The gateway rejects early; it is not trusted. Services must be safe to call directly, because there are internal callers (§3.1.1.4).
 - **A6 — Async all the way down.** FastAPI `async def`, SQLAlchemy 2.0 async, `asyncpg`. No sync I/O inside the event loop.
-- **A7 — RFC 9457 problem details, one shape everywhere**, produced by one handler in `libs/common`.
+- **A7 — RFC 9457 problem details, one shape everywhere**, produced by one handler in `common`.
 - **A8 — `X-Request-ID` in, W3C `traceparent` out.** A correlation ID is generated at the gateway if absent, propagated over HTTP headers and in the event envelope, and attached to every log line. With tracing in place it is the OpenTelemetry trace ID (C12).
 - **A9 — Payments and carriers are simulated, behind an interface.** A `PaymentProvider` and `ShippingProvider` protocol with a deterministic fake implementation that can be told to fail, time out, or succeed. The point is the workflow's behaviour under those failures, not the integration.
 - **A10 — Transactional outbox for every state-change event.** A service writes its state change and its outbox row in one transaction; `outbox-relay` publishes. Dual-writing to Postgres and Kafka in the same handler is the standard way to lose events, and it is not done anywhere.
@@ -570,13 +570,13 @@ The archived surface map listed `/api/v1/search/semantic` only; the retrieval RF
 
 ##### 3.1.2.2. API conventions
 
-Fixed here, once, for all services. Implemented in `libs/common` ([RFC 0001](0001-platform-and-shared-infrastructure.md)); each service RFC's §3.1.2.1 applies them.
+Fixed here, once, for all services. Implemented in `common` ([RFC 0001](0001-platform-and-shared-infrastructure.md)); each service RFC's §3.1.2.1 applies them.
 
-- *Errors* — RFC 9457 problem details (A7): `{"type", "title", "status", "detail", "instance", "request_id"}` plus `violations[]` on validation failures. Example: `{"type": "…/errors/product-not-found", "title": "Product not found", "status": 404, "detail": "…", "instance": "/api/v1/products/…", "request_id": "…"}`. One error shape across every service means one error handler in `libs/common`. Common statuses carry fixed meaning everywhere: `409` for an optimistic-concurrency loser (S6) or an illegal state transition, `422` for semantic validation failures, `429` for rate or budget limits (always with `Retry-After` or a reset time), `501` for a route whose behaviour is not yet provided.
+- *Errors* — RFC 9457 problem details (A7): `{"type", "title", "status", "detail", "instance", "request_id"}` plus `violations[]` on validation failures. Example: `{"type": "…/errors/product-not-found", "title": "Product not found", "status": 404, "detail": "…", "instance": "/api/v1/products/…", "request_id": "…"}`. One error shape across every service means one error handler in `common`. Common statuses carry fixed meaning everywhere: `409` for an optimistic-concurrency loser (S6) or an illegal state transition, `422` for semantic validation failures, `429` for rate or budget limits (always with `Retry-After` or a reset time), `501` for a route whose behaviour is not yet provided.
 - *Pagination* — `{"items": [...], "total": N, "limit": L, "offset": O}`, hard `limit` ceiling of 100. Limit/offset is chosen over cursors because listings are filtered and sorted by arbitrary columns, where a cursor buys little; a cursor variant may be added for a high-volume path, stated in that service's RFC (the notification list's `since_seq` forward paging is one).
 - *Correlation* — `X-Request-ID` accepted or generated at the gateway, echoed on every response, present on every log line, carried into every event and workflow (A8). With tracing on, every response also carries `traceparent`, and `X-Request-ID` echoes the OTel trace ID (C12) — header name and behaviour unchanged, only the value's provenance differs, so a log line, a trace and an event all carry the same string. Trace context crosses Kafka in the envelope (C11, §3.1.2.4).
 - *Device correlation* — an optional `X-Client-Id` header on mutating requests (and on `/notifications/stream-ticket`), minted by the client per browser profile or app install. The gateway passes it through — it never generates one — and validates its shape only (`^[A-Za-z0-9_-]{8,64}$`), **stripping** a malformed value rather than rejecting the request: a cosmetic header must never fail a checkout. The producing service records it in the outbox row's `client_id`; it is carried into the event envelope and used to scope notification delivery to the originating device (C21, [RFC 0007](0007-notification-service.md)). It is never an identity and never an authorisation input — the fifth reference kind in §3.1.3.5.
-- *Idempotency* — an `Idempotency-Key` header on every non-idempotent POST that creates business state. `POST /api/v1/orders` requires it ([RFC 0005](0005-order-service.md#3121-endpoints)); the mechanism lives in `libs/common` so later services reuse it. The contract:
+- *Idempotency* — an `Idempotency-Key` header on every non-idempotent POST that creates business state. `POST /api/v1/orders` requires it ([RFC 0005](0005-order-service.md#3121-endpoints)); the mechanism lives in `common` so later services reuse it. The contract:
   - The key is **claimed by a unique insert**, `INSERT … ON CONFLICT DO NOTHING` on `(user_id, key)`, never by a read-then-write (B7). A read-check-write has a race that only appears under exactly the burst load Part A describes.
   - Keys are **scoped per user**, so one caller cannot probe or collide with another's.
   - The request body is canonicalised and hashed; **same key with a different body is a client bug → `422`**.
@@ -657,11 +657,11 @@ The fields not held as outbox columns (`event_version`, `producer`) are supplied
 
 **Schema rules.**
 
-- **Avro with Schema Registry, `BACKWARD` compatibility (C5).** Schemas are checked at registration, so an incompatible change fails in CI rather than in a consumer at runtime. JSON Schema was the alternative; Avro is what Part A's "Schema Registry" implies and gives compact payloads with real evolution rules. Schemas live in `libs/common/events/schemas/` and are registered by a script ([RFC 0001](0001-platform-and-shared-infrastructure.md)).
+- **Avro with Schema Registry, `BACKWARD` compatibility (C5).** Schemas are checked at registration, so an incompatible change fails in CI rather than in a consumer at runtime. JSON Schema was the alternative; Avro is what Part A's "Schema Registry" implies and gives compact payloads with real evolution rules. Schemas live in `common/events/schemas/` and are registered by a script ([RFC 0001](0001-platform-and-shared-infrastructure.md)).
 - **Additive evolution only.** A new field is optional with a default. `client_id` is the worked example: `{"name": "client_id", "type": ["null", "string"], "default": null}` — `null` must be first in the union for the default to be legal, and with the default present the change is `FULL`, not merely the `BACKWARD` that C5 requires: a v2 reader resolves a v1 record through the default, and a v1 reader skips the unknown field. The compatibility test asserts both directions.
 - **Minimum payload.** Events carry ids and the minimum payload a consumer needs — no credentials, no password hashes, no card data, no full PII beyond what a consumer requires.
 
-**Consumer contract.** Every consumer — service or worker — uses the `libs/common` consumer base class ([RFC 0001](0001-platform-and-shared-infrastructure.md)):
+**Consumer contract.** Every consumer — service or worker — uses the `common` consumer base class ([RFC 0001](0001-platform-and-shared-infrastructure.md)):
 
 - **At-least-once, idempotent (C4).** Record `(consumer_group, event_id)` in the consumer's own `processed_events` (§3.1.3.2) in the same transaction as the effect; a seen `event_id` is committed and skipped. Kafka transactions are not used: exactly-once in Kafka does not extend to a Postgres write or an email.
 - **Retry then DLQ (C6).** Three in-process attempts with exponential backoff, then the event goes to `<topic>.dlq` with its error and the consumer commits the offset and moves on. A poison message must not stop a partition. Replay from the DLQ is a deliberate `make` CLI action, never automatic.
@@ -732,12 +732,12 @@ That is twenty-two vocabularies; `analytics` has none (its store is schemaless, 
 
 ###### S4 — enums as text
 
-**How S4 is implemented.** The mechanism is small and belongs in `libs/common`; the vocabularies belong to each service. That split is what keeps S4 compatible with R8 — the library knows *how* a closed value set behaves and never *which* values exist. The package itself is specified in [RFC 0001](0001-platform-and-shared-infrastructure.md); the contract every service relies on is fixed here.
+**How S4 is implemented.** The mechanism is small and belongs in `common`; the vocabularies belong to each service. That split is what keeps S4 compatible with R8 — the library knows *how* a closed value set behaves and never *which* values exist. The package itself is specified in [RFC 0001](0001-platform-and-shared-infrastructure.md); the contract every service relies on is fixed here.
 
 `DomainEnum` is a `StrEnum`, so a member compares equal to its own string, serialises to JSON and Avro with no encoder hook, and is interchangeable with the raw string as a dict key.
 
 ```python
-# libs/common/smartretail_common/enums.py
+# common/smartretail_common/enums.py
 class DomainEnum(StrEnum):
     """A closed set of string values, enforced by the application, not by Postgres."""
 
@@ -765,7 +765,7 @@ class UnknownEnumValueError(ValueError):
 `DomainEnumText` maps such a set onto a `TEXT` column. Its two paths are deliberately asymmetric:
 
 ```python
-# libs/common/smartretail_common/db_types.py
+# common/smartretail_common/db_types.py
 class DomainEnumText(TypeDecorator[Any]):
     impl = Text
     cache_ok = True          # the cache key reflects enum_class; two instances over
@@ -1115,7 +1115,7 @@ This RFC produces no code. Its output is the RFC set below, the constraints each
 | Order | RFC | Scope | Read it for |
 | --- | --- | --- | --- |
 | 1 | **0000 — System Architecture** (this document) | Cross-cutting architecture | The boundaries, the rules, the conventions, the catalogue, the index |
-| 2 | [0001 — Platform & Shared Infrastructure](0001-platform-and-shared-infrastructure.md) | `libs/common`, `outbox-relay`, `temporal-worker` host, `celery-worker`, `indexer-worker` runtime, Kafka + Schema Registry, RabbitMQ, Redis keyspaces, MinIO, Temporal server, OTel/Jaeger/Prometheus/Grafana, Compose, Makefile, Dockerfiles | How every convention here is implemented and hosted |
+| 2 | [0001 — Platform & Shared Infrastructure](0001-platform-and-shared-infrastructure.md) | `common`, `outbox-relay`, `temporal-worker` host, `celery-worker`, `indexer-worker` runtime, Kafka + Schema Registry, RabbitMQ, Redis keyspaces, MinIO, Temporal server, OTel/Jaeger/Prometheus/Grafana, Compose, Makefile, Dockerfiles | How every convention here is implemented and hosted |
 | 3 | [0002 — `gateway`](0002-gateway-service.md) | The stateless edge | Routing, early rejection, correlation, CORS, rate limits, streaming pass-through |
 | 4 | [0003 — `identity`](0003-identity-service.md) | Users, credentials, tokens | Authentication; the claims every other service trusts |
 | 5 | [0004 — `catalog`](0004-catalog-service.md) | Products, variants, categories, media, publishing | Flow 1 |
@@ -1130,7 +1130,7 @@ This RFC produces no code. Its output is the RFC set below, the constraints each
 | RFC | Constraint |
 | --- | --- |
 | All | R1 enforced by grants; S1–S15 applied; every enum-valued column uses `DomainEnumText` and every `alembic/env.py` carries the `render_item` hook; every producer carries `outbox`, every consumer `processed_events` (§3.1.3.2); no topic outside the catalogue; no column that belongs to another service's fact |
-| [0001](0001-platform-and-shared-infrastructure.md) | S4's `DomainEnum` and `DomainEnumText` exist in `libs/common` before the first enum-valued column; `libs/common` holds no vocabulary and no business rule (R8); the envelope, relay and consumer base class implement §3.1.2.4 exactly |
+| [0001](0001-platform-and-shared-infrastructure.md) | S4's `DomainEnum` and `DomainEnumText` exist in `common` before the first enum-valued column; `common` holds no vocabulary and no business rule (R8); the envelope, relay and consumer base class implement §3.1.2.4 exactly |
 | [0003](0003-identity-service.md), [0004](0004-catalog-service.md) | `merchant_id` as a claim, not a FK |
 | [0005](0005-order-service.md), [0006](0006-inventory-service.md) | `order` and `inventory` per §3.1.1.2; `payment`/`shipment` folded, not split; snapshots in `order_items`; S11 constraints on stock; S12 outbox in every producer, written in the state-change transaction even before a relay exists |
 | [0007](0007-notification-service.md), [0008](0008-analytics-service.md) | S13 in every consumer; `analytics` a pure consumer (never a caller); projection references fed by events, not polling |
@@ -1141,7 +1141,7 @@ This RFC produces no code. Its output is the RFC set below, the constraints each
 
 | Milestone | Week | Components standing up | Databases, tables and vocabularies created | RFCs exercised |
 | --- | --- | --- | --- | --- |
-| 1 — Foundation & Core Services | 1 | `gateway`, `identity`, `catalog`, `libs/common`, Postgres, Compose | `identity_db`, `catalog_db`: `users`, `merchant_profiles`, `refresh_sessions`, `categories`, `products`, `product_variants`, `product_media`, `product_audit_log`. `UserRole`, `MerchantStatus`, `ProductStatus` (less `publishing`) | 0001, 0002, 0003, 0004 |
+| 1 — Foundation & Core Services | 1 | `gateway`, `identity`, `catalog`, `common`, Postgres, Compose | `identity_db`, `catalog_db`: `users`, `merchant_profiles`, `refresh_sessions`, `categories`, `products`, `product_variants`, `product_media`, `product_audit_log`. `UserRole`, `MerchantStatus`, `ProductStatus` (less `publishing`) | 0001, 0002, 0003, 0004 |
 | 2 — Core Business Logic | 2 | `order`, `inventory`, `temporal-worker`, Temporal, MinIO | `order_db`, `inventory_db`: `orders`, `order_items`, `order_status_history`, `idempotency_keys`, `stock_items`, `reservations`, `stock_movements`, `product_publish_failures`, `outbox` ×3 (`catalog`, `order`, `inventory`). Amended: `products` +`publish_workflow_id`; `product_media` +5 columns. `OrderStatus`, `PaymentStatus`, `ShipmentStatus`, `IdempotencyState`, `ReservationStatus`, `StockMovementReason`, `MediaProcessingStatus`; `ProductStatus` +`publishing` | 0001, 0004, 0005, 0006 |
 | 3 — Events & Observability | 3 | `notification` (with SSE push), `analytics`, `outbox-relay`, `celery-worker`, Kafka + Schema Registry, RabbitMQ, Redis, MongoDB, OTel Collector, Jaeger, Prometheus, Grafana; gateway rate limiting and streaming pass-through | `notification_db`, `analytics_db`: `notifications`, `delivery_attempts`, `push_subscriptions`, `stream_cursors`; the six Mongo collections other than `assistant_conversions`; `processed_events` ×4 (`catalog` `‡`, `inventory` `‡`, `notification`, `analytics`); `outbox` ×1 (`identity` `‡`). Amended: `products` +`search_document`; `orders` +`notified_at` +`origin_client_id`; `outbox` +`client_id` ×5. `NotificationType`, `NotificationChannel`, `DeliveryStatus`, `NotificationDeliveryScope` | 0001, 0002, 0007, 0008 |
 | 4 — Part A Review | — | Nothing new; review of the above | — | — |
@@ -1251,7 +1251,7 @@ One qualification, because the usual version of this argument overstates it: it 
 | Q2 | pgvector or a dedicated vector database? | pgvector — no new container, and the corpus is small. Revisit if recall or latency disappoints | **Closed** by D1 — [RFC 0009](0009-assistant-service.md#331-challenges-and-open-questions) |
 | Q3 | Does `order` call `catalog` synchronously, or keep a local product projection fed by events? | Synchronous call at creation (A13). A projection is the scalable answer but adds a consistency problem to a path that must be correct. Re-examined once events exist; still synchronous | [RFC 0005](0005-order-service.md#331-challenges-and-open-questions) — revisit at Part A review |
 | Q4 | Where does inventory come from initially — merchant-set, or an event on publish? | `catalog.product.published` creates a zero-quantity stock row; the merchant sets quantity through `inventory` | [RFC 0006](0006-inventory-service.md#331-challenges-and-open-questions) — decided |
-| Q5 | Should the gateway stay hand-written, or move to Traefik/Kong? | Hand-written while it shares `libs/common`. Reconsider when rate limiting and SSE proxying arrive | [RFC 0002](0002-gateway-service.md#331-challenges-and-open-questions) |
+| Q5 | Should the gateway stay hand-written, or move to Traefik/Kong? | Hand-written while it shares `common`. Reconsider when rate limiting and SSE proxying arrive | [RFC 0002](0002-gateway-service.md#331-challenges-and-open-questions) |
 | Q6 | How is the assistant's LLM cost bounded? | Per-user and global daily token budgets enforced in `assistant`, with a cached-response path | **Closed** by E10 — [RFC 0009](0009-assistant-service.md#331-challenges-and-open-questions) |
 | Q7 | Do we need a cart, given that Part A never mentions one? | No. Orders are placed with a line-item body | Decided — [RFC 0005](0005-order-service.md#331-challenges-and-open-questions) |
 | Q8 | Does `analytics` compute rollups on ingest, on read, or both? | On ingest for counters, on read for time-window queries, with a scheduled reconciliation job (C9) | [RFC 0008](0008-analytics-service.md#331-challenges-and-open-questions) — decided |
@@ -1381,7 +1381,7 @@ The two archived RFCs each listed alternatives; they are merged here, with overl
 
 - **One `docker-compose.yml`** at the repository root with profiles `core`, `workflow`, `events`, `observability`, `ai`. `make up` brings up the default set; `make up-all` brings up everything ([RFC 0001](0001-platform-and-shared-infrastructure.md)).
 - **One Makefile** as the single entry point: `up`, `down`, `logs`, `migrate`, `seed`, `test`, `lint`, `fmt`, `reset`.
-- **Multi-stage Dockerfiles**, non-root user, one per service, sharing a base layer for `libs/common`.
+- **Multi-stage Dockerfiles**, non-root user, one per service, sharing a base layer for `common`.
 - **One logical database and one role per service**, created by the Postgres init script with grants on its own database only. This is the mechanism behind R1 and G4.
 - **Per-service Alembic histories** (S14), run as an explicit step, never automatically on startup, with a working `downgrade` on every migration. S4 is what makes that last clause achievable.
 - **Additive-first migrations.** Expand, migrate, contract — even with no production data, because the habit is what makes the boundaries hold.
@@ -1437,7 +1437,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 | Enum round trip (S4) | Per service: discover every `DomainEnum` subclass in `app/models/enums.py`, and for every member of every `DomainEnumText` column, write it to real Postgres and read it back. Adding a value extends this test with no edit |
 | Enum write strictness (S4) | An unknown value is rejected on write and leaves no row behind. The error arrives as `sqlalchemy.exc.StatementError` with `UnknownEnumValueError` on `.orig`, because `process_bind_param` runs inside the flush |
 | Enum read tolerance (S4) | A value written by a newer deploy is readable by an older one — the rollback case. Write an unknown value through raw SQL, read it through the ORM |
-| `libs/common` vocabulary (R8, S4) | A grep of `libs/common` for any domain status literal returns nothing — the library holds the mechanism, services hold the values |
+| `common` vocabulary (R8, S4) | A grep of `common` for any domain status literal returns nothing — the library holds the mechanism, services hold the values |
 | **Catalogue completeness** | Every table in a service's Alembic head appears in §3.1.3.4's index and in that service RFC's §3.1.3, and vice versa. The index's `Cols` count matches the model's column count. This is what keeps the RFC set from drifting from the code it specifies |
 | Event catalogue completeness | Every topic produced or subscribed to in code appears in §3.1.2.3, with the declared producer and consumers |
 
@@ -1469,7 +1469,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 
 - Does every service still pass all four ownership tests?
 - Has any service acquired a second writer for a fact it does not own?
-- Does `libs/common` contain a business rule (R8)? For S4 this is mechanical: a grep of the package for any status literal must return nothing, and that grep is itself a unit test.
+- Does `common` contain a business rule (R8)? For S4 this is mechanical: a grep of the package for any status literal must return nothing, and that grep is itself a unit test.
 - Has any router acquired direct ORM access, or any service-layer function an HTTP concern?
 - Has any new cross-boundary reference been added without declaring its kind?
 - **Has every `†` and `‡` cell in the §3.1.3.4 census been ratified or re-decided?**
@@ -1484,7 +1484,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 
 | RFC | What this RFC gives it | What it constrains |
 | --- | --- | --- |
-| [0001](0001-platform-and-shared-infrastructure.md) Platform | The envelope, catalogue, outbox and dedupe DDL, S4 contract and API conventions to implement once | Must implement them exactly; `libs/common` may not acquire a rule or a vocabulary (R8) |
+| [0001](0001-platform-and-shared-infrastructure.md) Platform | The envelope, catalogue, outbox and dedupe DDL, S4 contract and API conventions to implement once | Must implement them exactly; `common` may not acquire a rule or a vocabulary (R8) |
 | [0002](0002-gateway-service.md) `gateway` | Its bounded exception to the ownership test; the surface map | No business logic, no database; not the security boundary |
 | [0003](0003-identity-service.md) `identity` | Sole ownership of authentication and signing; the service-token path | Must not know about products; events it produces are fixed in the catalogue |
 | [0004](0004-catalog-service.md) `catalog` | Flow 1's shape; product events in the catalogue | Must not add stock columns (R3) or read `identity_db` |
@@ -1523,7 +1523,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 | Conventions drifting across eight schemas | High | Medium | The convention tests are automated; drift is a CI failure, not a review observation |
 | An inferred `†` type turning out wrong in implementation | Medium | Low | Each is marked and counted (§3.1.3.4); the cost is one migration in the service that hits it |
 | The eight-service count being judged excessive | Medium | Low | The method and every rejection are recorded, so the disagreement is specific and answerable (archive/0006 Q1, Q5) |
-| `libs/common` accumulating domain logic | Medium | Medium | R8, checked at every review and by the vocabulary grep |
+| `common` accumulating domain logic | Medium | Medium | R8, checked at every review and by the vocabulary grep |
 | The layering seam eroding, making rules unreachable from activities and consumers | Medium | High | Reviewed at each review; highest cost of erosion, lowest visibility |
 
 **On reviewers.** The Part A review should be able to check this document against the code and find: eight services or a documented reason for a different number, no shared tables, every event in the catalogue, and every deferral traceable to the RFC that owns it.

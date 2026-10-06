@@ -1,7 +1,7 @@
 # File Structure
 
 This document is the single map of the SmartRetail repository: what every
-top-level folder holds, how `libs/common` is laid out, and the one layout that
+top-level folder holds, how `common` is laid out, and the one layout that
 every service follows. It describes structure only. Why each piece exists is in
 the RFCs, which are linked from each section.
 
@@ -13,7 +13,7 @@ written. Everything else exists in the repository today.
 
 1. [Repository root](#1-repository-root)
 2. [docs/](#2-docs)
-3. [libs/common](#3-libscommon)
+3. [common](#3-common)
 4. [Service layout (every service)](#4-service-layout-every-service)
 5. [Per-service differences](#5-per-service-differences)
 6. [workers/](#6-workers)
@@ -34,8 +34,7 @@ SmartRetail/
 ├── README.md              # overview, setup, API tour
 ├── keys/                  # RS256 key pair from `make keys` (gitignored)
 ├── docs/                  # specification documents and RFCs (§2)
-├── libs/
-│   └── common/            # shared library smartretail_common (§3)
+├── common/                # shared package smartretail_common (§3)
 ├── services/              # one folder per service, all with the same layout (§4)
 │   ├── gateway/
 │   ├── identity/
@@ -68,7 +67,7 @@ docs/
 ├── RFC template.pdf
 └── rfcs/
     ├── 0000-architecture.md                       # whole-platform rules; read first
-    ├── 0001-platform-and-shared-infrastructure.md # libs/common, workers, infra, Compose
+    ├── 0001-platform-and-shared-infrastructure.md # common, workers, infra, Compose
     ├── 0002-gateway-service.md
     ├── 0003-identity-service.md
     ├── 0004-catalog-service.md
@@ -83,13 +82,13 @@ docs/
 RFCs are organised by service, not by milestone: 0000 is the architecture,
 0001 the shared platform, and 0002–0009 one per service.
 
-## 3. libs/common
+## 3. common
 
 The shared library, imported by every service as `smartretail_common`. It holds
 code that must behave the same everywhere. It never holds business rules.
 
 ```
-libs/common/
+common/
 ├── pyproject.toml
 ├── smartretail_common/
 │   ├── __init__.py
@@ -123,7 +122,7 @@ libs/common/
     └── test_r8_guard.py
 ```
 
-Source: [RFC 0001 §3.1.1.1](rfcs/0001-platform-and-shared-infrastructure.md#3111-libscommon).
+Source: [RFC 0001 §3.1.1.1](rfcs/0001-platform-and-shared-infrastructure.md#3111-common).
 
 ## 4. Service layout (every service)
 
@@ -202,7 +201,7 @@ the app the same way: `from main import create_application`.
   returned directly.
 - `utils/` state machines and helpers do no I/O.
 - A service never imports another service's code. Shared code goes in
-  `libs/common`.
+  `common`.
 
 **Routes and handlers**
 
@@ -302,7 +301,7 @@ tests/
     └── test_smoke.py          # Milestone 1 journey through the gateway
 ```
 
-Unit and integration tests live inside each package (`libs/common/tests/`,
+Unit and integration tests live inside each package (`common/tests/`,
 `services/<svc>/tests/`). Only cross-service tests go in `tests/e2e/`.
 
 ## 8. Generated and ignored files

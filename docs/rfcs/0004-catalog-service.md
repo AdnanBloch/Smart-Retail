@@ -155,7 +155,7 @@ Candidates rejected *into* `catalog` or away from it: `pricing` (price is a prod
 | R5 / A13 | `catalog` **serves** the platform's one synchronous cross-service call (`order → catalog` at creation) and makes none on a request path itself |
 | R6 / A14 | Consumers snapshot or project `catalog` data; nothing references it live except the order-creation lookup |
 | R7 | Browse and product reads work with `identity`, `inventory`, Kafka and Temporal all down (§3.1.1.5) |
-| R8 | `ProductStatus`, `MediaProcessingStatus` and every other vocabulary live in `services/catalog/app/models/enums.py`, never in `libs/common` |
+| R8 | `ProductStatus`, `MediaProcessingStatus` and every other vocabulary live in `services/catalog/app/models/enums.py`, never in `common` |
 | A4 / A5 | `catalog` re-verifies every token locally against the RS256 public key; the gateway's check is not trusted |
 | A6 | Async FastAPI, SQLAlchemy 2.0 async, `asyncpg` |
 | A7 | RFC 9457 problem details for every error |
@@ -501,11 +501,11 @@ Twelve-factor, environment-only, validated at startup by `pydantic-settings`; a 
 
 ##### 3.1.1.7. Observability
 
-**Logs.** JSON, one line per event, via `libs/common` logging. Fields on every line: `timestamp`, `level`, `service=catalog`, `trace_id` (which is also `X-Request-ID`, C12), `span_id`. Contextual fields where present: `actor_id`, `merchant_id`, `product_id`, `variant_id`, `media_id`, `workflow_id`, `event_id`, `consumer_group`. Never logged: request bodies, tokens, presigned urls.
+**Logs.** JSON, one line per event, via `common` logging. Fields on every line: `timestamp`, `level`, `service=catalog`, `trace_id` (which is also `X-Request-ID`, C12), `span_id`. Contextual fields where present: `actor_id`, `merchant_id`, `product_id`, `variant_id`, `media_id`, `workflow_id`, `event_id`, `consumer_group`. Never logged: request bodies, tokens, presigned urls.
 
 **Traces** (C10, C11). FastAPI, SQLAlchemy and httpx auto-instrumented, so a gateway → catalog call is one trace with SQL spans. Workflow and activity spans come from the Temporal interceptor in `temporal-worker`; the `correlation_id` the endpoint passes into the workflow links the `202` request's trace to the workflow's. The consumer restores `traceparent` from the envelope. Named spans added by `catalog`: `catalog.publish.accept`, `catalog.publish.start_workflow`, `catalog.media.upload`, `catalog.media.store_original`, `catalog.merchant_status.apply`, `catalog.browse.cache`.
 
-**Metrics** (`/metrics`, Prometheus). RED per route comes from `libs/common` (request count, error count, latency histogram, labelled by route template and status). Service-specific instruments (**CAT-11**; the sources require RED plus consumer lag, DLQ depth and outbox backlog, and name no catalog-specific instrument):
+**Metrics** (`/metrics`, Prometheus). RED per route comes from `common` (request count, error count, latency histogram, labelled by route template and status). Service-specific instruments (**CAT-11**; the sources require RED plus consumer lag, DLQ depth and outbox backlog, and name no catalog-specific instrument):
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -892,7 +892,7 @@ Ordered so each step is reviewable alone; the workflow is built on a service lay
 
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
-| 1 | `catalog` skeleton on `libs/common` (settings, async session, JSON logging, problem details, pagination, `DomainEnum`/`DomainEnumText`); Alembic with the `render_item` hook | Service boots; `/health`, `/health/ready` | Platform `libs/common`, Postgres init script creating `catalog_db` and its role |
+| 1 | `catalog` skeleton on `common` (settings, async session, JSON logging, problem details, pagination, `DomainEnum`/`DomainEnumText`); Alembic with the `render_item` hook | Service boots; `/health`, `/health/ready` | Platform `common`, Postgres init script creating `catalog_db` and its role |
 | 2 | Migration `0001_initial` — five tables, constraints, indexes, comments | `make migrate` to head from empty | 1 |
 | 3 | `enums.py` and `state_machine.py`; `transition()`; unit tests for totality and every illegal pair | Unit suite green | 1 |
 | 4 | Category CRUD (admin-gated), tree and flat views, cycle and in-use guards | Tests green | 2, identity's `require_roles` |
@@ -1137,7 +1137,7 @@ Aim: ~80 % on the service layer, 100 % on the role matrix and the state machine.
 - Pagination and filter parsing, including the `limit` ceiling clamp; visibility filter per role.
 - Upload validators: allowed types, magic-byte mismatch, oversize, extension spoofing.
 - Problem-detail serialisation for each error type.
-- R8: a grep of `libs/common` for any `catalog` status literal returns nothing.
+- R8: a grep of `common` for any `catalog` status literal returns nothing.
 
 **Integration** — real Postgres (throwaway database per session), `httpx.ASGITransport`, transaction rolled back per test.
 

@@ -177,7 +177,7 @@ Why it is not folded into `catalog`: a different write profile entirely — high
 | R5 / A13 | `inventory` makes **no** synchronous call to another service. It is *called* synchronously (by `OrderWorkflow` activities and display reads), never a caller |
 | R6 / A14 | Product data is snapshotted (`sku`, `product_id`, `merchant_id`) at row creation |
 | R7 | Serves reads from its own data with local JWT verification; `identity` being down does not stop it |
-| R8 | Stock rules live in `services/inventory/app/services/`, never in `libs/common` |
+| R8 | Stock rules live in `services/inventory/app/services/`, never in `common` |
 | A4 / A5 | Re-verifies every token itself; the gateway is an early rejection only |
 | A6 | Async throughout — `asyncpg`, SQLAlchemy 2.0 async |
 | A7 | Every error is an RFC 9457 problem detail |
@@ -418,7 +418,7 @@ The sweeper does not cancel or fail orders; it cannot, because orders are not it
 
 ###### Event consumers (process `inventory-consumer`, group `inventory`)
 
-One consumer process per service, subscribing to both topics, dedupe keyed by consumer group (archive/0003 Q2). The consumer base class from `libs/common` gives dedupe, three in-process retries with exponential backoff, then `<topic>.dlq` and an offset commit (C6) — a poison message never stops a partition. Handler logic, each in one transaction with its `processed_events` row:
+One consumer process per service, subscribing to both topics, dedupe keyed by consumer group (archive/0003 Q2). The consumer base class from `common` gives dedupe, three in-process retries with exponential backoff, then `<topic>.dlq` and an offset commit (C6) — a poison message never stops a partition. Handler logic, each in one transaction with its `processed_events` row:
 
 | Topic | Handler | Effect |
 | --- | --- | --- |
@@ -481,7 +481,7 @@ Settings are read by `app/configs/env.py` from the environment. Values marked *(
 
 ##### 3.1.1.7. Observability
 
-**Metrics** (Prometheus via `/metrics`; RED per route comes from `libs/common`):
+**Metrics** (Prometheus via `/metrics`; RED per route comes from `common`):
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -497,7 +497,7 @@ Settings are read by `app/configs/env.py` from the environment. Values marked *(
 | `inventory_oldest_held_reservation_age_seconds` | gauge | — | Stranded-stock detector; should never exceed the TTL plus one sweep interval |
 | `inventory_ledger_drift_variants` | gauge | — | Variants failing reconciliation at the last run; should be 0 |
 | `inventory_check_violations_total` | counter | `constraint` | `23514` hits — the last line of defence firing means a code path skipped the lock |
-| consumer lag, DLQ depth, outbox backlog | — | per `libs/common` | Exported for `inventory` like every service |
+| consumer lag, DLQ depth, outbox backlog | — | per `common` | Exported for `inventory` like every service |
 
 **Spans** (OTel, C10/C11): `inventory.reserve` (attributes `order_id`, `line_count`, `outcome`), child `inventory.lock stock_items` (attribute `lock_wait_ms`), `inventory.commit`, `inventory.release`, `inventory.expire_batch`, `inventory.consume {topic}` restored from the envelope's `traceparent`, and SQLAlchemy spans. A checkout's single trace spans gateway, order, the Temporal workflow, `inventory`, the relay and the consumers (archive/0003 G7).
 
@@ -705,7 +705,7 @@ Vocabularies (`ReservationStatus`, `StockMovementReason`) are not migrations (S4
 
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
-| 1 | `inventory` service skeleton, settings, health, Alembic with the S4 `render_item` hook; `0001_initial` (three tables + outbox) | Migration to head; `alembic check` clean | `libs/common` outbox, idempotency, service-token verify ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
+| 1 | `inventory` service skeleton, settings, health, Alembic with the S4 `render_item` hook; `0001_initial` (three tables + outbox) | Migration to head; `alembic check` clean | `common` outbox, idempotency, service-token verify ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
 | 2 | Domain: `enums.py`, `RESERVATION_TRANSITIONS`, `transition()`, `ledger.py` | Unit tests incl. all 13 illegal pairs | 1 |
 | 3 | Inventory core: reserve / release / commit with canonical lock order, `lock_timeout`, bounded retry, ledger and outbox writes | **Concurrency test — 50 parallel reserves on 10 units yield 10 successes**; deadlock test | 2 |
 | 4 | Internal routes and service-token scope check; `POST /stock-items` initialisation | Contract tests; user tokens rejected | 3, `identity` client-credentials grant |
@@ -815,8 +815,8 @@ Decided and recorded rather than open: stock is not a column on `product_variant
 | --- | --- | --- |
 | PostgreSQL | 16 | `inventory_db`; generated columns, row locks, `lock_timeout` |
 | SQLAlchemy (async) + `asyncpg` | 2.0.x | ORM and driver (A6) |
-| Alembic | per `libs/common` pin | Per-service migrations (S14) |
-| `libs/common` | — | Outbox helper, consumer base class (dedupe, retry, DLQ), service-token verification, `DomainEnum`/`DomainEnumText`, problem details, tracing |
+| Alembic | per `common` pin | Per-service migrations (S14) |
+| `common` | — | Outbox helper, consumer base class (dedupe, retry, DLQ), service-token verification, `DomainEnum`/`DomainEnumText`, problem details, tracing |
 | Kafka + Schema Registry | per [RFC 0001](0001-platform-and-shared-infrastructure.md) | Consumed and produced topics |
 | Redis (`redis[hiredis]`) | 5.x | Stock read cache |
 | Celery + RabbitMQ | per RFC 0001 | Sweeper and reconciliation |

@@ -41,7 +41,7 @@ flowchart LR
 - **catalog** owns categories, products, variants, URL media and the product
   audit trail. It enforces ownership, visibility, optimistic concurrency
   (`version`) and the product status state machine.
-- **libs/common** (`smartretail_common`) holds mechanism only: settings, JSON
+- **common** (`smartretail_common`) holds mechanism only: settings, JSON
   logging, RFC 9457 problem details, pagination, the async DB session,
   `DomainEnum`/`DomainEnumText`, JWT verification and `require_roles`, and
   health checks. It holds no domain vocabulary (rule R8, enforced by a test).
@@ -111,7 +111,7 @@ The full map, including the layout every service follows, is in
 
 ```
 docker-compose.yml   Makefile   .env.example   pyproject.toml (ruff/mypy config)
-libs/common/         smartretail_common + tests
+common/         smartretail_common + tests
 services/<svc>/      main.py, app/{api, configs, infrastructure, models, services, utils, …}, alembic/, tests/
 ops/postgres/init/   databases, roles and grants
 scripts/keys.sh      RS256 key generation

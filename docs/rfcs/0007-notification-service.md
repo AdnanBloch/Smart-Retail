@@ -164,7 +164,7 @@ Recording a notification is not delivering one, and the design turns on one cons
 - **NTF-11 — `unread_count` travels in the Pub/Sub message.** The consumer computes the recipient's in-app unread count once, after commit, and includes it in the message, so a delivering replica emits the `unread_count` frame without a query per connection. Mark-read and read-all publish a bare `{kind: "unread_count"}` message on the same channel, so every device's badge moves when one device reads.
 - **NTF-12 — A stream ticket without a `client_id` opens an ephemeral stream.** A missing or stripped `X-Client-Id` must never fail a request (C21). The ticket then carries `client_id: null`; the stream has no `stream_cursors` row, its floor is `Last-Event-ID` alone (cold start when absent), it is never the "origin" of anything, and `origin_only` frames are never delivered to it.
 - **NTF-13 — The notification lifecycle is derived from timestamps, not stored as a status.** archive/0006 gives `notifications` no status column; `read_at`, `delivered_at` and `promoted_at` are independent facts written by different actors, and a single status would force an order on them that does not exist (§3.1.1.3).
-- **NTF-14 — Infrastructure outages pause the consumer; they do not dead-letter.** C6's three-attempts-then-DLQ is for poison messages. A `notification_db` or Redis-for-presence outage is not the event's fault: the consumer pauses the partition and retries with capped backoff until the dependency returns. This is a requirement on the `libs/common` consumer base class ([RFC 0001](0001-platform-and-shared-infrastructure.md)); failing to meet it would DLQ every event for the duration of an outage.
+- **NTF-14 — Infrastructure outages pause the consumer; they do not dead-letter.** C6's three-attempts-then-DLQ is for poison messages. A `notification_db` or Redis-for-presence outage is not the event's fault: the consumer pauses the partition and retries with capped backoff until the dependency returns. This is a requirement on the `common` consumer base class ([RFC 0001](0001-platform-and-shared-infrastructure.md)); failing to meet it would DLQ every event for the duration of an outage.
 - **NTF-15 — The ack rate limit is enforced in-service,** keyed `rl:notif-ack:{user_id}:{client_id}`, because the gateway cannot see the body's `client_id`.
 - **NTF-16 — `since_seq` switches list ordering to `seq ASC`.** Without it, the list is `created_at DESC` (newest first, for a UI); with it, the list is forward paging for a truncated client, and only ascending `seq` lets that client advance contiguously.
 
@@ -380,7 +380,7 @@ Notes: a row may be *read* without ever being *delivered* (read from the list on
 
 ###### The consumer
 
-Consumer group `notification`, one process per replica subscribing to every consumed topic (archive/0003 Q2: per service, not per topic). Handler, per event, using the `libs/common` consumer base class:
+Consumer group `notification`, one process per replica subscribing to every consumed topic (archive/0003 Q2: per service, not per topic). Handler, per event, using the `common` consumer base class:
 
 ```
  restore traceparent from envelope (C11); open span "notification.consume {event_type}"
@@ -634,7 +634,7 @@ Separate queues so a burst of media processing cannot starve notification delive
 
 ##### 3.1.1.7. Observability
 
-**Metrics.** RED on every endpoint via `libs/common` (`http_requests_total`, `http_request_duration_seconds` by route and status). Service-specific, with the names from archive/0003 T10 kept verbatim and the prose-only instruments named here (NTF-16 is the naming of those, not new instruments):
+**Metrics.** RED on every endpoint via `common` (`http_requests_total`, `http_request_duration_seconds` by route and status). Service-specific, with the names from archive/0003 T10 kept verbatim and the prose-only instruments named here (NTF-16 is the naming of those, not new instruments):
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -1080,7 +1080,7 @@ IDs from the archive are kept; the source RFC is named because archive/0003 and 
 | Dependency | Version | Used for |
 | --- | --- | --- |
 | PostgreSQL | 16 | `notification_db` |
-| `confluent-kafka[avro]` | 2.6.x | Consumer, via the `libs/common` base class |
+| `confluent-kafka[avro]` | 2.6.x | Consumer, via the `common` base class |
 | Celery | 5.4.x | Dispatch and Beat tasks (hosted by `celery-worker`) |
 | Redis + `redis[hiredis]` | 7.4 / 5.x | Tickets, Pub/Sub fan-out, presence, caps, rate limits |
 | `sse-starlette` | 2.x | SSE responses in FastAPI — the same dependency the assistant stream takes ([RFC 0009](0009-assistant-service.md)) |

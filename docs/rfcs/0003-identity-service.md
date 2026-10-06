@@ -9,7 +9,7 @@
 | **Supersedes** | [archive/0001 — Foundation & Core Services](archive/0001-foundation-and-core-services.md) (identity half) · [archive/0000 — System Architecture](archive/0000-system-architecture.md) (authentication split, A4/A5, identity events) · [archive/0002 — Core Business Logic & Workflows](archive/0002-core-business-logic-and-workflows.md) (client-credentials grant) · [archive/0003 — Events & Observability](archive/0003-events-and-observability.md) (identity events, outbox, login rate limit, suspension, Q6) · [archive/0006 — Service Decomposition & Data Model](archive/0006-service-decomposition-and-data-model.md) (`identity_db` tables, ownership-test row) |
 | **Depends on** | [RFC 0000 — Architecture](0000-architecture.md) · [RFC 0001 — Platform & Shared Infrastructure](0001-platform-and-shared-infrastructure.md) · [RFC 0002 — `gateway` Service](0002-gateway-service.md) |
 
-> **Reading note.** This RFC specifies the `identity` service completely: its users, credentials, roles, merchant profiles and their approval state, sessions, token issuance, signing keys, the service-token grant, its HTTP surface, its two events, and every column of `identity_db`. It is the only place those tables are defined. Cross-cutting rules that bind every service — the ownership test, boundary rules R1–R8, decisions A1–A14, schema conventions S1–S15, the event envelope, the shared `outbox` DDL, API conventions — live in [RFC 0000](0000-architecture.md) and are linked rather than restated. Token *verification* is a `libs/common` concern hosted by [RFC 0001](0001-platform-and-shared-infrastructure.md); the edge rate limiter is a `gateway` concern in [RFC 0002](0002-gateway-service.md). Both are described here only as far as `identity` depends on them.
+> **Reading note.** This RFC specifies the `identity` service completely: its users, credentials, roles, merchant profiles and their approval state, sessions, token issuance, signing keys, the service-token grant, its HTTP surface, its two events, and every column of `identity_db`. It is the only place those tables are defined. Cross-cutting rules that bind every service — the ownership test, boundary rules R1–R8, decisions A1–A14, schema conventions S1–S15, the event envelope, the shared `outbox` DDL, API conventions — live in [RFC 0000](0000-architecture.md) and are linked rather than restated. Token *verification* is a `common` concern hosted by [RFC 0001](0001-platform-and-shared-infrastructure.md); the edge rate limiter is a `gateway` concern in [RFC 0002](0002-gateway-service.md). Both are described here only as far as `identity` depends on them.
 
 ---
 
@@ -89,7 +89,7 @@ Goal IDs `G2` and `G4` are carried from [archive/0001](archive/0001-foundation-a
 | Excluded | Why / who owns it |
 | --- | --- |
 | Email delivery, email verification, password reset | No email channel exists; `email_verified` is carried but cannot move to `true`. Registration is immediate. A reset flow needs a delivery channel that `notification` ([RFC 0007](0007-notification-service.md)) would supply; not scheduled |
-| Token **verification** code | `libs/common/auth.py` ([RFC 0001](0001-platform-and-shared-infrastructure.md)). `identity` defines the claims; the shared library checks them |
+| Token **verification** code | `common/auth.py` ([RFC 0001](0001-platform-and-shared-infrastructure.md)). `identity` defines the claims; the shared library checks them |
 | Rate limiting enforcement | At the `gateway` ([RFC 0002](0002-gateway-service.md)) with Redis. The limits that apply to identity routes are recorded here (§6.2) |
 | Resource-level authorisation in other services | Owned by the service that owns the resource ([RFC 0000 §3.1.1.4](0000-architecture.md#3114-authentication-and-authorisation-split)). `identity` says "merchant `M` with role `merchant`"; `catalog` decides whether `M` may edit product `P` |
 | A central policy service, token introspection on each request | Rejected by A4/A5: verification is local |
@@ -151,12 +151,12 @@ Decided and recorded rather than open: `identity` is **not** split into `auth` a
 | R3 | `identity` is the single writer of users, roles, merchant status, sessions |
 | R4 | Other services learn identity facts through the token (claim), `GET /merchants/{id}` (API), or events |
 | R7 | Local JWT verification is the mechanism by which no other service needs `identity` up to serve reads |
-| R8 | `libs/common` holds verification and the claim model, never `UserRole` or `MerchantStatus` values — those are in `identity/app/models/enums.py` |
+| R8 | `common` holds verification and the claim model, never `UserRole` or `MerchantStatus` values — those are in `identity/app/models/enums.py` |
 | A2 | `identity_db` is one logical database on the shared PostgreSQL 16 instance |
 | A4 | RS256; `identity` is the only signer. Every other component holds the public key and verifies locally, with no network call on the request path |
 | A5 | Every service re-verifies the token; the gateway's check is an early rejection, not the boundary |
 | A6 | FastAPI `async def`, SQLAlchemy 2.0 async, `asyncpg`. Argon2id hashing is CPU-bound and runs in a thread pool (`anyio.to_thread`) so it never blocks the event loop |
-| A7 | RFC 9457 problem details from the `libs/common` handler |
+| A7 | RFC 9457 problem details from the `common` handler |
 | A8 | `X-Request-ID` / `traceparent` on every log line and every outbox row |
 | A10 | Events are written to `identity_db.outbox` in the state-change transaction; `outbox-relay` publishes |
 | 0001-A5 | **Stateless access tokens, stateful refresh tokens.** Access tokens are short-lived (15 min) and never checked against the database. Refresh tokens are long-lived (7 days), stored hashed in `identity_db`, and can be revoked. The trade of revocation latency for scale, bounded by the access-token TTL |
@@ -292,7 +292,7 @@ No `role`, no `sid`, no `merchant_status`. Internal routes require the scope and
 
 **Signing keys, custody and rotation (IDN-6).**
 
-- **Algorithm and size.** RSA 2048-bit, RS256. Verifiers accept `RS256` only, pinned in `libs/common`; a token with `alg: none` or `HS256` is rejected before any key lookup, which closes algorithm-confusion attacks.
+- **Algorithm and size.** RSA 2048-bit, RS256. Verifiers accept `RS256` only, pinned in `common`; a token with `alg: none` or `HS256` is rejected before any key lookup, which closes algorithm-confusion attacks.
 - **Custody.** Key files live in a gitignored `secrets/jwt/` directory, one PEM per key named `<kid>.pem`, mounted read-only into the `identity` container only. `kid` is `YYYYMMDD-<8 hex>` so ordering is legible. The private key is never logged, never returned, never mounted elsewhere ([archive/0001](archive/0001-foundation-and-core-services.md) Q4: "a generated key pair mounted from a gitignored directory"; production KMS is out of scope).
 - **Key ring.** On startup `identity` loads every PEM in `JWT_KEYS_DIR`. `JWT_ACTIVE_KID` names the one used to sign; every loaded key's public half is published in JWKS. Startup fails loudly if the active kid is missing.
 - **Rotation procedure.** Four steps, no downtime:
@@ -427,7 +427,7 @@ Environment only, validated at startup by `pydantic-settings`; a missing or malf
 | `OTEL_SERVICE_NAME` | `identity` | |
 | `LOG_LEVEL` | `INFO` | JSON logs |
 
-**Verifier-side settings** (in `libs/common`, set in every other service; listed because `identity` defines their contract): `JWT_JWKS_URL` (`http://identity:8001/api/v1/auth/jwks`), `JWT_PUBLIC_KEYS` (fallback PEM set), `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_LEEWAY_SECONDS` (`30`), `JWKS_MIN_REFETCH_SECONDS` (`30` — the unknown-`kid` refetch throttle). `temporal-worker` additionally sets `SERVICE_CLIENT_ID` and `SERVICE_CLIENT_SECRET`.
+**Verifier-side settings** (in `common`, set in every other service; listed because `identity` defines their contract): `JWT_JWKS_URL` (`http://identity:8001/api/v1/auth/jwks`), `JWT_PUBLIC_KEYS` (fallback PEM set), `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_LEEWAY_SECONDS` (`30`), `JWKS_MIN_REFETCH_SECONDS` (`30` — the unknown-`kid` refetch throttle). `temporal-worker` additionally sets `SERVICE_CLIENT_ID` and `SERVICE_CLIENT_SECRET`.
 
 **Gateway-side settings affecting identity routes** (owned by [RFC 0002](0002-gateway-service.md)): the login limit of 5 per minute per IP and per email, the 100 per minute per IP default, the 10-second upstream timeout.
 
@@ -455,7 +455,7 @@ The outbox backlog for `identity_db` is exported by `outbox-relay` (`outbox_back
 
 **Spans.** Auto-instrumented FastAPI, SQLAlchemy and httpx spans, plus manual spans `identity.password.hash`, `identity.password.verify`, `identity.token.sign`, `identity.session.rotate`. Attributes: `enduser.id` (user id), `identity.outcome`. Never: email, password, token, token hash.
 
-**Log fields.** `request_id`/`trace_id`, `user_id`, `session_id`, `event` (`login`, `refresh`, `reuse_detected`, …), `outcome`, `client_ip`, `kid`. Emails are logged only as the first 12 hex characters of `SHA-256(lower(email))`, which is enough to correlate an attack across lines and useless for harvesting. Passwords, raw tokens and `Authorization` headers are never logged; the logging filter in `libs/common` drops those keys.
+**Log fields.** `request_id`/`trace_id`, `user_id`, `session_id`, `event` (`login`, `refresh`, `reuse_detected`, …), `outcome`, `client_ip`, `kid`. Emails are logged only as the first 12 hex characters of `SHA-256(lower(email))`, which is enough to correlate an attack across lines and useless for harvesting. Passwords, raw tokens and `Authorization` headers are never logged; the logging filter in `common` drops those keys.
 
 **Dashboard.** An "Identity" panel group on the per-service RED dashboard: login outcomes stacked, refresh outcomes with reuse highlighted, hash latency p50/p99, active signing key, merchant status changes.
 
@@ -487,7 +487,7 @@ Cache-Control: public, max-age=300, stale-while-revalidate=60, stale-if-error=86
 ETag: "<sha256 of the serialised key set, first 16 hex>"
 ```
 
-`max-age=300` bounds how long a newly published key takes to reach every verifier (rotation step 2). `stale-if-error=86400` tells caches — including the `libs/common` in-process cache, which honours the same directives — to keep verifying with the last good set for a day if `identity` is unreachable, which is what makes IDN-G3 hold across an `identity` outage longer than five minutes. On a token with an unknown `kid` a verifier refetches immediately, at most once per `JWKS_MIN_REFETCH_SECONDS` (30), so a flood of forged `kid`s cannot turn verifiers into a JWKS amplifier.
+`max-age=300` bounds how long a newly published key takes to reach every verifier (rotation step 2). `stale-if-error=86400` tells caches — including the `common` in-process cache, which honours the same directives — to keep verifying with the last good set for a day if `identity` is unreachable, which is what makes IDN-G3 hold across an `identity` outage longer than five minutes. On a token with an unknown `kid` a verifier refetches immediately, at most once per `JWKS_MIN_REFETCH_SECONDS` (30), so a flood of forged `kid`s cannot turn verifiers into a JWKS amplifier.
 
 **Login and refresh flows.**
 
@@ -559,7 +559,7 @@ The `FOR UPDATE` row lock serialises two concurrent refreshes with the same toke
 
 **Idempotency and `202`.** No identity endpoint uses `Idempotency-Key` — the mechanism belongs to business-object creation in `order` ([RFC 0005](0005-order-service.md)). Registration is protected by the unique email (a retry gets `409`); `PATCH` and the status endpoint are naturally idempotent; logout is idempotent by design. `POST /auth/refresh` is **deliberately not** idempotent: a retried refresh whose first response was lost is indistinguishable from replay and is treated as reuse (IDN-Q3). No identity endpoint starts a workflow, so none returns `202`.
 
-**Problem types** (all under the `libs/common` base URI): `invalid-credentials` (401), `invalid-refresh-token` (401), `account-inactive` (403), `merchant-suspended` (403), `forbidden` (403), `user-not-found` / `merchant-not-found` (404), `email-taken` (409), `last-admin` (409), `invalid-merchant-transition` (409), `validation` (422, with `violations[]`), `rate-limited` (429, from the gateway).
+**Problem types** (all under the `common` base URI): `invalid-credentials` (401), `invalid-refresh-token` (401), `account-inactive` (403), `merchant-suspended` (403), `forbidden` (403), `user-not-found` / `merchant-not-found` (404), `email-taken` (409), `last-admin` (409), `invalid-merchant-transition` (409), `validation` (422, with `violations[]`), `rate-limited` (429, from the gateway).
 
 ##### 3.1.2.2. Role matrix
 
@@ -742,18 +742,18 @@ Internal reversal relative to the deleted prototype, carried from [archive/0001]
 
 #### 3.1.5. Action Plan
 
-Task IDs `T4`–`T7` and `T15` are carried from [archive/0001](archive/0001-foundation-and-core-services.md) §3.1.5 (its T1–T3 — skeleton, `libs/common`, Compose — are Platform, [RFC 0001](0001-platform-and-shared-infrastructure.md)); `IDN-T*` are added.
+Task IDs `T4`–`T7` and `T15` are carried from [archive/0001](archive/0001-foundation-and-core-services.md) §3.1.5 (its T1–T3 — skeleton, `common`, Compose — are Platform, [RFC 0001](0001-platform-and-shared-infrastructure.md)); `IDN-T*` are added.
 
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
-| T4 | `identity` skeleton + Alembic + `users`, `merchant_profiles`, `refresh_sessions` migrations | `make migrate` takes an empty database to head | Platform: `libs/common`, Compose, Postgres init with `identity_db` role |
-| T5 | Password hashing (Argon2id, IDN-1 parameters), RS256 key loading, token issue in `identity` and verify in `libs/common` | Unit tests for sign/verify, expiry, tampering, wrong key, `alg` pinning | T4 |
+| T4 | `identity` skeleton + Alembic + `users`, `merchant_profiles`, `refresh_sessions` migrations | `make migrate` takes an empty database to head | Platform: `common`, Compose, Postgres init with `identity_db` role |
+| T5 | Password hashing (Argon2id, IDN-1 parameters), RS256 key loading, token issue in `identity` and verify in `common` | Unit tests for sign/verify, expiry, tampering, wrong key, `alg` pinning | T4 |
 | T6 | Auth endpoints: register (with merchant profile), login, refresh with rotation and reuse detection, logout | Integration tests green | T4, T5 |
 | T7 | User endpoints + `require_roles` dependency + admin management routes (incl. I10 guard, session revocation on role/active change) | Role-matrix tests green | T6 |
-| IDN-T1 | Key ring and `GET /api/v1/auth/jwks` with `ETag`/`Cache-Control`; `libs/common` JWKS cache with env fallback and unknown-`kid` throttle | Rotation drill passes (§7) | T5 |
+| IDN-T1 | Key ring and `GET /api/v1/auth/jwks` with `ETag`/`Cache-Control`; `common` JWKS cache with env fallback and unknown-`kid` throttle | Rotation drill passes (§7) | T5 |
 | IDN-T2 | Merchant routes: public profile, `/merchants/me`, admin listing | Tests green | T7 |
 | T15 | Seed: admin from `SEED_ADMIN_*`, two merchants (`approved`), two customers | `make seed` idempotent and re-runnable | T7, IDN-T2 |
-| IDN-T3 | Client-credentials grant: `SERVICE_CLIENTS` registry, `POST /api/v1/auth/token`, `typ=service` tokens; gateway excludes the route; `require_scope` in `libs/common` | `temporal-worker` obtains a token; user routes reject it; internal routes reject user tokens | IDN-T1 |
+| IDN-T3 | Client-credentials grant: `SERVICE_CLIENTS` registry, `POST /api/v1/auth/token`, `typ=service` tokens; gateway excludes the route; `require_scope` in `common` | `temporal-worker` obtains a token; user routes reject it; internal routes reject user tokens | IDN-T1 |
 | IDN-T4 | `outbox` migration; outbox rows for `identity.user.registered` in the registration transaction | Relay publishes to the topic; Avro schema registered | Platform: relay, Schema Registry |
 | IDN-T5 | Merchant status endpoint and transition table; `identity.merchant.status_changed` outbox row; login/refresh refusal and session revocation on suspension | E2E step: suspend → `catalog` hides products (archive/0003 Q6) | IDN-T2, IDN-T4 |
 | IDN-T6 | Metrics (§3.1.1.7), manual spans, log filter for secrets; identity panels on the RED dashboard | `/metrics` scraped; dashboard panels return data | Platform: OTel, Prometheus |
@@ -858,11 +858,11 @@ Carried questions keep their archive IDs with the source RFC named, because Q nu
 | Pydantic / pydantic-settings | 2.x | Validation, configuration |
 | PyJWT (with `cryptography`) | 2.10.x | RS256 sign and verify, JWK serialisation |
 | argon2-cffi | 23.x | Argon2id password and client-secret hashing |
-| httpx | 0.28.x | Test client; verifier JWKS fetch in `libs/common` |
+| httpx | 0.28.x | Test client; verifier JWKS fetch in `common` |
 | pytest / pytest-asyncio | 8.x / 0.24.x | Tests |
 | PostgreSQL | 16 | `identity_db` (`citext`) |
 
-**Internal dependencies.** `libs/common` (settings, DB session, logging, errors, pagination, `DomainEnum`/`DomainEnumText`, verification, outbox helper) and the Postgres init script that creates `identity_db` and its role — [RFC 0001](0001-platform-and-shared-infrastructure.md). `outbox-relay`, Kafka and Schema Registry for event delivery — [RFC 0001](0001-platform-and-shared-infrastructure.md). The gateway's routing, route exclusion of `/auth/token`, and rate limiter — [RFC 0002](0002-gateway-service.md).
+**Internal dependencies.** `common` (settings, DB session, logging, errors, pagination, `DomainEnum`/`DomainEnumText`, verification, outbox helper) and the Postgres init script that creates `identity_db` and its role — [RFC 0001](0001-platform-and-shared-infrastructure.md). `outbox-relay`, Kafka and Schema Registry for event delivery — [RFC 0001](0001-platform-and-shared-infrastructure.md). The gateway's routing, route exclusion of `/auth/token`, and rate limiter — [RFC 0002](0002-gateway-service.md).
 
 **Blockers.** None. No external account, credential or third-party service is required.
 
@@ -969,7 +969,7 @@ Carried questions keep their archive IDs with the source RFC named, because Q nu
 - **Configuration** — twelve-factor, validated at startup; a missing `JWT_ACTIVE_KID` or unreadable key fails the container loudly.
 - **Key rotation** — the four-step procedure in §3.1.1.2 (IDN-6), each step a restart; no verifier redeploys.
 - **Rollback** — Alembic `downgrade` per revision; independent of every other service's history. Rolling back past `0004_outbox` is safe only after the relay has drained `identity_db.outbox`.
-- **Event schemas** — the two Avro schemas live in `libs/common/events/schemas/` and are registered by the idempotent `make topics` step; compatibility `BACKWARD`.
+- **Event schemas** — the two Avro schemas live in `common/events/schemas/` and are registered by the idempotent `make topics` step; compatibility `BACKWARD`.
 
 ---
 
@@ -989,7 +989,7 @@ Target: 100% of the role matrix, ~80% on the service layer. Integration tests us
 - JWKS: document contains every loaded key, only public components (`n`, `e`), `alg=RS256`, `use=sig`; `ETag` stable for the same key set and changes when a key is added.
 - Slug derivation and collision suffixing.
 - Log filter: `password`, `refresh_token`, `access_token`, `client_secret`, `Authorization` never appear in a formatted record.
-- R8 grep: no `UserRole`/`MerchantStatus` literal in `libs/common`.
+- R8 grep: no `UserRole`/`MerchantStatus` literal in `common`.
 
 **Integration — identity.**
 
@@ -1029,7 +1029,7 @@ Target: 100% of the role matrix, ~80% on the service layer. Integration tests us
 4. `temporal-worker` obtains a service token and reserves stock during an order; a customer token on `/internal/v1/inventory/reservations` → `401`.
 5. Every response carries `X-Request-ID`; the login request's trace contains the `identity.password.verify` span.
 
-**Explicitly not tested here** — load and performance (no traffic target is defined), and token verification internals beyond the contract (owned by `libs/common` tests).
+**Explicitly not tested here** — load and performance (no traffic target is defined), and token verification internals beyond the contract (owned by `common` tests).
 
 ---
 
@@ -1040,7 +1040,7 @@ Target: 100% of the role matrix, ~80% on the service layer. Integration tests us
 | Consumer | What this RFC gives it | What it constrains |
 | --- | --- | --- |
 | `gateway` ([RFC 0002](0002-gateway-service.md)) | A JWKS to verify against; the claim set for coarse route checks; the login limits to enforce | Must not route `POST /auth/token`; must parse the login body for the per-email limit (IDN-Q8) |
-| Every service (via `libs/common`) | `sub`, `role`, `merchant_status`, `typ`, `scope` as the only authorisation inputs | Must pin RS256, check `typ` per route, never trust ids from bodies |
+| Every service (via `common`) | `sub`, `role`, `merchant_status`, `typ`, `scope` as the only authorisation inputs | Must pin RS256, check `typ` per route, never trust ids from bodies |
 | `catalog` ([RFC 0004](0004-catalog-service.md)) | `merchant_id` = `sub` as a claim; `merchant.status_changed` to project merchant state; `merchant_status` claim for gating (IDN-Q1) | Must not call `identity` on its read path |
 | `order`, `inventory` ([RFC 0005](0005-order-service.md), [RFC 0006](0006-inventory-service.md)) | `customer_id` = `sub`; service tokens with scopes for internal routes | Internal routes must require `typ=service` and a scope |
 | `notification` ([RFC 0007](0007-notification-service.md)) | `user.registered` with `full_name` for the `welcome` notification; token `exp` for stream re-authorisation | — |
