@@ -61,8 +61,8 @@ def bearer(tokens) -> dict:
 
 async def make_admin(app, email="admin@test.local"):
     """Admins cannot self-register; create one directly."""
+    from app.core.enums import UserRole
     from app.models import User
-    from app.models.enums import UserRole
 
     async with app.state.db.sessionmaker() as session:
         session.add(

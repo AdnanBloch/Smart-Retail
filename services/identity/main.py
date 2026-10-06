@@ -5,12 +5,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.handlers import health
-from app.api.router import router
-from app.configs.env import Settings, get_settings
-from app.infrastructure.db import create_database
-from app.infrastructure.logger import init_logger
-from app.infrastructure.security import KeyRing, PasswordHasher
+from app.core.config import Settings, get_settings
+from app.core.db import create_database
+from app.core.logger import init_logger
+from app.core.security import KeyRing, PasswordHasher
+from app.health import routes as health
+from app.router import router
 from smartretail_common.app import install_platform
 from smartretail_common.auth import JwtVerifier
 

@@ -1,6 +1,6 @@
 import pytest
 
-from app.configs.env import Settings
+from app.core.config import Settings
 from smartretail_common.testing import KeyPair, generate_keypair
 
 
