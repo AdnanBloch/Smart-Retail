@@ -80,6 +80,31 @@ def mint_token(
     )
 
 
+def mint_service_token(
+    keypair: KeyPair,
+    *,
+    client_id: str = "temporal-worker",
+    scopes: tuple[str, ...] = (),
+    ttl: int = 300,
+    issuer: str = ISSUER,
+    audience: str = AUDIENCE,
+) -> str:
+    """A ``typ=service`` token shaped like identity's client-credentials grant."""
+    now = int(time.time())
+    claims: dict[str, Any] = {
+        "iss": issuer,
+        "aud": audience,
+        "sub": f"service:{client_id}",
+        "typ": "service",
+        "scope": " ".join(scopes),
+        "iat": now,
+        "nbf": now,
+        "exp": now + ttl,
+        "jti": str(uuid.uuid4()),
+    }
+    return jwt.encode(claims, keypair.private_key, algorithm="RS256", headers={"kid": keypair.kid})
+
+
 # --- integration databases ------------------------------------------------
 
 DEFAULT_TEST_ADMIN_URL = "postgresql://postgres:postgres@127.0.0.1:55432/postgres"

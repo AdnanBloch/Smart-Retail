@@ -16,7 +16,7 @@ from smartretail_common.auth import (
     optional_principal,
     require_roles,
 )
-from smartretail_common.testing import generate_keypair, mint_token
+from smartretail_common.testing import generate_keypair, mint_service_token, mint_token
 
 KEY = generate_keypair("k1")
 OTHER = generate_keypair("k2")
@@ -166,9 +166,10 @@ async def test_malformed_header_is_401(client) -> None:
 
 
 async def test_service_token_refused_by_require_roles(client) -> None:
-    token = mint_token(KEY, sub="service:order", role=None)
+    # User-facing routes refuse service tokens with 401 (RFC 0003 §3.1.2.2).
+    token = mint_service_token(KEY, client_id="order")
     r = await client.get("/admin", headers={"Authorization": f"Bearer {token}"})
-    assert r.status_code == 403
+    assert r.status_code == 401
 
 
 async def test_optional_principal(client) -> None:

@@ -52,6 +52,8 @@ class Principal:
     expires_at: int
     key_id: str | None
     claims: Mapping[str, Any]
+    # Service tokens only: the space-separated ``scope`` claim (RFC 0003 IDN-4).
+    scopes: frozenset[str] = frozenset()
 
     @property
     def is_service(self) -> bool:
@@ -184,7 +186,8 @@ class JwtVerifier:
 
         subject = str(claims["sub"])
         token_type = "service" if subject.startswith("service:") else "user"
-        if token_type == "user" and claims.get("typ") != "access":
+        # The subject and ``typ`` must agree, so neither kind can pass as the other.
+        if claims.get("typ") != ("service" if token_type == "service" else "access"):
             raise InvalidToken("invalid")
         role = claims.get("role")
         return Principal(
@@ -197,6 +200,7 @@ class JwtVerifier:
             expires_at=int(claims["exp"]),
             key_id=kid,
             claims=claims,
+            scopes=frozenset(str(claims.get("scope", "")).split()),
         )
 
 
@@ -210,8 +214,7 @@ def bearer_token(request: Request) -> str | None:
     return token.strip()
 
 
-async def optional_principal(request: Request) -> Principal | None:
-    """No token → ``None``; a present but invalid token → 401."""
+async def _verified_principal(request: Request) -> Principal | None:
     cached = getattr(request.state, "principal", None)
     if cached is not None:
         return cached
@@ -225,6 +228,18 @@ async def optional_principal(request: Request) -> Principal | None:
     return principal
 
 
+async def optional_principal(request: Request) -> Principal | None:
+    """No token → ``None``; a present but invalid token → 401.
+
+    User-facing routes refuse service tokens with 401 (RFC 0003 IDN-D7): a
+    service token is only ever good for the internal routes that ask for it.
+    """
+    principal = await _verified_principal(request)
+    if principal is not None and principal.is_service:
+        raise InvalidToken("invalid")
+    return principal
+
+
 async def current_principal(request: Request) -> Principal:
     principal = await optional_principal(request)
     if principal is None:
@@ -235,7 +250,7 @@ async def current_principal(request: Request) -> Principal:
 def require_roles(*roles: str) -> Callable[[Request], Awaitable[Principal]]:
     """Dependency: an authenticated user whose role is in ``roles``.
 
-    Service tokens are always refused here; internal routes use scopes (M2).
+    Service tokens are always refused here; internal routes use :func:`require_scope`.
     """
     allowed = frozenset(roles)
 
@@ -243,6 +258,24 @@ def require_roles(*roles: str) -> Callable[[Request], Awaitable[Principal]]:
         principal = await current_principal(request)
         if principal.is_service or principal.role not in allowed:
             raise Forbidden("This action is not permitted for your role")
+        return principal
+
+    return dependency
+
+
+def require_scope(scope: str) -> Callable[[Request], Awaitable[Principal]]:
+    """Dependency for ``/internal/*`` routes: a service token granted ``scope``.
+
+    User tokens are refused with 403 even for admins, so a stolen customer
+    token can never reach an internal route (RFC 0006 §3.1.2.2).
+    """
+
+    async def dependency(request: Request) -> Principal:
+        principal = await _verified_principal(request)
+        if principal is None:
+            raise InvalidToken("missing")
+        if not principal.is_service or scope not in principal.scopes:
+            raise Forbidden("This route requires a service token with the right scope")
         return principal
 
     return dependency

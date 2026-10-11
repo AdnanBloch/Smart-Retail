@@ -17,6 +17,10 @@ dependencies = [
     "httpx>=0.28,<0.29",
 ]
 
+[project.optional-dependencies]
+# smartretail_common.temporal: services that own or start a workflow.
+temporal = ["temporalio>=1.9,<1.10"]
+
 [tool.setuptools.packages.find]
 include = ["smartretail_common*"]
 
