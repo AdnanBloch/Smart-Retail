@@ -11,7 +11,7 @@ TEST_PG := smartretail-test-pg
 TEST_PG_PORT := 55432
 
 .DEFAULT_GOAL := help
-.PHONY: help env keys up down reset logs ps migrate seed dev-install test-db test test-e2e lint fmt
+.PHONY: help env keys up down reset logs ps migrate seed dev-install hooks test-db test cov lint-types test-e2e lint fmt audit
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -51,7 +51,11 @@ seed: ## Seed admin, demo accounts and categories (idempotent)
 
 dev-install: ## Install every package and dev tool into $(VENV)
 	$(PY) -m pip install -q -e common ./services/identity ./services/catalog ./services/gateway
-	$(PY) -m pip install -q "pytest>=8,<9" "pytest-asyncio>=0.24,<0.26" "ruff>=0.8,<0.9" "mypy>=1.13"
+	$(PY) -m pip install -q "pytest>=8,<9" "pytest-asyncio>=0.24,<0.26" "pytest-cov>=6,<7" \
+		"ruff>=0.8,<0.9" "mypy>=1.13" "pip-audit>=2.7" "pre-commit>=4"
+
+hooks: ## Install the git pre-commit hooks
+	$(PY) -m pre_commit install
 
 test-db: ## Start a throwaway Postgres for integration tests (127.0.0.1:$(TEST_PG_PORT))
 	@docker ps --format '{{.Names}}' | grep -qx $(TEST_PG) || \
@@ -65,12 +69,20 @@ test: test-db ## Unit and integration suites for every package
 		(cd $$pkg && $(PY) -m pytest -q) || exit 1; \
 	done
 
+cov: test-db ## Tests with branch coverage; fails below 85% per package (HTML in <pkg>/htmlcov/)
+	@for pkg in $(PACKAGES); do \
+		echo "→ $$pkg"; \
+		(cd $$pkg && $(PY) -m pytest -q --cov --cov-report=term --cov-report=html) || exit 1; \
+	done
+
 test-e2e: ## Smoke test through the gateway (needs `make up migrate seed`)
 	$(PY) -m pytest -q tests/e2e
 
-lint: ## ruff (lint + format check) and mypy
+lint: lint-types ## ruff (lint + format check) and mypy
 	$(PY) -m ruff check .
 	$(PY) -m ruff format --check .
+
+lint-types: ## mypy for every package
 	@for pkg in $(PACKAGES); do \
 		echo "→ mypy $$pkg"; \
 		(cd $$pkg && $(PY) -m mypy --config-file $(CURDIR)/pyproject.toml $$(ls -d app main.py smartretail_common 2>/dev/null)) || exit 1; \
@@ -79,3 +91,6 @@ lint: ## ruff (lint + format check) and mypy
 fmt: ## Format and auto-fix
 	$(PY) -m ruff format .
 	$(PY) -m ruff check --fix .
+
+audit: ## Check installed dependencies for known vulnerabilities
+	$(PY) -m pip_audit --skip-editable

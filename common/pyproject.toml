@@ -24,3 +24,20 @@ include = ["smartretail_common*"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+
+# Coverage gate (RFC 0001, review 2026-10-06 §5): `make cov`; CI fails below 85%.
+[tool.coverage.run]
+branch = true
+concurrency = ["greenlet", "thread"]
+source = ["smartretail_common"]
+# Test support code; every service's integration suite exercises it.
+omit = ["smartretail_common/testing.py"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.coverage.html]
+directory = "htmlcov"

@@ -1,0 +1,76 @@
+# CI pipeline (RFC 0001 §3.1.1.13): lint → type check → tests with the
+# coverage gate per package against Postgres → dependency audit.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff>=0.8,<0.9"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m venv .venv && make dev-install
+      - run: make lint-types
+
+  test:
+    needs: [lint, typecheck]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [common, services/identity, services/catalog, services/gateway]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+        # Same address `make test-db` uses, so tests need no CI-only settings.
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m venv .venv && make dev-install
+      # --cov applies [tool.coverage] from the package's pyproject: branch
+      # coverage, fail_under = 85.
+      - name: pytest with coverage gate
+        working-directory: ${{ matrix.package }}
+        run: ${{ github.workspace }}/.venv/bin/python -m pytest -q --cov --cov-report=term
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m venv .venv && make dev-install
+      - run: make audit

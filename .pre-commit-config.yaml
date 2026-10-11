@@ -1,0 +1,30 @@
+# Git hooks (RFC 0001 §3.1.1.13). Install with `make hooks`; run on every file
+# with `.venv/bin/pre-commit run --all-files`. CI runs the same checks.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # mypy needs each package's dependencies, so it runs from the project venv
+  # (`make dev-install`) rather than an isolated hook environment.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: make lint-types
+        language: system
+        types: [python]
+        pass_filenames: false
