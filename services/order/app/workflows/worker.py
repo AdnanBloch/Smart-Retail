@@ -13,6 +13,9 @@ import httpx
 from temporalio.client import Client
 from temporalio.worker import Worker
 
+# Registers every ORM model: relationships name their targets by string, and the
+# worker reaches only some models through its own imports.
+import app.models  # noqa: F401
 from app.clients.inventory import InventoryClient
 from app.core.config import Settings, get_settings
 from app.core.db import create_database
