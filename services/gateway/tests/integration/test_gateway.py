@@ -82,12 +82,39 @@ async def test_public_policy_ignores_bad_token(client, upstreams) -> None:
     assert upstreams["identity"].last.headers["authorization"] == "Bearer junk"
 
 
-async def test_service_token_refused_on_role_routes(client) -> None:
-    from smartretail_common.testing import mint_token
+async def test_service_token_refused_at_the_edge(client) -> None:
+    """GW-T10: a service token is never good for a routed (user-facing) route."""
+    from smartretail_common.testing import mint_service_token
 
-    svc = mint_token(KEY, sub="service:order", role=None)
-    r = await client.post("/api/v1/products", json={}, headers={"Authorization": f"Bearer {svc}"})
-    assert r.status_code == 403
+    svc = {"Authorization": f"Bearer {mint_service_token(KEY, scopes=('inventory:internal',))}"}
+    assert (await client.post("/api/v1/products", json={}, headers=svc)).status_code == 401
+    assert (await client.get("/api/v1/products", headers=svc)).status_code == 401
+    # Internal routes do not exist at the edge, whatever the token.
+    r = await client.post("/internal/v1/inventory/reservations", json={}, headers=svc)
+    assert r.status_code == 404
+
+
+async def test_order_and_inventory_rows(client, upstreams) -> None:
+    r = await client.post("/api/v1/orders", json={}, headers=token("customer"))
+    assert r.status_code == 200 and upstreams["order"].last.url.path == "/api/v1/orders"
+    assert (
+        await client.post("/api/v1/orders", json={}, headers=token("merchant"))
+    ).status_code == 403
+    assert (
+        await client.get("/api/v1/orders/merchant", headers=token("merchant"))
+    ).status_code == 200
+    r = await client.get("/api/v1/inventory/abc")
+    assert r.status_code == 200 and upstreams["inventory"].last.url.path == "/api/v1/inventory/abc"
+    assert (await client.get("/api/v1/inventory", headers=token("customer"))).status_code == 403
+
+
+async def test_upload_route_has_the_larger_limit(client, upstreams, settings) -> None:
+    body = b"x" * (settings.gateway_max_body_bytes + 10)
+    headers = {**token("merchant"), "Content-Type": "application/octet-stream"}
+    r = await client.post("/api/v1/products/abc/media/upload", content=body, headers=headers)
+    assert r.status_code == 200
+    r = await client.post("/api/v1/products/abc/media", content=body, headers=headers)
+    assert r.status_code == 413
 
 
 @pytest.mark.parametrize(
@@ -184,7 +211,12 @@ async def test_health_and_ready(client, upstreams) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["checks"] == {"settings": "ok", "public_key": "ok", "route_table": "ok"}
-    assert body["informational"]["upstreams"] == {"identity": "ok", "catalog": "unreachable"}
+    assert body["informational"]["upstreams"] == {
+        "identity": "ok",
+        "catalog": "unreachable",
+        "order": "ok",
+        "inventory": "ok",
+    }
 
 
 async def test_aggregated_openapi(client, upstreams) -> None:

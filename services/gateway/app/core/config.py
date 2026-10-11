@@ -11,11 +11,16 @@ class GatewaySettings(BaseServiceSettings):
 
     upstream_identity_url: str = "http://identity:8001"
     upstream_catalog_url: str = "http://catalog:8002"
+    upstream_order_url: str = "http://order:8003"
+    upstream_inventory_url: str = "http://inventory:8004"
 
     gateway_cors_allow_origins: str = "http://localhost:3000,http://localhost:5173"
     gateway_cors_max_age_s: int = 600
     gateway_public_url: str = "http://localhost:8000"
     gateway_max_body_bytes: int = 1_048_576
+    # GW-14: the media upload route alone accepts larger bodies, and more time.
+    gateway_max_upload_bytes: int = 10_485_760
+    gateway_upload_read_timeout_s: float = 30.0
     gateway_upstream_connect_timeout_s: float = 2.0
     gateway_upstream_read_timeout_s: float = 10.0
     gateway_upstream_max_connections: int = 100
@@ -35,7 +40,12 @@ class GatewaySettings(BaseServiceSettings):
 
     @property
     def upstreams(self) -> dict[str, str]:
-        return {"identity": self.upstream_identity_url, "catalog": self.upstream_catalog_url}
+        return {
+            "identity": self.upstream_identity_url,
+            "catalog": self.upstream_catalog_url,
+            "order": self.upstream_order_url,
+            "inventory": self.upstream_inventory_url,
+        }
 
 
 @lru_cache

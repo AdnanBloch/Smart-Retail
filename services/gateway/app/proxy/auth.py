@@ -18,10 +18,9 @@ async def enforce_policy(
             return None
         raise InvalidToken("missing")
     principal = await verifier.verify(token)
-    if (
-        rule.policy == Policy.BEARER
-        and rule.roles
-        and (principal.is_service or principal.role not in rule.roles)
-    ):
+    if principal.is_service:
+        # GW-T10: service tokens are for internal routes, which are never routed.
+        raise InvalidToken("invalid")
+    if rule.policy == Policy.BEARER and rule.roles and principal.role not in rule.roles:
         raise Forbidden("This action is not permitted for your role")
     return principal

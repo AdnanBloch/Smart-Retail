@@ -25,10 +25,17 @@ async def proxy(request: Request, path: str) -> Response:
     if rule.policy == Policy.BLOCKED:
         raise RouteNotFound()
     await enforce_policy(request, rule, state.verifier)
+    settings = state.settings
     return await forward(
         request,
         upstream=rule.upstream,
         client=state.clients.get(rule.upstream),
-        body_limit=state.settings.gateway_max_body_bytes,
-        read_timeout=state.settings.gateway_upstream_read_timeout_s,
+        body_limit=(
+            settings.gateway_max_upload_bytes if rule.upload else settings.gateway_max_body_bytes
+        ),
+        read_timeout=(
+            settings.gateway_upload_read_timeout_s
+            if rule.upload
+            else settings.gateway_upstream_read_timeout_s
+        ),
     )

@@ -1,4 +1,5 @@
-"""The route table (RFC 0002 §3.1.2.1), Milestone 1 rows: identity and catalog.
+"""The route table (RFC 0002 §3.1.2.1): identity, catalog, and from Milestone 2
+order and inventory (GW-T10).
 
 Patterns are matched segment by segment: a literal, ``{id}`` for any single
 segment, or a trailing ``**`` for the rest of the path. The most specific
@@ -14,7 +15,10 @@ from enum import StrEnum
 
 ADMIN = "admin"
 MERCHANT = "merchant"
+CUSTOMER = "customer"
 CATALOG_WRITERS = frozenset({MERCHANT, ADMIN})
+STOCK_MANAGERS = frozenset({MERCHANT, ADMIN})
+ORDER_READERS = frozenset({CUSTOMER, ADMIN})
 
 
 class Policy(StrEnum):
@@ -31,6 +35,8 @@ class RouteRule:
     upstream: str
     policy: Policy
     roles: frozenset[str] = field(default_factory=frozenset)
+    # GW-14: the larger body limit and the `upload` timeout class.
+    upload: bool = False
 
     @property
     def segments(self) -> tuple[str, ...]:
@@ -54,8 +60,17 @@ class RouteRule:
         return all(s == "{id}" or s == p for s, p in zip(segs, path_segments, strict=True))
 
 
-def _r(pattern: str, methods: str, upstream: str, policy: Policy, roles=frozenset()) -> RouteRule:
-    return RouteRule(pattern, frozenset(methods.split(",")), upstream, policy, frozenset(roles))
+def _r(
+    pattern: str,
+    methods: str,
+    upstream: str,
+    policy: Policy,
+    roles: frozenset[str] | set[str] = frozenset(),
+    *,
+    upload: bool = False,
+) -> RouteRule:
+    methods_set = frozenset(methods.split(","))
+    return RouteRule(pattern, methods_set, upstream, policy, frozenset(roles), upload)
 
 
 P = Policy
@@ -89,10 +104,33 @@ ROUTES: tuple[RouteRule, ...] = (
     _r("/api/v1/products/{id}", "PATCH,DELETE", "catalog", P.BEARER, CATALOG_WRITERS),
     _r("/api/v1/products/{id}/history", "GET", "catalog", P.BEARER, CATALOG_WRITERS),
     _r("/api/v1/products/{id}/status", "POST", "catalog", P.BEARER, CATALOG_WRITERS),
+    _r("/api/v1/products/{id}/publish-status", "GET", "catalog", P.BEARER, CATALOG_WRITERS),
     _r("/api/v1/products/{id}/variants", "POST", "catalog", P.BEARER, CATALOG_WRITERS),
     _r("/api/v1/products/{id}/media", "POST", "catalog", P.BEARER, CATALOG_WRITERS),
+    _r(
+        "/api/v1/products/{id}/media/upload",
+        "POST",
+        "catalog",
+        P.BEARER,
+        CATALOG_WRITERS,
+        upload=True,
+    ),
     _r("/api/v1/variants/{id}", "PATCH,DELETE", "catalog", P.BEARER, CATALOG_WRITERS),
     _r("/api/v1/media/{id}", "DELETE", "catalog", P.BEARER, CATALOG_WRITERS),
+    # order (RFC 0005 §3.1.2.2)
+    _r("/api/v1/orders", "POST", "order", P.BEARER, {CUSTOMER}),
+    _r("/api/v1/orders", "GET", "order", P.BEARER, ORDER_READERS),
+    _r("/api/v1/orders/merchant", "GET", "order", P.BEARER, {MERCHANT}),
+    _r("/api/v1/orders/{id}", "GET", "order", P.BEARER, ORDER_READERS),
+    _r("/api/v1/orders/{id}/cancel", "POST", "order", P.BEARER, ORDER_READERS),
+    _r("/api/v1/orders/{id}/shipment/status", "POST", "order", P.BEARER, {ADMIN}),
+    _r("/api/v1/orders/{id}/workflow", "GET", "order", P.BEARER, {ADMIN}),
+    # inventory (RFC 0006 §3.1.2.2); the stock read is public, a product page needs it
+    _r("/api/v1/inventory", "GET", "inventory", P.BEARER, STOCK_MANAGERS),
+    _r("/api/v1/inventory/{id}", "GET", "inventory", P.OPTIONAL),
+    _r("/api/v1/inventory/{id}", "PUT", "inventory", P.BEARER, STOCK_MANAGERS),
+    _r("/api/v1/inventory/{id}/adjust", "POST", "inventory", P.BEARER, STOCK_MANAGERS),
+    _r("/api/v1/inventory/{id}/movements", "GET", "inventory", P.BEARER, STOCK_MANAGERS),
     # Internal routes are service-to-service only and never routed (RFC 0000).
     _r("/internal/**", "GET,POST,PUT,PATCH,DELETE", "", P.BLOCKED),
 )

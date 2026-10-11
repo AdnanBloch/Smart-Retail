@@ -71,7 +71,7 @@ def keypair() -> KeyPair:
 
 @pytest.fixture
 def upstreams() -> dict[str, Upstream]:
-    return {"identity": Upstream("identity"), "catalog": Upstream("catalog")}
+    return {name: Upstream(name) for name in ("identity", "catalog", "order", "inventory")}
 
 
 @pytest.fixture

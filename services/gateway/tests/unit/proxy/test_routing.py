@@ -2,7 +2,7 @@ import pytest
 
 from app.proxy.routing import ROUTES, Policy, RouteRule, RouteTable
 
-UPSTREAMS = {"identity": "http://identity", "catalog": "http://catalog"}
+UPSTREAMS = {n: f"http://{n}" for n in ("identity", "catalog", "order", "inventory")}
 TABLE = RouteTable(ROUTES, UPSTREAMS)
 
 
@@ -22,6 +22,14 @@ TABLE = RouteTable(ROUTES, UPSTREAMS)
         ("POST", "/api/v1/products/abc/variants", "catalog", Policy.BEARER),
         ("DELETE", "/api/v1/media/abc", "catalog", Policy.BEARER),
         ("POST", "/api/v1/auth/token", "identity", Policy.BLOCKED),
+        ("GET", "/api/v1/products/abc/publish-status", "catalog", Policy.BEARER),
+        ("POST", "/api/v1/products/abc/media/upload", "catalog", Policy.BEARER),
+        ("POST", "/api/v1/orders", "order", Policy.BEARER),
+        ("GET", "/api/v1/orders/merchant", "order", Policy.BEARER),
+        ("POST", "/api/v1/orders/abc/cancel", "order", Policy.BEARER),
+        ("GET", "/api/v1/orders/abc/workflow", "order", Policy.BEARER),
+        ("GET", "/api/v1/inventory/abc", "inventory", Policy.OPTIONAL),
+        ("POST", "/api/v1/inventory/abc/adjust", "inventory", Policy.BEARER),
         ("GET", "/internal/v1/anything/at/all", "", Policy.BLOCKED),
     ],
 )
