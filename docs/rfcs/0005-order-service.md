@@ -38,6 +38,7 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -112,35 +113,40 @@ The process is multi-step, crosses service boundaries (`catalog`, `inventory`, t
 
 ##### 3.1.1.1. Responsibility and boundaries
 
-**Topology around `order`.**
+**Topology around `order`** (component diagram).
 
-```
-                     client
-                       │  POST /api/v1/orders  (Idempotency-Key, X-Client-Id)
-                       ▼
-              ┌─────────────────┐
-              │ gateway :8000   │  JWT pre-check · 30 orders/min/user · X-Client-Id pass-through
-              └────────┬────────┘
-                       ▼
-  ┌──────────────────────────────────────────┐   sync, user token (A13, R5)   ┌───────────┐
-  │ order :8003                              │───────────────────────────────▶│ catalog   │
-  │  api/v1 → services → models              │   GET /products/{id}           │  :8002    │
-  │  idempotency · snapshot · totals         │                                └───────────┘
-  └───┬───────────────┬──────────────────┬───┘
-      │ order_db      │ start workflow   │ Redis idem:{user_id}:{key}
-      ▼               ▼                  ▼
-  ┌────────┐   ┌─────────────────────────────────────┐        ┌───────────┐
-  │order_db│◀──│ temporal-worker — OrderWorkflow     │───────▶│ inventory │
-  │ +outbox│   │  order activities → order services  │ HTTP,  │  :8004    │
-  └───┬────┘   │  inventory activities → HTTP        │ service│           │
-      │        │  payment/shipping → provider fakes  │ token  └───────────┘
-      │        └─────────────────────────────────────┘
-      │ outbox-relay (SKIP LOCKED, key = order_id)
-      ▼
-  Kafka: smartretail.order.* · smartretail.payment.* · smartretail.shipment.status_changed
-      ├──▶ notification   ├──▶ analytics   └──▶ inventory (order.cancelled)
+```mermaid
+flowchart TB
+    client["Client"]
+    gw["gateway :8000<br/>JWT pre-check, 30 orders/min/user,<br/>X-Client-Id pass-through"]
+    subgraph orderSvc["order :8003"]
+        api["routes → repos → models<br/>idempotency, snapshot, totals"]
+    end
+    catalog["catalog :8002"]
+    redis[("Redis<br/>idem:{user_id}:{key}")]
+    db[("order_db<br/>+ outbox")]
+    worker["temporal-worker: OrderWorkflow<br/>order activities → order repos<br/>inventory activities → HTTP<br/>payment and shipping → provider fakes"]
+    inventory["inventory :8004"]
+    relay["outbox-relay<br/>SKIP LOCKED, key = order_id"]
+    kafka[["Kafka: smartretail.order.*<br/>smartretail.payment.*<br/>smartretail.shipment.status_changed"]]
+    notification["notification"]
+    analytics["analytics"]
+    carrier["carrier (simulated)"]
 
-  carrier (simulated) ── POST /api/v1/webhooks/shipment (HMAC) ──▶ order
+    client -->|"POST /api/v1/orders<br/>Idempotency-Key, X-Client-Id"| gw
+    gw --> api
+    api -->|"sync, user token (A13, R5)<br/>GET /products/{id}"| catalog
+    api -.->|"fast path"| redis
+    api --> db
+    api -->|"start workflow"| worker
+    worker --> db
+    worker -->|"HTTP, service token"| inventory
+    db --> relay
+    relay --> kafka
+    kafka --> notification
+    kafka --> analytics
+    kafka -->|"order.cancelled"| inventory
+    carrier -->|"POST /api/v1/webhooks/shipment (HMAC)"| api
 ```
 
 **Owns** — facts nothing else writes ([RFC 0000 ownership map](0000-architecture.md#3136-ownership-map)):
@@ -181,7 +187,7 @@ The process is multi-step, crosses service boundaries (`catalog`, `inventory`, t
 | --- | --- | --- |
 | R1 | A service reads and writes only its own database | `order` holds the only role with grants on `order_db`. Order-side activities in `temporal-worker` and order's Celery tasks run `order`'s code with `order`'s role; nothing else connects |
 | R2 / S15 | No FK crosses a boundary | `order_items.product_id`, `variant_id`, `merchant_id` and `orders.customer_id` are plain indexed UUIDs (A3) |
-| R3 | One writer per fact | Order, payment and shipment state are written only by `OrderService` |
+| R3 | One writer per fact | Order, payment and shipment state are written only by `OrderRepo` |
 | R4 | Cross-service reads by API or event | Product data by API; stock by API; nothing joins |
 | R5 / A13 | Sync calls only where the caller cannot proceed | `order → catalog` at creation is **the one such call in the system** |
 | R6 / A14 | Data crossing a boundary is snapshotted | Line items store name, SKU, options and price as they were at purchase |
@@ -204,43 +210,100 @@ The process is multi-step, crosses service boundaries (`catalog`, `inventory`, t
 | C21 | Delivery is scoped by originating client | `orders.origin_client_id`, persisted at creation, read by every activity that writes an outbox row |
 | S2, S4, S6, S7, S8, S10, S11, S12 | Schema conventions | Applied in §3.1.3; S4 transition tables in §3.1.1.3 |
 
-**Internal module layout** (the [RFC 0000 module structure](0000-architecture.md#3117-module-structure-inside-a-service); handlers do not touch the ORM, and the service layer does not construct HTTP responses):
+**Internal module layout** (the entity-first layout of [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) and [file-structure.md §4](../file-structure.md#4-service-layout-every-service); routes do not touch the ORM, and repos do not construct HTTP responses). `order` is planned; its one entity is `orders/` (orders, items, status history). `idempotency_keys` is request-level machinery rather than an order rule (R8), so it sits in `core/`:
 
 ```
 services/order/
+├── main.py                       create_application(): settings, logging, DB, router, /health
+├── alembic.ini
+├── alembic/                      per-service history (S14), render_item hook (S4)
 ├── app/
-│   ├── api/v1/
-│   │   ├── router.py            every route: /orders, /orders/{id}/shipment/status, /webhooks
-│   │   ├── orders.py            handlers: POST/GET /orders, /orders/{id}, /cancel, /merchant, /workflow
-│   │   ├── shipment_admin.py    handler: POST /orders/{id}/shipment/status (test-only)
-│   │   └── webhooks.py          handler: POST /webhooks/shipment (HMAC)
-│   ├── domain/
-│   │   ├── enums.py             OrderStatus, PaymentStatus, ShipmentStatus, IdempotencyState,
-│   │   │                        OrderFailureReason (ORD-5)
-│   │   ├── state_machine.py     ORDER_/PAYMENT_/SHIPMENT_TRANSITIONS, transition()
-│   │   └── money.py             line and order totals (S2)
-│   ├── services/
-│   │   ├── order_service.py     create, advance(), cancel, reads — the only writer of status
-│   │   ├── idempotency.py       claim / replay / complete / release (B7)
-│   │   ├── snapshot.py          catalog lookup → OrderLineSnapshot
-│   │   ├── shipment_service.py  apply_carrier_update() — shared by webhook and admin route
-│   │   └── outbox.py            order-event payload builders (envelope from common)
+│   ├── router.py                 includes only: owns /api/v1 and the /orders and /webhooks prefixes
+│   ├── models.py                 imports every ORM model onto one metadata (Alembic, seed)
+│   ├── seed.py                   sample orders through the real workflow (O16)
+│   ├── core/
+│   │   ├── config.py             OrderSettings (§3.1.1.6)
+│   │   ├── db.py                 Database factory, get_db
+│   │   ├── logger.py             JSON logging
+│   │   ├── dependencies.py       principal, role guards; user routes reject service tokens
+│   │   ├── security.py           carrier HMAC signer and verifier (ORD-13)
+│   │   ├── errors.py             IllegalTransition, idempotency and catalog problem types
+│   │   ├── enums.py              IdempotencyState
+│   │   ├── idempotency.py        IdempotencyKey ORM model + IdempotencyRepo:
+│   │   │                         claim / replay / complete / release (B7, ORD-8)
+│   │   ├── schemas.py            Pydantic bases
+│   │   └── utils.py              key canonicalisation, request hash (ORD-7)
+│   ├── health/
+│   │   └── routes.py             /health, /health/ready
+│   ├── orders/
+│   │   ├── models.py             Order, OrderItem, OrderStatusHistory — persistence only
+│   │   ├── repo.py               OrderRepo: create, advance(), cancel, reads — the only writer of status
+│   │   ├── shipment_repo.py      ShipmentRepo.apply_carrier_update() — shared by webhook and admin route
+│   │   ├── snapshot.py           catalog lookup → OrderLineSnapshot
+│   │   ├── events.py             order-event payload builders (envelope from common)
+│   │   ├── dependencies.py       builds the repos for a request
+│   │   ├── enums.py              OrderStatus, PaymentStatus, ShipmentStatus,
+│   │   │                         OrderFailureReason (ORD-5)
+│   │   ├── state_machine.py      ORDER_/PAYMENT_/SHIPMENT_TRANSITIONS, transition()
+│   │   ├── utils.py              money: line and order totals (S2, ORD-4)
+│   │   └── v1/
+│   │       ├── routes.py         POST/GET /orders, /merchant, /{id}, /{id}/cancel, /{id}/workflow,
+│   │       │                     /{id}/shipment/status (test-only)
+│   │       └── schemas.py        the v1 request/response contract
+│   ├── webhooks/
+│   │   └── v1/
+│   │       ├── routes.py         POST /webhooks/shipment (HMAC)
+│   │       └── schemas.py        carrier callback body
 │   ├── providers/
-│   │   ├── payment.py           PaymentProvider protocol + FakePaymentProvider
-│   │   └── shipping.py          ShippingProvider protocol + FakeShippingProvider
+│   │   ├── payment.py            PaymentProvider protocol + FakePaymentProvider
+│   │   └── shipping.py           ShippingProvider protocol + FakeShippingProvider
 │   ├── clients/
-│   │   ├── catalog.py           httpx client, user token forwarded
-│   │   └── inventory.py         httpx client, service token (ORD-11)
+│   │   ├── catalog.py            httpx client, user token forwarded
+│   │   └── inventory.py          httpx client, service token (ORD-11)
 │   ├── workflows/
-│   │   ├── order_workflow.py    OrderWorkflow — sequence, compensation, signal, query
-│   │   └── activities.py        thin adapters (B1)
-│   ├── tasks/
-│   │   └── maintenance.py       sweep_idempotency_keys, resume_unstarted_orders (Celery)
-│   ├── models/                  SQLAlchemy ORM — persistence only
-│   ├── schemas/                 Pydantic request/response contracts
-│   └── core/                    settings, security dependencies
-├── alembic/                     per-service history (S14), render_item hook (S4)
+│   │   ├── order_workflow.py     OrderWorkflow — sequence, compensation, signal, query
+│   │   └── activities.py         thin adapters over the repos (B1)
+│   └── tasks/
+│       └── maintenance.py        sweep_idempotency_keys, resume_unstarted_orders (Celery)
 └── tests/
+    ├── unit/orders/              state machines, money, events, fakes
+    └── integration/orders/       real Postgres; test_migrations.py
+```
+
+```mermaid
+flowchart LR
+    subgraph callers["Callers (thin)"]
+        routes["orders/v1/routes.py<br/>webhooks/v1/routes.py"]
+        acts["workflows/activities.py"]
+        tasks["tasks/maintenance.py"]
+    end
+    subgraph rules["Business rules"]
+        orepo["orders/repo.py<br/>OrderRepo"]
+        srepo["orders/shipment_repo.py<br/>ShipmentRepo"]
+        irepo["core/idempotency.py<br/>IdempotencyRepo"]
+        sm["orders/state_machine.py<br/>orders/utils.py (money)"]
+    end
+    subgraph edges["Outbound adapters"]
+        clients["clients/catalog.py<br/>clients/inventory.py"]
+        providers["providers/payment.py<br/>providers/shipping.py"]
+    end
+    db[("order_db<br/>orders/models.py, outbox")]
+    wf["workflows/order_workflow.py<br/>OrderWorkflow"]
+
+    routes --> irepo
+    routes --> orepo
+    routes --> srepo
+    wf --> acts
+    acts --> orepo
+    acts --> clients
+    acts --> providers
+    tasks --> irepo
+    tasks --> orepo
+    orepo --> sm
+    srepo --> orepo
+    orepo --> clients
+    orepo --> db
+    irepo --> db
 ```
 
 `temporal-worker` registers `OrderWorkflow` and `order`'s activities by importing `app.workflows`; `celery-worker` registers `app.tasks`. Both are hosts ([RFC 0001](0001-platform-and-shared-infrastructure.md)); the logic and its tests belong here.
@@ -249,22 +312,50 @@ services/order/
 
 **Aggregate.** `Order` is the aggregate root. Its children are `OrderItem` (line snapshots, immutable after creation) and `OrderStatusHistory` (append-only). Payment and shipment are **value-level sub-state on the root**, not entities of their own — there is exactly one payment and at most one shipment per order. `IdempotencyKey` is a separate aggregate: it exists before the order does, and it references the order by id once created.
 
-```
-  Order (root) ─── version (S6)
-   ├── status : OrderStatus                 ── ORDER_TRANSITIONS
-   ├── payment_status : PaymentStatus       ── PAYMENT_TRANSITIONS
-   │     payment_reference
-   ├── shipment_status : ShipmentStatus     ── SHIPMENT_TRANSITIONS
-   │     shipment_reference, tracking_number
-   ├── subtotal, shipping_fee, total, currency     (S2)
-   ├── shipping_address (jsonb snapshot, S8)
-   ├── workflow_id, workflow_run_id
-   ├── origin_client_id                     (opaque client token, C21)
-   ├── OrderItem[1..n]   product_id, variant_id, merchant_id, product_name, sku,
-   │                     variant_options, unit_price, quantity, line_total  — all snapshots
-   └── OrderStatusHistory[*]  from_status → to_status, reason, actor, correlation_id
-
-  IdempotencyKey (key, user_id) ── state, request_hash, stored reply, order_id?
+```mermaid
+classDiagram
+    class Order {
+        <<aggregate root>>
+        version : S6 optimistic concurrency
+        status : OrderStatus
+        payment_status : PaymentStatus
+        payment_reference
+        shipment_status : ShipmentStatus
+        shipment_reference
+        tracking_number
+        subtotal, shipping_fee, total, currency : S2
+        shipping_address : jsonb snapshot, S8
+        workflow_id, workflow_run_id
+        origin_client_id : opaque client token, C21
+    }
+    class OrderItem {
+        <<snapshot, immutable>>
+        product_id, variant_id, merchant_id
+        product_name, sku, variant_options
+        unit_price, quantity, line_total
+    }
+    class OrderStatusHistory {
+        <<append-only>>
+        from_status, to_status
+        reason, actor, correlation_id
+    }
+    class IdempotencyKey {
+        <<separate aggregate>>
+        key, user_id
+        state, request_hash
+        stored reply
+        order_id : nullable
+    }
+    class TransitionTables {
+        <<state machine>>
+        ORDER_TRANSITIONS
+        PAYMENT_TRANSITIONS
+        SHIPMENT_TRANSITIONS
+    }
+    Order "1" *-- "1..*" OrderItem : lines
+    Order "1" *-- "0..*" OrderStatusHistory : timeline
+    IdempotencyKey ..> Order : order_id once created
+    Order ..> TransitionTables : status columns constrained by
 ```
 
 **Invariants.**
@@ -272,13 +363,13 @@ services/order/
 | # | Invariant | Where enforced |
 | --- | --- | --- |
 | I1 | One order per `(user_id, Idempotency-Key)` | Primary key / unique `(user_id, key)` on `idempotency_keys` (S11, B7) |
-| I2 | Every status, payment-status and shipment-status change is an edge in its transition table | `transition()` in `app/utils/state_machine.py`; nothing else assigns those columns (review check) |
-| I3 | No lost update on an order | `version` checked and incremented in `OrderService.advance()` (S6); the loser gets `409` |
-| I4 | `line_total = unit_price × quantity`; `subtotal = Σ line_total`; `total = subtotal + shipping_fee` | `app/utils/money.py`, computed server-side; stored values never recomputed from live catalog data |
+| I2 | Every status, payment-status and shipment-status change is an edge in its transition table | `transition()` in `app/orders/state_machine.py`; nothing else assigns those columns (review check) |
+| I3 | No lost update on an order | `version` checked and incremented in `OrderRepo.advance()` (S6); the loser gets `409` |
+| I4 | `line_total = unit_price × quantity`; `subtotal = Σ line_total`; `total = subtotal + shipping_fee` | `app/orders/utils.py`, computed server-side; stored values never recomputed from live catalog data |
 | I5 | All lines share the order's `currency` | Creation rejects mixed currencies with `422` (S2) |
 | I6 | `quantity > 0`; money columns non-negative | Database `CHECK`s (S2, S11) and Pydantic |
 | I7 | A snapshot never changes after creation | No update path exists for `order_items`; tested (§7) |
-| I8 | Every state change writes its history row (S7) and its outbox row (B11) in the same transaction | `OrderService.advance()` |
+| I8 | Every state change writes its history row (S7) and its outbox row (B11) in the same transaction | `OrderRepo.advance()` |
 | I9 | Amounts come from the catalog snapshot, never from the client | The request schema has no price field; an extra field is rejected |
 | I10 | At most one line per `variant_id` per order | Creation rejects duplicates with `422` — required because `inventory.reservations` is unique on `(order_id, variant_id)` (ORD-6) |
 
@@ -299,53 +390,37 @@ services/order/
 
 | Code set | Where | Values | Why not a `DomainEnum` column |
 | --- | --- | --- | --- |
-| `OrderFailureReason` (ORD-5) | `orders.failure_reason`, `order_status_history.reason`, event payloads, metric label | `INSUFFICIENT_STOCK`, `INVENTORY_UNAVAILABLE`, `PAYMENT_DECLINED`, `PAYMENT_TIMEOUT`, `RESERVATION_EXPIRED`, `COMMIT_FAILED`, `FULFILMENT_FAILED`, `REFUND_FAILED`, `OPERATOR_TERMINATED` | The first three are the archive's codes; the rest name failure paths the archive describes without naming. The column is specified as plain nullable `text` in the catalogue; the set is a `StrEnum` in `app/models/enums.py` validated by the service layer so metric labels stay bounded |
+| `OrderFailureReason` (ORD-5) | `orders.failure_reason`, `order_status_history.reason`, event payloads, metric label | `INSUFFICIENT_STOCK`, `INVENTORY_UNAVAILABLE`, `PAYMENT_DECLINED`, `PAYMENT_TIMEOUT`, `RESERVATION_EXPIRED`, `COMMIT_FAILED`, `FULFILMENT_FAILED`, `REFUND_FAILED`, `OPERATOR_TERMINATED` | The first three are the archive's codes; the rest name failure paths the archive describes without naming. The column is specified as plain nullable `text` in the catalogue; the set is a `StrEnum` in `app/orders/enums.py` validated by the service layer so metric labels stay bounded |
 | Actor | `order_status_history.actor` | `customer:<id>` \| `workflow` \| `admin:<id>` \| `system` | A `<kind>:<id>` composite is not a closed set (S4) |
 
 **Order number.** `order_number` is human-readable, `SR-<year>-<7-digit sequence>`, e.g. `SR-2026-0001042`, unique. The sequence is a Postgres sequence `order_number_seq` in `order_db`, created by the initial migration (ORD-3). It is never used as a key across a boundary — ids are UUIDs (S1).
 
 ##### 3.1.1.3. State machines
 
-Three columns are state machines. Under S4 they are `text`, so the database no longer rejects a bad status; what replaces it is stricter, and it lives in `services/order/app/utils/state_machine.py` — one file, next to the enums it constrains.
+Three columns are state machines. Under S4 they are `text`, so the database no longer rejects a bad status; what replaces it is stricter, and it lives in `services/order/app/orders/state_machine.py` — one file, next to the enums it constrains (`app/orders/enums.py`).
 
 **Order status diagram.**
 
-```
-                         created
-                            │
-                            ▼
-                      ┌───────────┐  reserve fails          ┌──────────┐
-                      │  pending  │────────────────────────▶│          │
-                      └─────┬─────┘                         │          │
-               reserve ok   │   cancel (before commit)      │  failed  │ terminal
-                            │ ─────────────────┐            │          │
-                            ▼                  ▼            │          │
-                 ┌────────────────────┐   ┌───────────┐     │          │
-                 │  awaiting_payment  │──▶│ cancelled │     │          │
-                 └──┬──────────┬───┬──┘   └───────────┘     │          │
-     charged,       │          │   │ declined / timeout     │          │
-     committed,     │          │   └───────────────────────▶│          │
-     shipment       │          │ commit or shipment fails   │          │
-     created        │          │ after charge (ORD-1)       │          │
-                    │          ▼                            │          │
-                    │    ┌───────────┐  refund done         │          │
-                    │    │ refunding │─────────────────────▶│          │
-                    │    └─────┬─────┘  (pre-confirmation)  └──────────┘
-                    │      ▲   │ refund done (post-confirmation)
-                    ▼      │   ▼
-             ┌───────────┐ │ ┌──────────┐
-             │ confirmed │─┤ │ refunded │ terminal
-             └─────┬─────┘ │ └──────────┘
-    carrier:       │       │ refund (no v1 trigger, ORD-Q1)
-    shipped        ▼       │
-             ┌───────────┐ │
-             │  shipped  │─┤
-             └─────┬─────┘ │
-    carrier:       │       │
-    delivered      ▼       │
-             ┌───────────┐ │
-             │ delivered │─┘
-             └───────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> pending : created
+    pending --> awaiting_payment : reserve ok
+    pending --> failed : reserve fails
+    pending --> cancelled : cancel before commit
+    awaiting_payment --> confirmed : charged, committed, shipment created
+    awaiting_payment --> failed : declined or timeout
+    awaiting_payment --> cancelled : cancel before commit
+    awaiting_payment --> refunding : commit or shipment fails after charge, ORD-1
+    confirmed --> shipped : carrier shipped
+    confirmed --> refunding : refund, no v1 trigger, ORD-Q1
+    shipped --> delivered : carrier delivered
+    shipped --> refunding : refund, ORD-Q1
+    delivered --> refunding : refund, ORD-Q1
+    refunding --> failed : refund done, pre-confirmation
+    refunding --> refunded : refund done, post-confirmation
+    cancelled --> [*]
+    failed --> [*]
+    refunded --> [*]
 ```
 
 **`ORDER_TRANSITIONS`** — the full table. Terminal states have no outgoing edge.
@@ -408,6 +483,18 @@ def transition(self, target: OrderStatus, *, actor: str, reason: str | None = No
 
 `failed` and `refunded` are terminal. An order cancelled before payment keeps `none`.
 
+```mermaid
+stateDiagram-v2
+    [*] --> none
+    none --> pending : order enters awaiting_payment
+    pending --> succeeded : charge_payment returns a reference
+    pending --> failed : decline, or timeout with nothing captured
+    pending --> refunded : ambiguous timeout found a capture and refunded it
+    succeeded --> refunded : refund_payment completes
+    failed --> [*]
+    refunded --> [*]
+```
+
 **Shipment sub-state — `SHIPMENT_TRANSITIONS`** (ORD-2).
 
 | From | To | Triggered by | Order status effect | Event |
@@ -418,11 +505,22 @@ def transition(self, target: OrderStatus, *, actor: str, reason: str | None = No
 | `shipped` | `delivered` | Carrier `delivered` | `shipped → delivered` | `shipment.status_changed` |
 | `in_transit` | `delivered` | Carrier `delivered` | `shipped → delivered` | `shipment.status_changed` |
 
+```mermaid
+stateDiagram-v2
+    [*] --> none
+    none --> created : create_shipment returns reference and tracking
+    created --> shipped : carrier shipped
+    shipped --> in_transit : carrier in_transit
+    shipped --> delivered : carrier delivered
+    in_transit --> delivered : carrier delivered
+    delivered --> [*]
+```
+
 `delivered` is terminal. A carrier update that repeats the current status is an idempotent no-op (`200`, no row, no event); any other update not in the table is `409`. A carrier update on an order that is not `confirmed`/`shipped` (for example `refunding`) is `409`.
 
-**Why this is strictly stronger than the type it replaces.** Let *V* be the value set and *T ⊆ V × V* the legal transition relation. A Postgres `ENUM` on `orders.status` constrained an `UPDATE` to *new ∈ V* — it checked the label and never the edge. It therefore accepted all 81 ordered pairs over the nine order states. `ORDER_TRANSITIONS` accepts 14. The 67 it rejects are the writes that actually corrupt an order: un-delivering (`delivered → pending`), reviving a terminal state (`cancelled → confirmed`), and skipping payment entirely (`pending → confirmed`). Every one of those was always valid against a native `order_status` type. The honest boundary of the claim: the enum's guarantee applied to *every* writer including a hand-run `psql` statement, while the transition table applies only to writers that go through `OrderService`. It is strictly stronger **within the application**, not within the database; the trade is bounded by R1 giving `order_db` exactly one service and one role, and manual status edits go through an admin utility that calls the service layer.
+**Why this is strictly stronger than the type it replaces.** Let *V* be the value set and *T ⊆ V × V* the legal transition relation. A Postgres `ENUM` on `orders.status` constrained an `UPDATE` to *new ∈ V* — it checked the label and never the edge. It therefore accepted all 81 ordered pairs over the nine order states. `ORDER_TRANSITIONS` accepts 14. The 67 it rejects are the writes that actually corrupt an order: un-delivering (`delivered → pending`), reviving a terminal state (`cancelled → confirmed`), and skipping payment entirely (`pending → confirmed`). Every one of those was always valid against a native `order_status` type. The honest boundary of the claim: the enum's guarantee applied to *every* writer including a hand-run `psql` statement, while the transition table applies only to writers that go through `OrderRepo`. It is strictly stronger **within the application**, not within the database; the trade is bounded by R1 giving `order_db` exactly one service and one role, and manual status edits go through an admin utility that calls the service layer.
 
-**Both guards run in the same transaction, and neither subsumes the other.** The S6 `version` check answers *"has anyone else changed this row since I read it?"* — a question about concurrency. `transition()` answers *"is this move legal from where the row actually is?"* — a question about the state machine. `version` alone permits a perfectly serialised `delivered → pending`; `transition()` alone permits two workers both reading `confirmed` and both legally moving to `shipped`, writing two shipments. `OrderService.advance()` performs the version check, the transition, the S7 history row and the B11 outbox row in one transaction, and both failures surface as `409`. Optimistic concurrency is enough on orders (archive/0002 Q10, decided): the workflow is effectively a single writer per order, and `version` protects against a concurrent admin action or carrier update.
+**Both guards run in the same transaction, and neither subsumes the other.** The S6 `version` check answers *"has anyone else changed this row since I read it?"* — a question about concurrency. `transition()` answers *"is this move legal from where the row actually is?"* — a question about the state machine. `version` alone permits a perfectly serialised `delivered → pending`; `transition()` alone permits two workers both reading `confirmed` and both legally moving to `shipped`, writing two shipments. `OrderRepo.advance()` performs the version check, the transition, the S7 history row and the B11 outbox row in one transaction, and both failures surface as `409`. Optimistic concurrency is enough on orders (archive/0002 Q10, decided): the workflow is effectively a single writer per order, and `version` protects against a concurrent admin action or carrier update.
 
 ##### 3.1.1.4. Workflows and async jobs
 
@@ -430,35 +528,63 @@ def transition(self, target: OrderStatus, *, actor: str, reason: str | None = No
 
 The synchronous part of checkout, in the `order` HTTP handler, before any workflow starts:
 
+```mermaid
+flowchart TD
+    req(["POST /api/v1/orders<br/>Idempotency-Key, X-Client-Id optional"]) --> hasKey{"Idempotency-Key<br/>present?"}
+    hasKey -- "no" --> r400["400 idempotency-key-required"]
+    hasKey -- "yes" --> fast{"0. Redis fast path<br/>GET idem:{user_id}:{key}"}
+    fast -- "hit, same hash" --> replayRedis["replay stored reply<br/>no Postgres"]
+    fast -- "hit, other hash" --> r422a["422"]
+    fast -- "miss, or Redis down" --> claim{"a. claim: INSERT idempotency_keys<br/>state=in_progress, expires_at = now() + 24h<br/>ON CONFLICT (user_id, key) DO NOTHING RETURNING"}
+    claim -- "row returned" --> owns["this request owns the key"]
+    claim -- "no row" --> existing{"read existing row"}
+    existing -- "hash differs" --> r422b["422 idempotency-key-reused"]
+    existing -- "completed" --> replayDb["replay response_status +<br/>response_body verbatim"]
+    existing -- "in_progress, fresh" --> r409["409 + Retry-After: 1"]
+    existing -- "in_progress stale, or expired" --> reclaim["reclaim by conditional UPDATE, ORD-8"]
+    reclaim --> owns
+    owns --> cat{"b. GET catalog /products/{id}<br/>per line, user token"}
+    cat -- "unknown or unpublished" --> r422c["422, completed and replayed"]
+    cat -- "catalog unavailable" --> r503["503, claim released"]
+    cat -- "ok" --> snap["c. snapshot name, sku, options, price<br/>compute totals, check currency"]
+    snap --> tx["d. one transaction:<br/>INSERT orders status=pending + order_items<br/>INSERT order_status_history ∅ → pending<br/>INSERT outbox order.created<br/>UPDATE idempotency_keys completed, 202 body"]
+    tx --> wf{"e. start OrderWorkflow<br/>workflow_id = order-{order_id}"}
+    wf -- "started" --> runid["record workflow_run_id"]
+    wf -- "Temporal unreachable" --> nullrun["leave run id null<br/>resume_unstarted_orders starts it, ORD-9"]
+    runid --> cache["f. SET idem:{user_id}:{key}<br/>stored reply, 24h, best effort"]
+    nullrun --> cache
+    cache --> r202(["g. 202 order_id, order_number,<br/>status pending, _links.self"])
 ```
-  POST /api/v1/orders   Idempotency-Key: <key>   X-Client-Id: <opaque>?
-        │
-   0.  Redis fast path   GET idem:{user_id}:{key}
-        │   hit, same hash      → replay stored reply (no Postgres)
-        │   hit, other hash     → 422
-        │   miss / Redis down   → continue
-   a.  claim   INSERT idempotency_keys (key, user_id, request_hash, state=in_progress,
-        │                                expires_at = now() + 24h)
-        │      ON CONFLICT (user_id, key) DO NOTHING RETURNING …
-        │   row returned        → this request owns the key
-        │   no row              → read existing:
-        │        hash differs          → 422 idempotency-key-reused
-        │        completed             → replay response_status + response_body verbatim
-        │        in_progress, fresh    → 409 + Retry-After: 1
-        │        in_progress, stale / expired → reclaim (conditional UPDATE, ORD-8)
-   b.  GET catalog /products/{id} per line (user's token); reject unpublished / unknown
-   c.  snapshot name, sku, options, price; compute totals; check currency consistency
-   d.  BEGIN
-        │   INSERT orders (status=pending, origin_client_id, placed_at) + order_items
-        │   INSERT order_status_history (∅ → pending, actor=customer:<id>)
-        │   INSERT outbox (order.created)
-        │   UPDATE idempotency_keys SET state=completed, order_id, response_status=202,
-        │          response_body = {order_id, order_number, status, _links}
-        │ COMMIT
-   e.  start OrderWorkflow  workflow_id = f"order-{order_id}"  → record workflow_run_id
-        │   Temporal unreachable → leave run id null; resume_unstarted_orders starts it (ORD-9)
-   f.  SET idem:{user_id}:{key} (stored reply, 24h)   — best effort
-   g.  return 202 {order_id, order_number, status: "pending", _links.self}
+
+**Checkout request, happy path** (the critical endpoint as a sequence):
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as gateway
+    participant O as order
+    participant R as Redis
+    participant D as order_db
+    participant K as catalog
+    participant T as Temporal
+    C->>G: POST /api/v1/orders, Idempotency-Key, X-Client-Id
+    G->>G: JWT pre-check, rate limit 30/min/user
+    G->>O: forward
+    O->>O: verify JWT (A5)
+    O->>R: GET idem:{user_id}:{key}
+    R-->>O: miss
+    O->>D: INSERT idempotency_keys ON CONFLICT DO NOTHING
+    D-->>O: row returned, key owned
+    O->>K: GET /api/v1/products/{id} per product, user token
+    K-->>O: published product, price, variants
+    O->>O: snapshot lines, compute totals, check currency
+    O->>D: BEGIN, orders + order_items + history + outbox order.created + key completed, COMMIT
+    O->>T: start OrderWorkflow, workflow_id order-{order_id}
+    T-->>O: run id
+    O->>D: record workflow_run_id
+    O->>R: SET idem:{user_id}:{key}, 24h
+    O-->>G: 202 order_id, order_number, status pending
+    G-->>C: 202 Accepted, Location /api/v1/orders/{id}
 ```
 
 **Why the claim is a unique insert.** Read-then-write has a window: two concurrent requests both find no key, both proceed, both create an order. That window is narrow under light load and wide under exactly the burst traffic Part A describes, which is the worst possible property — it works in testing and fails in the demo. A unique constraint has no window; the database arbitrates.
@@ -486,29 +612,55 @@ The synchronous part of checkout, in the `order` HTTP handler, before any workfl
 
 Its input holds identifiers only (B2). `payment_method` is an opaque provider token (for the fake, a string such as `tok_ok`), never card data — there is no field anywhere that could hold a card number. It travels only in the workflow input because no column persists it (ORD-Q5). Temporal history is readable in its UI, and nothing sensitive is put in it.
 
-```
-  OrderWorkflow(order_id)                                       stage
-  ─────────────────────────────────────────────────────────────  ──────────
-  1. reserve_inventory(order_id)              → reservation_ids  reserving
-       InsufficientStock → NonRetryable
-       ✗ → set_order_status(failed, INSUFFICIENT_STOCK | INVENTORY_UNAVAILABLE)
-  2. set_order_status(awaiting_payment)        payment: none→pending
-  3. charge_payment(order_id)                  → payment_ref     charging
-       retry on transient/timeout; NonRetryable on decline
-       ✗ → COMPENSATE: [refund_payment if ambiguous], release_inventory
-            → set_order_status(failed, PAYMENT_DECLINED | PAYMENT_TIMEOUT)
-  ──────────────── cancellable point: cancel signals honoured above ────────────────
-  4. commit_inventory(order_id)                reserved → committed   committing
-       ✗ → set_order_status(refunding, COMMIT_FAILED | RESERVATION_EXPIRED)
-            → COMPENSATE: refund_payment, release_inventory
-            → set_order_status(failed)
-  5. create_shipment(order_id)                 → shipment_ref, tracking  shipping
-       ✗ → set_order_status(refunding, FULFILMENT_FAILED)
-            → COMPENSATE: refund_payment, reverse_commit_inventory
-            → set_order_status(failed)
-  6. set_order_status(confirmed) + outbox(order.confirmed)       confirming
-  7. notify(order_id, "confirmed")  → stamps notified_at          notifying
-  ─────────────────────────────────────────────────────────────  done
+```mermaid
+sequenceDiagram
+    participant W as OrderWorkflow
+    participant O as OrderRepo and order_db
+    participant I as inventory
+    participant P as PaymentProvider
+    participant S as ShippingProvider
+    Note over W: stage reserving
+    W->>I: 1. reserve_inventory(order_id)
+    alt reserve fails, InsufficientStock is non-retryable
+        W->>O: set_order_status(failed, INSUFFICIENT_STOCK or INVENTORY_UNAVAILABLE)
+    else reserved
+        I-->>W: reservation_ids
+        W->>O: 2. set_order_status(awaiting_payment), payment none to pending
+        Note over W: stage charging
+        W->>P: 3. charge_payment(order_id), retried on transient or timeout
+        alt declined, non-retryable, or retries exhausted on timeout
+            W->>P: compensate: refund_payment, only if the charge is ambiguous
+            W->>I: compensate: release_inventory
+            W->>O: set_order_status(failed, PAYMENT_DECLINED or PAYMENT_TIMEOUT)
+        else charged
+            P-->>W: payment_ref
+            Note over W: cancellable point passed, cancel signals honoured only before here
+            Note over W: stage committing
+            W->>I: 4. commit_inventory(order_id), reserved to committed
+            alt commit fails
+                W->>O: set_order_status(refunding, COMMIT_FAILED or RESERVATION_EXPIRED)
+                W->>P: compensate: refund_payment
+                W->>I: compensate: release_inventory
+                W->>O: set_order_status(failed)
+            else committed
+                Note over W: stage shipping
+                W->>S: 5. create_shipment(order_id)
+                alt shipment fails
+                    W->>O: set_order_status(refunding, FULFILMENT_FAILED)
+                    W->>P: compensate: refund_payment
+                    W->>I: compensate: reverse_commit_inventory, ORD-12
+                    W->>O: set_order_status(failed)
+                else created
+                    S-->>W: shipment_ref, tracking
+                    Note over W: stage confirming
+                    W->>O: 6. set_order_status(confirmed) + outbox order.confirmed
+                    Note over W: stage notifying
+                    W->>O: 7. notify(order_id, confirmed), stamps notified_at
+                    Note over W: stage done
+                end
+            end
+        end
+    end
 ```
 
 Any step failing runs the compensations of the steps already completed, **in reverse order**. This is why the order lifecycle is a workflow and not a chain of event handlers: compensation stays adjacent to the step it undoes, and "where is order X?" is a query, not an inference from six consumers' logs.
@@ -572,14 +724,14 @@ class OrderWorkflow:
 | # | Activity | Calls | Idempotency | `start_to_close` | `schedule_to_close` | Retry policy | Non-retryable |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | `reserve_inventory` | `POST /internal/v1/inventory/reservations` with all lines, service token | Unique `(order_id, variant_id)` in `inventory.reservations` (B3); a retry returns the existing reservations | 10 s | 60 s | initial 1 s, ×2, max 10 s, 5 attempts | `InsufficientStock`, `UnknownVariant` |
-| 2 | `set_order_status` | `OrderService.advance()` | A no-op when the order is already in the target state | 5 s | 5 min | initial 1 s, ×2, max 30 s, unlimited within the window | `IllegalTransition` |
-| 3 | `charge_payment` | `PaymentProvider.charge()` then `OrderService.record_payment()` | Provider idempotency key `order-{id}:charge`: a retry after a timeout returns the first result, so there is **exactly one charge** | 15 s | 60 s | initial 1 s, ×2, max 10 s, **3 attempts** (a network blip is retried up to three times) | `PaymentDeclined` — a declined card is retried **zero** times |
+| 2 | `set_order_status` | `OrderRepo.advance()` | A no-op when the order is already in the target state | 5 s | 5 min | initial 1 s, ×2, max 30 s, unlimited within the window | `IllegalTransition` |
+| 3 | `charge_payment` | `PaymentProvider.charge()` then `OrderRepo.record_payment()` | Provider idempotency key `order-{id}:charge`: a retry after a timeout returns the first result, so there is **exactly one charge** | 15 s | 60 s | initial 1 s, ×2, max 10 s, **3 attempts** (a network blip is retried up to three times) | `PaymentDeclined` — a declined card is retried **zero** times |
 | 4 | `commit_inventory` | `POST /internal/v1/inventory/reservations/{id}/commit` per reservation | Committing a committed reservation is a no-op | 10 s | 5 min | initial 1 s, ×2, max 30 s, unlimited within the window | `ReservationExpired`, `ReservationNotHeld` |
-| 5 | `create_shipment` | `ShippingProvider.create_shipment()` then `OrderService.record_shipment()` | Provider key `order-{id}:shipment` | 15 s | 2 min | initial 1 s, ×2, max 15 s, 5 attempts | `AddressRejected` |
+| 5 | `create_shipment` | `ShippingProvider.create_shipment()` then `OrderRepo.record_shipment()` | Provider key `order-{id}:shipment` | 15 s | 2 min | initial 1 s, ×2, max 15 s, 5 attempts | `AddressRejected` |
 | 6 | `set_order_status(confirmed)` | as 2, writes `order.confirmed` | as 2 | 5 s | 5 min | as 2 | as 2 |
-| 7 | `notify` | `OrderService.mark_notified()` — `notified_at = coalesce(notified_at, now())` and a log line | Idempotent by `coalesce` | 5 s | 5 min | as 2 | — |
+| 7 | `notify` | `OrderRepo.mark_notified()` — `notified_at = coalesce(notified_at, now())` and a log line | Idempotent by `coalesce` | 5 s | 5 min | as 2 | — |
 | C1 | `release_inventory` | `DELETE /internal/v1/inventory/reservations/{id}` | Releasing a released or expired reservation is success | 10 s | 1 h | initial 2 s, ×2, max 60 s, unlimited within the window | — |
-| C2 | `refund_payment` | `PaymentProvider.refund()` keyed to the charge key, then `OrderService.record_refund()` | Refund key `order-{id}:refund`; "nothing captured" is success and records `payment_status failed` | 15 s | 1 h | as C1 | — |
+| C2 | `refund_payment` | `PaymentProvider.refund()` keyed to the charge key, then `OrderRepo.record_refund()` | Refund key `order-{id}:refund`; "nothing captured" is success and records `payment_status failed` | 15 s | 1 h | as C1 | — |
 | C3 | `reverse_commit_inventory` | `POST /internal/v1/inventory/reservations/{id}/reverse`: inventory's reversal of a *committed* reservation (returns quantity to `on_hand` with a `compensation` ledger row) — ORD-12, answered by [RFC 0006](0006-inventory-service.md#3121-endpoints) INV-16 | Keyed by reservation id | 10 s | 1 h | as C1 | — |
 
 **Why these numbers.** Inventory holds a reservation for 15 minutes (B5, owned by [RFC 0006](0006-inventory-service.md); archive/0002 Q2 keeps it at 15 minutes — long enough to cover a slow payment retry, short enough that stranded stock returns within a demo). The forward path's worst case — 60 s reserve + 60 s charge + 5 min commit + 2 min shipment + status writes — is under ten minutes, so a workflow that is merely slow never has its reservation swept out from under it. If the sweeper does release it (a workflow lost in a way Temporal could not recover), `commit_inventory` fails with `ReservationExpired`, which is non-retryable and triggers the refund. The workflow-level execution timeout is **24 hours** (`ORDER_WORKFLOW_EXECUTION_TIMEOUT`): large enough that it can never cut a compensation short, finite so nothing hangs indefinitely. Timeouts exist at every level — `start_to_close` per attempt, `schedule_to_close` per attempt chain, and the execution timeout.
@@ -597,6 +749,37 @@ class OrderWorkflow:
 | `committing` or later | **Not a cancellation.** The signal is recorded in workflow history and ignored. After commit a cancel would be a refund request, which has no customer-facing flow (ORD-Q1) | unchanged | unchanged |
 
 The API decides synchronously where it can: `POST /orders/{id}/cancel` reads the order and queries `get_state`; if the order is terminal or the stage is `committing` or later it returns `409` with a problem detail explaining that the order is past the cancellable point. Otherwise it sends `request_cancellation` and returns `202` with the order's URL, because the cancellation completes asynchronously. The residual race — the signal arrives in the instant the workflow enters `committing` — resolves in the workflow's favour, deterministically, and the client sees the true outcome on its next read. Temporal *Update* would close that race and is recorded as ORD-Q4. An operator-issued Temporal cancellation or termination is handled as follows: a cancellation before the cancellable point behaves exactly like the signal; after it, the workflow compensates in reverse and ends `failed` with `OPERATOR_TERMINATED`.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant O as order
+    participant D as order_db
+    participant T as Temporal
+    participant W as OrderWorkflow
+    C->>O: POST /api/v1/orders/{id}/cancel, reason optional
+    O->>D: read order, owner or admin
+    alt not found or not yours
+        O-->>C: 404
+    else order terminal
+        O-->>C: 409 order is terminal
+    else order live
+        O->>T: query get_state
+        T-->>O: stage, failure_reason, cancel_requested
+        alt Temporal unavailable
+            O-->>C: 503
+        else stage is committing or later
+            O-->>C: 409 past the cancellable point
+        else stage is starting, reserving or charging
+            O->>T: signal request_cancellation(actor, reason)
+            O-->>C: 202 cancellation requested
+            T->>W: deliver signal
+            W->>W: finish the in-flight activity
+            W->>W: run undo in reverse: refund if charged, release reservation
+            W->>D: set_order_status(cancelled) + outbox order.cancelled
+        end
+    end
+```
 
 **Signals and queries.**
 
@@ -641,7 +824,7 @@ Each fake's behaviour is a pure function of `(trigger, attempt number for that i
 
 ###### Carrier webhook simulation
 
-Shipment progression after confirmation is driven by carrier callbacks. `POST /api/v1/webhooks/shipment` is an HMAC-signed simulated carrier callback (archive/0003 T22); `POST /api/v1/orders/{id}/shipment/status` remains for manual testing. Both call `ShipmentService.apply_carrier_update()`, so there is one implementation.
+Shipment progression after confirmation is driven by carrier callbacks. `POST /api/v1/webhooks/shipment` is an HMAC-signed simulated carrier callback (archive/0003 T22); `POST /api/v1/orders/{id}/shipment/status` remains for manual testing. Both call `ShipmentRepo.apply_carrier_update()`, so there is one implementation.
 
 | Aspect | Specification |
 | --- | --- |
@@ -654,6 +837,35 @@ Shipment progression after confirmation is driven by carrier callbacks. `POST /a
 | Responses | `200 {applied: true|false}` · `401` bad or stale signature · `404` unknown order or reference · `409` illegal transition · `422` malformed body |
 | The simulator | `make carrier-sim ORDER=<order_number> STATUS=<status>` runs `scripts/carrier_sim.py`, which signs and posts exactly what a carrier would. The same signer is a test fixture, so the tests exercise the real verification path |
 
+```mermaid
+sequenceDiagram
+    participant X as Carrier (simulated)
+    participant O as order webhooks/v1/routes.py
+    participant R as ShipmentRepo
+    participant D as order_db
+    X->>O: POST /api/v1/webhooks/shipment, X-Carrier-Signature t, v1
+    O->>O: verify HMAC in constant time, timestamp within 300 s
+    alt unsigned, bad or stale signature
+        O-->>X: 401
+    else malformed body
+        O-->>X: 422
+    else verified
+        O->>R: apply_carrier_update(body)
+        R->>D: find order by order_number = merchant_reference
+        alt unknown order or shipment_reference mismatch
+            R-->>O: not found
+            O-->>X: 404
+        else same status as current
+            O-->>X: 200 applied false, no row, no event
+        else edge not in SHIPMENT_TRANSITIONS, or order not confirmed or shipped
+            O-->>X: 409
+        else legal edge
+            R->>D: advance(): shipment transition, order transition if any, history row, outbox shipment.status_changed with client_id null
+            O-->>X: 200 applied true
+        end
+    end
+```
+
 ###### Async jobs owned by `order`
 
 | Job | Host | Schedule | Effect |
@@ -661,6 +873,26 @@ Shipment progression after confirmation is driven by carrier callbacks. `POST /a
 | `sweep_idempotency_keys` | `celery-worker`, queue `maintenance` | Celery Beat, daily | `DELETE FROM idempotency_keys WHERE expires_at < now()` in batches; safe to run twice |
 | `resume_unstarted_orders` (ORD-9) | `celery-worker`, queue `maintenance` | Celery Beat, every minute | Finds `pending` orders with `workflow_run_id IS NULL` older than 30 s (the `(status, created_at)` index "for operational sweeps") and starts their workflow; `WorkflowAlreadyStarted` is success |
 | `OrderWorkflow` and its activities | `temporal-worker`, task queue `orders` | Per order | The saga above |
+
+```mermaid
+sequenceDiagram
+    participant B as Celery Beat
+    participant K as celery-worker, resume_unstarted_orders
+    participant D as order_db
+    participant T as Temporal
+    B->>K: every minute
+    K->>D: SELECT pending orders with workflow_run_id IS NULL, older than 30 s
+    D-->>K: order ids
+    loop each unstarted order
+        K->>T: start OrderWorkflow, workflow_id order-{order_id}
+        alt started
+            T-->>K: run id
+            K->>D: record workflow_run_id
+        else WorkflowAlreadyStarted
+            T-->>K: already started, treated as success
+        end
+    end
+```
 
 The `sweep_published_outbox` Beat task that trims `order_db.outbox` is the relay's, specified in [RFC 0001](0001-platform-and-shared-infrastructure.md).
 
@@ -797,7 +1029,7 @@ All routes are under `/api/v1`, reached through the gateway at `:8000`, and foll
 
 **Operational** — `GET /health`, `GET /health/ready` (checks `order_db`; reports Temporal reachability without failing on it), `GET /metrics`, `GET /docs`.
 
-**Route precedence.** `/orders/merchant` is registered before `/orders/{id}` in `api/router.py`, and `{id}` is typed as a UUID, so `merchant` can never be parsed as an id.
+**Route precedence.** `/orders/merchant` is declared before `/{id}` in `orders/v1/routes.py`, and `{id}` is typed as a UUID, so `merchant` can never be parsed as an id.
 
 **`202` semantics.** An accepted order exists and is addressable, but its lifecycle is asynchronous. The client learns the outcome by `GET /orders/{id}` or, preferably, by the `order_confirmed` / `order_failed` notification pushed by `notification` over SSE ([RFC 0007](0007-notification-service.md)). A client retry is a poll, never a second order.
 
@@ -862,6 +1094,76 @@ Owned by `order` · PostgreSQL 16 · one logical database with one role (A2, R1)
 **Markers**, as in the archived catalogue: *(none)* = stated explicitly in a source RFC; `†` = column named in a source RFC but its type was not stated there, inferred from S1–S15; `‡` = not named in any source RFC, present because a convention requires it. The four `order_db` tables carry **no** `†` or `‡` cells — every column below was stated with its type in a source RFC.
 
 **Non-database state.** Redis holds `idem:{user_id}:{key}` (24 h, the idempotency fast path). Temporal owns workflow execution state, referenced by `workflow_id` only.
+
+**Entity-relationship diagram** of the four `order_db` tables. The shared `outbox` table is omitted; its DDL is in [RFC 0000](0000-architecture.md#3132-shared-tables--outbox-and-processed_events). `order_items.order_id` is the only foreign key; the dotted lines are plain indexed UUIDs.
+
+```mermaid
+erDiagram
+    orders ||--|{ order_items : "lines, FK, cascade"
+    orders ||..o{ order_status_history : "timeline, no FK"
+    idempotency_keys |o..o| orders : "order_id, no FK"
+
+    orders {
+        uuid id PK
+        text order_number "unique"
+        uuid customer_id "no FK, claim"
+        text status "OrderStatus"
+        text failure_reason "nullable"
+        numeric subtotal "numeric(12,2)"
+        numeric shipping_fee "numeric(12,2)"
+        numeric total "numeric(12,2)"
+        text currency "char(3)"
+        jsonb shipping_address "snapshot"
+        text payment_status "PaymentStatus"
+        text payment_reference "nullable"
+        text shipment_status "ShipmentStatus"
+        text shipment_reference "nullable"
+        text tracking_number "nullable"
+        text workflow_id "nullable, indexed"
+        text workflow_run_id "nullable, indexed"
+        int version "S6"
+        timestamptz placed_at
+        timestamptz confirmed_at
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz notified_at "nullable"
+        text origin_client_id "nullable"
+    }
+    order_items {
+        uuid id PK
+        uuid order_id FK
+        uuid product_id "no FK, snapshot"
+        uuid variant_id "no FK, snapshot"
+        uuid merchant_id "no FK, indexed"
+        text product_name "snapshot"
+        text sku "snapshot"
+        jsonb variant_options "snapshot"
+        numeric unit_price "numeric(12,2)"
+        int quantity "greater than 0"
+        numeric line_total "numeric(12,2)"
+    }
+    order_status_history {
+        int id PK "bigserial"
+        uuid order_id "indexed"
+        text from_status
+        text to_status
+        text reason "nullable"
+        text actor
+        text correlation_id
+        timestamptz created_at
+    }
+    idempotency_keys {
+        text key PK
+        uuid user_id PK
+        text request_hash
+        uuid order_id "nullable"
+        int response_status
+        jsonb response_body
+        text state "IdempotencyState"
+        timestamptz created_at
+        timestamptz expires_at "indexed, ORD-3"
+    }
+```
 
 ###### `orders`
 
@@ -951,7 +1253,7 @@ Constraint: unique `(user_id, key)` — S11, and the mechanism behind "one order
 | Unique | `idempotency_keys` | `(user_id, key)` — the S11 arbiter | archive/0006 |
 | Index | `idempotency_keys` | `expires_at` — the sweep's predicate | **ORD-3, proposed** |
 | Sequence | — | `order_number_seq` — the numeric part of `order_number` | **ORD-3, proposed** |
-| Comment | `orders` | `COMMENT ON COLUMN orders.status IS 'DomainEnum OrderStatus — see services/order/app/models/enums.py; transitions in app/utils/state_machine.py'`, and the same for `payment_status`, `shipment_status` | archive/0006 S4 |
+| Comment | `orders` | `COMMENT ON COLUMN orders.status IS 'DomainEnum OrderStatus — see services/order/app/orders/enums.py; transitions in app/orders/state_machine.py'`, and the same for `payment_status`, `shipment_status` | archive/0006 S4 |
 
 No `CHECK` names a status value and no Postgres `ENUM` type exists (S4). The status columns carry no index beyond those listed; the enums-as-text trade (alphabetical `ORDER BY status`) is irrelevant because no order query sorts by status.
 
@@ -964,7 +1266,7 @@ No `CHECK` names a status value and no Postgres `ENUM` type exists (S4). The sta
 | `0003_outbox_client_id_relay_index` | `outbox` + `client_id` (nullable) and the relay's partial index on `published_at IS NULL` ordered by `id` — as defined in RFC 0000 | Drop both |
 | `0004_idempotency_expiry_index` | `idempotency_keys(expires_at)` index (ORD-3) | Drop index |
 
-Vocabulary changes are not migrations: adding a value to any `order` enum is one line in `app/models/enums.py` plus an edge in its transition table, and `alembic check` must report no pending diff.
+Vocabulary changes are not migrations: adding a value to any `order` enum is one line in `app/orders/enums.py` plus an edge in its transition table, and `alembic check` must report no pending diff.
 
 **Shared tables carried.** [`outbox`](0000-architecture.md#3132-shared-tables--outbox-and-processed_events) (S12) — yes. `processed_events` (S13) — no; `order` consumes nothing.
 
@@ -991,7 +1293,7 @@ Ordered so that the order workflow has something real to reserve against — `in
 | --- | --- | --- | --- |
 | O1 | `order` service skeleton, settings, Alembic with the S4 `render_item` hook; `0001_initial` | Migration to head; `alembic check` clean | `common` outbox, idempotency and Temporal client helpers; service-token mint and verify ([RFC 0001](0001-platform-and-shared-infrastructure.md), [RFC 0003](0003-identity-service.md)) |
 | O2 | Domain: enums, `ORDER_/PAYMENT_/SHIPMENT_TRANSITIONS`, `transition()`, money | 67 illegal-pair tests and the structural tests green | O1 |
-| O3 | `OrderService.advance()` — version check, transition, history row, outbox row in one transaction | Rollback leaves no outbox row (G6) | O2 |
+| O3 | `OrderRepo.advance()` — version check, transition, history row, outbox row in one transaction | Rollback leaves no outbox row (G6) | O2 |
 | O4 | Idempotency: claim, replay, conflict, in-progress, mismatch, lease reclaim, release on dependency failure | Concurrent-duplicate test (G3) | O1 |
 | O5 | Order creation: catalog snapshot with the user's token, validation, totals, persistence, workflow start | Tests green | O4, O3, catalog's `published` status ([RFC 0004](0004-catalog-service.md)) |
 | O6 | `PaymentProvider` and `ShippingProvider` protocols and deterministic fakes | Every branch reachable by configuration | O1 |
@@ -1030,6 +1332,42 @@ Ordered so that the order workflow has something real to reserve against — `in
 | `order.confirmed` feeding the assistant conversion metric (consumer side only; no `order` change) | M6 |
 
 ### 3.2. Rationale
+
+The register below lists every significant decision in this RFC with its reason. The prose after it gives the longer argument for the most contested ones.
+
+#### 3.2.1. Decision register
+
+This RFC already carries ID'd decisions (A*, B*, C*, R*, S* from RFC 0000 and the archive, ORD-1–ORD-17 in [§11](#11-notes), Q*/ORD-Q* in [§3.3.1](#331-challenges-and-open-questions)). They are not renumbered: each register row gets a new `ORD-D` ID and names the existing IDs it covers in the Decision cell (“= B7”).
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| ORD-D1 | `OrderWorkflow`, a Temporal saga, orchestrates checkout (= A12) | Part A requires an interrupted order to be resumable or cleanly reversed; Temporal persists state, keeps compensation next to its step and answers "where is order X?" with a query ([§3.2](#32-rationale)) | Kafka choreography: compensation scattered, no single view; 2PC/XA: blocking, unsupported across the stores; in-process `try/except`: nothing resumes after process death; Celery chains: no workflow state ([§5](#5-alternate-solutions) 1–4) | The Temporal spike fails and the schedule risk in [§8](#8-impact-analysis) materialises |
+| ORD-D2 | One workflow per order, `workflow_id = order-{order_id}`, reject-duplicate policy (= archive/0002 Q3) | Gives free deduplication at Temporal as a second line of defence behind the idempotency key ([§3.1.1.4](#orderworkflow--the-saga)) | One long-running workflow per customer: loses the per-order dedupe and mixes unrelated orders' histories | Decided; not expected |
+| ORD-D3 | `payment` and `shipment` are sub-state on the order, not services (= A9, archive/0006 Q1) | They fail the ownership test: simulated provider, no cardholder data, a table keyed 1:1 to orders written only by the order's workflow ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Separate services: a distributed transaction to record one fact, more failure modes, no isolation gained ([§5](#5-alternate-solutions) 6) | A real payment provider or a PCI boundary appears ([§8](#8-impact-analysis)) |
+| ORD-D4 | Payment and shipping behind `PaymentProvider` / `ShippingProvider` with deterministic fakes (= A9, B10) | Every saga branch, including timeouts and refund failures, is reachable by configuration; the interface keeps extraction mechanical ([§3.1.1.4](#payment-and-shipping-providers-a9-b10)) | A real sandbox: cannot be told to fail on demand; not asked for by Part A or B | A real provider is introduced |
+| ORD-D5 | Reserve stock before charging; commit only after a successful charge (= B4) | The cheap failure comes first: a released reservation costs nothing, a charge for missing stock needs an unrequested refund ([§3.2](#32-rationale)) | Charge first; sell first and reconcile later, which turns a technical constraint into a cancelled paid order ([§5](#5-alternate-solutions) 5) | Not expected |
+| ORD-D6 | Idempotency keys claimed by a unique insert on `(user_id, key)` in Postgres; Redis is only a fast path (= B7, C13, ORD-7) | A read-then-write races under exactly the burst load Part A describes; a unique constraint has no window. Per-user scope stops probing ([§3.1.1.4](#idempotent-creation-b7)) | Read-then-write: races; Redis alone: not durable, not transactional with the order insert ([§5](#5-alternate-solutions) 8) | Not expected |
+| ORD-D7 | Replay the stored reply verbatim plus `Idempotency-Replayed: true`; in-flight duplicate → `409 Retry-After: 1`; 30 s lease reclaim; business rejections stored, dependency failures release the claim (= ORD-7, ORD-8) | A retry must see the original answer; a dead request must not hold a key forever; a transient `503` must not be replayed forever ([§3.1.1.4](#idempotent-creation-b7)) | Replaying with a different status code; storing every failure (a catalog outage would poison the key) | Creation latency approaches the 30 s lease |
+| ORD-D8 | `POST /orders` returns `202 Accepted`, not `201` (= B9) | Holding the connection through payment and shipment is the checkout latency Part A opens with, and makes the client's timeout the order's timeout ([§3.2](#32-rationale)) | Blocking `201` until the workflow ends ([§5](#5-alternate-solutions) 9) | Not expected |
+| ORD-D9 | Synchronous `order → catalog` lookup at creation with the user's token — the one sync call in the system (= A13, R5, Q3) | Creation cannot proceed without knowing the product is published and its real price; forwarding the user token makes `catalog` apply its edge rules ([§3.2](#32-rationale)) | A local product projection: puts a staleness window on price and publication status at purchase ([§5](#5-alternate-solutions) 7) | Q3 is re-decided at the Part A architecture review |
+| ORD-D10 | Product data snapshotted into `order_items` (= A14, B8, R6) | A merchant repricing a product must not change what a customer paid; the line records what was bought ([§3.2](#32-rationale)) | Referencing the live product: history changes retroactively and needs a cross-service join | Not expected |
+| ORD-D11 | Money is `numeric(12,2)` / `Decimal`, `ROUND_HALF_EVEN`, price = `price_override` ?? `base_price`, flat shipping fee, one currency per order (= S2, ORD-4, ORD-6, ORD-Q6) | A stored total can never disagree with its lines by a cent; mixed currencies are rejected rather than converted ([§3.1.1.2](#3112-domain-model)) | `float`; currency conversion; a currency column per line (restates one fact per line) | Multi-currency or promotions come into scope |
+| ORD-D12 | Three state machines as `text` columns with `ORDER_/PAYMENT_/SHIPMENT_TRANSITIONS` and one `transition()` in `orders/state_machine.py` (= S4, ORD-1, ORD-2) | A native enum checks the label, never the edge (81 pairs vs 14), and `ALTER TYPE … ADD VALUE` cannot be downgraded (S14) ([§3.1.1.3](#3113-state-machines)) | Native Postgres enum; `CHECK (status IN (…))`, kept as the escape hatch ([§5](#5-alternate-solutions) 11) | A non-Python writer to `order_db` appears |
+| ORD-D13 | `awaiting_payment → refunding` edge (= ORD-1) | Commit and shipment both happen before `confirmed`, so this edge is the only way to reach `refunding → failed`; it restores the stated 14/67 count ([§3.1.1.3](#3113-state-machines)) | Going `awaiting_payment → failed` directly: leaves `refunding → failed` unreachable and hides the refund | Not expected |
+| ORD-D14 | `fallback` read policy on the three status columns | An unknown value from a newer build degrades to the initial state, so the row freezes loudly instead of corrupting quietly ([§3.1.1.2](#3112-domain-model)) | `passthrough`: lets a state machine branch on a bare string | Not expected |
+| ORD-D15 | `version` check plus `transition()` plus history row plus outbox row in one `OrderRepo.advance()` transaction; optimistic concurrency only (= S6, S7, B11, archive/0002 Q10) | The two guards answer different questions (concurrency vs legality) and neither subsumes the other; the workflow is effectively the single writer ([§3.1.1.3](#3113-state-machines)) | Either guard alone; pessimistic row locks (not needed with one writer per order) | Several concurrent writers per order become normal |
+| ORD-D16 | Every state change writes its outbox row in the same transaction; `aggregate_id` and Kafka key = `order_id` (= A10, B11, C3) | Removes the dual-write loss; the relay's failure mode becomes a duplicate. One partition per order keeps its events in order ([§3.2](#32-rationale)) | Publish after commit: loses events on a crash; Kafka transactions: do not extend to Postgres; event sourcing: high cost ([§5](#5-alternate-solutions) 10, 12) | Not expected |
+| ORD-D17 | Activities are thin adapters over the repos and idempotent under `workflow_id:activity:input` (= B1, B2, B3) | One implementation, two callers (route and activity), fast unit tests; replaying an in-flight activity after a crash is safe ([§3.2](#32-rationale)) | Business logic in activities: testable only inside Temporal and unreachable from HTTP | Not expected |
+| ORD-D18 | Per-activity timeouts and retry policies sized inside the 15-minute reservation TTL; compensations retry for an hour; 24 h execution timeout (= ORD-10) | A slow workflow never has its reservation swept from under it; a compensation that gives up is worse than one that is late ([§3.1.1.4](#orderworkflow--the-saga)) | Unbounded workflow time; equal retries for business and transient errors (a declined card is retried zero times) | The reservation TTL changes (archive/0002 Q2) |
+| ORD-D19 | Compensations run in reverse; a post-commit failure reverses the committed reservation; an ambiguous charge is always refunded by key (= ORD-12) | A committed reservation can never return to `held`, so "release" cannot undo it; the customer is never charged for an order that did not complete ([§3.1.1.4](#orderworkflow--the-saga)) | Release after commit (impossible in `inventory`); assuming a timed-out charge failed | Not expected; resolved by INV-16 |
+| ORD-D20 | Cancellation by signal + `get_state` query, honoured only before `committing`; auto-refund if charged (= archive/0002 Q4, ORD-Q4) | After commit a cancel is a refund request, which has no customer flow; the archive specifies a signal ([§3.1.1.4](#orderworkflow--the-saga)) | Temporal Update: closes the race but departs from the archive; admin-approved refund on cancel | ORD-Q4 is decided for Update, or returns come into scope |
+| ORD-D21 | Order creation succeeds while Temporal is down; `resume_unstarted_orders` starts the workflow later (= ORD-9) | Checkout acceptance should not depend on the orchestrator being up; only order progress does ([§3.1.1.5](#3115-dependencies-and-degradation)) | Failing creation with `503` when Temporal is unreachable | Not expected |
+| ORD-D22 | Worker calls `inventory` with a client-credentials service token, scope `inventory:internal`; user routes reject service tokens (= ORD-11) | There is no user in a workflow; sharing one role would let a stolen customer token call the internal reservation routes ([§3.1.1.5](#3115-dependencies-and-degradation)) | Forwarding the customer's token into the workflow; one role for both | `identity`'s client-credentials grant changes ([RFC 0003](0003-identity-service.md)) |
+| ORD-D23 | Carrier updates arrive as an HMAC-signed webhook with a 300 s window; replays are absorbed by the shipment state machine (= ORD-13) | The correct shape even for a simulated carrier; a repeated status is a no-op, so no dedupe table is needed ([§3.1.1.4](#carrier-webhook-simulation)) | Unsigned callbacks; a dedupe table; an admin-only simulation route (kept, test-only) | A real carrier integration is added |
+| ORD-D24 | Isolation by token claims: another customer's order is `404`; merchants see only their own lines, never total, address or payment reference (= ORD-16) | `403` would confirm the order exists; the merchant scope comes from the catalog snapshot, not the request ([§3.1.2.2](#3122-role-matrix)) | Scoping by request fields; `403` for foreign orders | Multi-merchant sub-orders come into scope (archive/0002 Q9) |
+| ORD-D25 | `origin_client_id` persisted on the order and copied into every outbox row (= C21, archive/0006 Q7) | `order.confirmed` and `order.failed` are emitted by the worker after the request has ended and would otherwise have no origin ([§3.2](#32-rationale)) | Reading the client id from request context (not available on the worker) | Not expected |
+| ORD-D26 | `order` is a producer only: seven events, no refund topic, no `processed_events` (= ORD-17, ORD-Q2) | Carrier updates are a signed HTTP call made idempotent by the state machine; refunds ride on `payment_status` so the RFC 0000 catalogue is not amended silently ([§3.1.2.4](#3124-events-consumed)) | A `payment.refunded` topic; consuming carrier events from Kafka | The RFC 0000 catalogue adds a refund topic (ORD-Q2) |
+| ORD-D27 | Entity-first layout: one `orders/` entity with `models`, `repo`, `enums`, `state_machine`, `utils` (money) and `v1/{routes,schemas}`; `idempotency_keys` in `core/` | The binding layout ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)); the idempotency mechanism is request plumbing, not an order rule (R8) ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Version-first `app/v1/<entity>/`; hybrid `app/api/v1/` split (mentor review §3) | A second entity needs idempotency, or the mechanism moves to `common` |
 
 **Why Temporal rather than a chain of Kafka consumers.** Part A requires that an interrupted order be "resumable or cleanly reversible". With choreography, the answer to "where is order X stuck?" is "read six consumers' logs and infer", compensation is scattered across the consumers that happen to run after a failure, and step timeouts have to be hand-rolled everywhere. Temporal answers that question with a query, keeps compensation adjacent to the step it undoes, and persists workflow state so a worker crash resumes rather than loses. Kafka is the wrong tool for a saga — no built-in state, no compensation, no visibility into where a process is stuck — and Temporal is the wrong tool for broadcasting a fact, which is why the workflow's outcome leaves as events (A12).
 
@@ -1223,7 +1561,7 @@ Service dependencies: `catalog`'s product read and `published` status ([RFC 0004
 - Webhook: valid signature applies; bad or stale signature → `401`; repeat → no-op `200`; out-of-order status → `409`; `shipment.status_changed` written with `client_id = null`.
 - Temporal unreachable at creation → `202`, run id null; `resume_unstarted_orders` starts it once Temporal is reachable.
 
-**Workflow tests** — Temporal test environment, time-skipping, real `OrderService` against Postgres, inventory stubbed or real per test, fakes configured per case. **Failure injection at every step is a required test, not an optional one.**
+**Workflow tests** — Temporal test environment, time-skipping, real `OrderRepo` against Postgres, inventory stubbed or real per test, fakes configured per case. **Failure injection at every step is a required test, not an optional one.**
 
 | Case | Injection | Expected |
 | --- | --- | --- |

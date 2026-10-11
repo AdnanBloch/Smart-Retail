@@ -38,6 +38,8 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
+     - 3.2.2. [Reasoning](#322-reasoning)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -119,27 +121,32 @@ Duplicating these into eight services multiplies both code and drift; hiding the
 
 ##### 3.1.1.1. Responsibility and boundaries
 
-**Position in the topology.**
+**Position in the topology.** The gateway is the only public port. It talks to Redis for rate-limit counters only, and passes the two SSE surfaces (`notification`, `assistant`) through without buffering.
 
-```
-                                 ┌──────────────────────────────────────────┐
-     client ─────────────────────▶│  gateway  (FastAPI, :8000)               │
-     HTTP / JSON / SSE            │  • single public entry point             │
-                                  │  • JWT verify (local, RS256) · coarse    │
-                                  │    route-level role check                │
-                                  │  • X-Request-ID = trace id · traceparent │
-                                  │  • X-Client-Id shape check / strip       │
-                                  │  • CORS · size limits · rate limit       │
-                                  │  • SSE pass-through (no buffering)       │
-                                  │  • aggregated OpenAPI                    │
-                                  └──┬────┬────┬────┬────┬────┬────┬─────────┘
-            ┌────────────────────────┘    │    │    │    │    │    └────────────────┐
-            ▼              ▼              ▼    ▼    ▼    ▼    ▼                     ▼
-       identity        catalog         order inventory notification analytics   assistant
-        :8001           :8002          :8003  :8004     :8005        :8006        :8007
-                                                          ▲ SSE                   ▲ SSE
-            │ Redis (rate-limit counters only)            │                       │
-            └────────▶ redis:6379                          stream pass-through ────┘
+```mermaid
+flowchart TB
+    client["Client<br/>browser, mobile, test harness"]
+    subgraph edge["gateway (FastAPI, :8000)"]
+        gw["Single public entry point<br/>JWT verify (local, RS256), coarse route-level role check<br/>X-Request-ID = trace id, traceparent<br/>X-Client-Id shape check / strip<br/>CORS, size limits, rate limit<br/>SSE pass-through (no buffering)<br/>aggregated OpenAPI"]
+    end
+    redis[("redis:6379<br/>rate-limit counters only")]
+    identity["identity :8001"]
+    catalog["catalog :8002"]
+    order["order :8003"]
+    inventory["inventory :8004"]
+    notification["notification :8005"]
+    analytics["analytics :8006"]
+    assistant["assistant :8007"]
+
+    client -->|"HTTP / JSON / SSE"| gw
+    gw --> identity
+    gw --> catalog
+    gw --> order
+    gw --> inventory
+    gw <-->|"SSE stream pass-through"| notification
+    gw --> analytics
+    gw <-->|"SSE stream pass-through"| assistant
+    gw -.->|"INCR rl:*"| redis
 ```
 
 **What the gateway owns and what it does not.**
@@ -174,7 +181,7 @@ It fails test 1 — it owns no state — and is a deliberate exception. Cross-cu
 | R4 — cross-service reads go through an API or event | The gateway reads nothing from any service except each upstream's `/openapi.json` and the identity JWKS, both public HTTP surfaces |
 | R5 — synchronous cross-service calls only where the caller cannot proceed | Proxying is not a cross-service call in the R5 sense — the gateway is on the client's request path, not a caller with a question of its own. It never calls two upstreams for one client request |
 | R7 — a service may not require another to be up to serve reads it has data for | Token verification is local, so `identity` being down does not stop the gateway admitting authenticated traffic |
-| R8 — `common` contains no business rule | The gateway uses `common` for JWT verification, the claim model, problem details, logging and tracing. The route table lives in `services/gateway/`, not in `common` |
+| R8 — `common` contains no business rule | The gateway uses `common` for JWT verification, the claim model, problem details, logging and tracing. The route table lives in `services/gateway/app/proxy/routing.py`, not in `common` |
 | A4 — RS256; `identity` is the only signer | The gateway holds the public key only |
 | A5 — every service re-verifies the token; the gateway rejects early and is not trusted | Defines the gateway's authorisation role. It forwards `Authorization` unchanged and never substitutes its own assertion (GW-5). (Archive 0001 recorded the same decision as its local A6.) |
 | A6 — async all the way down | `async def` handlers; `httpx.AsyncClient` for upstream calls; `redis.asyncio` for counters |
@@ -186,41 +193,79 @@ It fails test 1 — it owns no state — and is a deliberate exception. Cross-cu
 | C19 — stream tickets instead of bearer headers on `EventSource` | The stream route has auth policy `ticket`: the gateway performs no bearer check on it and redacts the ticket from logs and spans (GW-18) |
 | C21 — `X-Client-Id` is a correlator, never an identity | The gateway validates its shape, strips a malformed value, and never generates one or uses it for authorisation |
 
-**Internal module layout.** The gateway follows the platform layering ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)), the EVA backend layout, with the layers it does not need removed — no `models/`, no `services/`, no `consumers/`, no `alembic/` — which is itself the structural statement that it has no store and no domain. Its upstream calls live in `clients/upstream/`, as EVA keeps calls to other services in `clients/`.
+**Internal module layout.** The gateway follows the platform's entity-first layout ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service), [file-structure.md](../file-structure.md) §4–§5), with what it does not need left out. It owns no API contract, so it has **no `v<N>/` folders**: the `/api/v<N>/...` paths it accepts are rows in `proxy/routing.py` and are forwarded unchanged (the docstring of `app/router.py` records this). It owns no store and no domain, so it has no `models.py`, no `repo.py`, no `core/db.py`, no `core/enums.py`, no consumers and no `alembic/` — that absence is itself the structural statement of the ownership-test exception. Its "entities" are its three concerns: `health/` (operational probes), `docs/` (aggregated OpenAPI and Swagger UI) and `proxy/` (route table, edge auth, forwarding, upstream errors, and the catch-all route). `app/router.py` only includes their routers, and includes `proxy` last so the operational routes win. Correlation (`X-Request-ID`) and the RFC 9457 handlers come from `common`'s `install_platform`; the gateway adds only its edge CORS middleware, in `core/cors.py`.
 
 ```
 services/gateway/
-├── main.py                # create_application(); middleware order; lifespan (httpx clients, redis, key load)
+├── main.py                # create_application(): settings, route table, one pooled httpx client
+│                          # per configured upstream, OpenAPI aggregator; lifespan loads the JWKS
+│                          # (fails startup with no key); EdgeCORSMiddleware, then install_platform
+├── Dockerfile
+├── pyproject.toml
 ├── app/
-│   ├── api/
-│   │   ├── router.py      # operational routes first, then the catch-all proxy route
-│   │   └── handlers/
-│   │       ├── health.py  # /health, /health/ready
-│   │       ├── docs.py    # /docs, /openapi.json
-│   │       ├── metrics.py # /metrics
-│   │       └── proxy.py   # catch-all: route match → auth policy → forward
-│   ├── configs/
-│   │   └── env.py         # GatewaySettings (pydantic-settings), validated at startup
-│   ├── infrastructure/
-│   │   ├── logger.py      # JSON logging setup
-│   │   └── security.py    # auth policy over common JWT verification; service-token detection
-│   ├── middleware/
-│   │   ├── correlation.py # X-Request-ID / traceparent (GW-10)
-│   │   ├── size_limit.py  # 413 (GW-14)
-│   │   ├── client_id.py   # X-Client-Id shape check / strip (C21)
-│   │   ├── auth.py        # auth policy + coarse role check (GW-1..GW-5)
-│   │   ├── ratelimit.py   # fixed-window counters in Redis (GW-7)
-│   │   └── cors.py        # allow-list CORS, applied to error responses too (GW-19)
-│   ├── clients/
-│   │   └── upstream/
-│   │       ├── forward.py # header hygiene; streamed request and response bodies (GW-6)
-│   │       ├── sse.py     # stream relay, idle timeout, disconnect propagation (GW-12, GW-13)
-│   │       ├── errors.py  # upstream failure → 502/503/504 problem details (GW-11)
-│   │       └── openapi.py # merged OpenAPI, TTL cache (GW-15)
-│   └── utils/
-│       └── routing.py     # the route table (the single declarative source of §3.1.2.1)
-│                          # and longest-prefix + method match → RouteRule
+│   ├── router.py          # includes only: /health, then /openapi.json + /docs, then the catch-all proxy
+│   ├── core/
+│   │   ├── config.py      # GatewaySettings (pydantic-settings over common), validated at startup
+│   │   ├── cors.py        # allow-list CORS; preflight answered at the edge; headers on errors too (GW-19)
+│   │   └── logger.py      # JSON logging over common
+│   ├── docs/
+│   │   ├── openapi.py     # OpenApiAggregator: concurrent fetch, namespacing, TTL cache (GW-15)
+│   │   └── routes.py      # GET /openapi.json, GET /docs
+│   ├── health/
+│   │   └── routes.py      # GET /health, GET /health/ready (GW-16)
+│   └── proxy/
+│       ├── routing.py     # the route table (the single declarative source of §3.1.2.1),
+│       │                  # Policy, RouteRule, RouteTable: most-specific pattern, then method
+│       ├── auth.py        # enforce_policy(): auth policy + coarse role check over common JWT (GW-1..GW-3)
+│       ├── forward.py     # header hygiene; streamed request and response bodies; no retries (GW-6, GW-14)
+│       ├── errors.py      # gateway-originated problem types: 404, 405, 413, 502, 503, 504 (GW-11)
+│       └── routes.py      # catch-all /{path}: route match → auth policy → forward → relay
 └── tests/
+    ├── unit/proxy/test_routing.py
+    └── integration/test_gateway.py
+```
+
+This is the Milestone 1 tree. Stages that land in later milestones ([§3.1.5](#315-action-plan)) are added beside the concern they extend, not as new layers: correlation-as-trace-ID, size limit and rate limiting as edge middleware in `core/` ([file-structure.md](../file-structure.md) §5); `X-Client-Id` handling and the SSE relay in `proxy/`; `/metrics` as an operational route beside `health/`.
+
+**Components.**
+
+```mermaid
+flowchart LR
+    client["Client"]
+    subgraph gateway["services/gateway"]
+        main["main.py<br/>create_application()"]
+        cors["core/cors.py<br/>EdgeCORSMiddleware"]
+        platform["common install_platform<br/>correlation, RFC 9457 handlers"]
+        router["app/router.py"]
+        health["health/routes.py"]
+        docs["docs/routes.py"]
+        agg["docs/openapi.py<br/>OpenApiAggregator"]
+        proxyroutes["proxy/routes.py<br/>catch-all"]
+        routing["proxy/routing.py<br/>route table"]
+        auth["proxy/auth.py<br/>enforce_policy"]
+        forward["proxy/forward.py<br/>streamed forward"]
+        errors["proxy/errors.py"]
+        config["core/config.py<br/>GatewaySettings"]
+    end
+    jwt["common JwtVerifier"]
+    upstreams["Upstream services<br/>identity, catalog, ..."]
+    jwks["identity /api/v1/auth/jwks"]
+
+    client --> cors --> platform --> router
+    main -.-> config
+    main -.-> cors
+    main -.-> platform
+    router --> health
+    router --> docs
+    router --> proxyroutes
+    docs --> agg -->|"GET /openapi.json"| upstreams
+    health -->|"GET /health probe"| upstreams
+    proxyroutes --> routing
+    proxyroutes --> auth --> jwt
+    jwt -.->|"key refresh"| jwks
+    proxyroutes --> forward -->|"httpx stream"| upstreams
+    forward -.-> errors
+    proxyroutes -.-> errors
 ```
 
 **The request pipeline.** Order matters: cheap, identity-free checks run first so that abusive traffic is rejected before any signature is verified, and per-subject limits run after authentication because they need the verified `sub`.
@@ -237,6 +282,31 @@ services/gateway/
 | 8 | Per-subject rate limits | `429 rate-limited` | `login_email`, `order_create`, `search_user`, `chat_user`, `generate`, `notif_ack` |
 | 9 | Forward | `502` / `503` / `504` | Header hygiene, streamed bodies, per-class timeouts (GW-6, GW-11) |
 | 10 | Relay response | — | Pass-through; SSE relayed frame-by-frame with no buffering; disconnect propagated (GW-12, GW-13) |
+
+```mermaid
+flowchart TD
+    req["Request"] --> corr["1. Correlation<br/>edge span, X-Request-ID = trace id"]
+    corr --> pre{"2. CORS preflight?"}
+    pre -->|"yes"| p204["204, answered at the edge"]
+    pre -->|"no"| match{"3. Route matches?"}
+    match -->|"no rule or blocked"| r404["404 route-not-found"]
+    match -->|"prefix only, wrong method"| r405["405 method-not-allowed"]
+    match -->|"yes"| size{"4. Body within limit?"}
+    size -->|"no"| r413["413 payload-too-large"]
+    size -->|"yes"| ipl{"5. Per-IP classes under limit?"}
+    ipl -->|"no"| r429a["429 rate-limited"]
+    ipl -->|"yes or Redis error: fail open"| cid["6. X-Client-Id: keep if well-formed, else strip"]
+    cid --> pol{"7. Auth policy passes?"}
+    pol -->|"no / bad token"| r401["401 invalid-token"]
+    pol -->|"role or service token"| r403["403 forbidden"]
+    pol -->|"yes"| subl{"8. Per-subject classes under limit?"}
+    subl -->|"no"| r429b["429 rate-limited"]
+    subl -->|"yes or fail open"| fwd{"9. Forward to upstream"}
+    fwd -->|"connect fail, not configured, pool exhausted"| r503["503 upstream-unavailable"]
+    fwd -->|"read timeout"| r504["504 upstream-timeout"]
+    fwd -->|"broken response"| r502["502 upstream-bad-response"]
+    fwd -->|"response headers"| relay["10. Relay response<br/>pass-through, SSE frame by frame"]
+```
 
 **Decisions specific to the gateway.** These extend, and do not contradict, A1–A14 ([RFC 0000 §3.1.1.5](0000-architecture.md#3115-cross-cutting-decisions-a1a14)).
 
@@ -265,7 +335,7 @@ services/gateway/
 
 ##### 3.1.1.2. Domain model
 
-**None.** The gateway has no entities, aggregates, or persisted vocabularies, and therefore no `app/models/enums.py` and no S4 `DomainEnum`. What it has is an in-memory, code-defined configuration model, built once at startup and immutable thereafter:
+**None.** The gateway has no entities, aggregates, or persisted vocabularies, and therefore no `app/core/enums.py`, no per-entity `enums.py` and no S4 `DomainEnum`. What it has is an in-memory, code-defined configuration model, built once at startup and immutable thereafter:
 
 | Type | Fields | Invariants |
 | --- | --- | --- |
@@ -291,6 +361,28 @@ services/gateway/
 | | `stream_assistant` | Connect 2s, idle read 60s, total 180s |
 | Rate-limit scope | `default`, `login_ip`, `login_email`, `order_create`, `search_anon`, `search_user`, `chat_anon`, `chat_user`, `generate`, `notif_ack` | Defined in [Rate-limit classes](#rate-limit-classes) |
 
+**Auth-policy decision** (stage 7 of the pipeline; GW-1, GW-2, GW-3):
+
+```mermaid
+flowchart TD
+    start["Matched RouteRule"] --> pol{"auth_policy"}
+    pol -->|"blocked"| b404["404 route-not-found"]
+    pol -->|"public or hmac"| fwd["Forward, Authorization untouched"]
+    pol -->|"ticket"| tq{"ticket query param present?"}
+    tq -->|"no"| t401["401 invalid-token"]
+    tq -->|"yes"| fwd
+    pol -->|"optional or bearer"| has{"Bearer token present?"}
+    has -->|"no, optional"| fwd
+    has -->|"no, bearer"| m401["401 invalid-token (missing)"]
+    has -->|"yes"| ver{"Verifies locally?<br/>signature, exp, alg, kid"}
+    ver -->|"no"| v401["401 invalid-token<br/>never downgraded to anonymous"]
+    ver -->|"yes"| svc{"Service token?"}
+    svc -->|"yes"| s403["403 forbidden"]
+    svc -->|"no"| roles{"roles empty or role in roles?"}
+    roles -->|"no"| r403["403 forbidden"]
+    roles -->|"yes"| fwd
+```
+
 ##### 3.1.1.3. State machines
 
 **None persisted.** The gateway holds no entity with a lifecycle. For clarity on disconnect and failure semantics, the in-memory lifecycle of one proxied stream (a request whose response is `text/event-stream`) is:
@@ -308,6 +400,21 @@ services/gateway/
 | `streaming` | `closed` | Idle read timeout, or the total bound for `stream_assistant` | Terminal `event: error` frame with a `504` problem detail, then close; upstream `aclose()`d; `initiator=timeout` |
 | `streaming` | `closed` | Gateway shutdown after the drain grace period | Client response ended; clients reconnect with the `retry:` interval the upstream already set; `initiator=shutdown` |
 
+```mermaid
+stateDiagram-v2
+    [*] --> connecting: request passes stages 1-8 on a stream route
+    connecting --> streaming: upstream returns text/event-stream headers
+    connecting --> closed: non-stream response relayed (e.g. 401, 429)
+    connecting --> closed: connect failure or timeout (503 / 504)
+    streaming --> streaming: upstream writes bytes (relayed, idle timer reset)
+    streaming --> closed: upstream ends cleanly (initiator=upstream)
+    streaming --> closed: client disconnects, upstream aclose() (initiator=client)
+    streaming --> closed: upstream error mid-stream, terminal 502 error frame (initiator=upstream_error)
+    streaming --> closed: idle or total timeout, terminal 504 error frame (initiator=timeout)
+    streaming --> closed: gateway shutdown after drain grace (initiator=shutdown)
+    closed --> [*]
+```
+
 `closed` is terminal. There is no resume at the gateway: resumption is `notification`'s `Last-Event-ID` and cursor mechanism (C18, C22), which works through any gateway replica because the gateway holds nothing.
 
 ##### 3.1.1.4. Workflows and async jobs
@@ -319,6 +426,35 @@ services/gateway/
 | Public key refresh | Startup; then when `kid` in a token is unknown, at most once per `JWT_JWKS_MIN_REFRESH_S`; otherwise every `JWT_JWKS_CACHE_TTL_S` | If `JWT_JWKS_URL` is set, fetch `GET /api/v1/auth/jwks` from `identity` and replace the cached key set atomically; if unset, the key is read from `JWT_PUBLIC_KEY_PATH` at startup only | A failed refresh keeps the previous key set and logs a warning. Startup with no loadable key fails the container (a gateway that cannot verify is not ready) |
 | OpenAPI aggregation | On request to `/openapi.json` or `/docs` when the cache is older than `GATEWAY_OPENAPI_CACHE_TTL_S` | Fetch each upstream's `/openapi.json` concurrently (2s timeout each); merge (below); cache | An upstream that fails is omitted and listed under `x-upstreams-unavailable`; the last good copy of its section is used if one is cached |
 | Rate-limit counting | Each request, per applicable class | Fixed-window counter (below) | Redis error or timeout (> `GATEWAY_RATELIMIT_REDIS_TIMEOUT_MS`) → fail open, count `failed_open` |
+
+**Public key refresh** (JWKS mode):
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as gateway
+    participant K as Key cache (in process)
+    participant I as identity
+    Note over G,I: Startup: fetch once, no loadable key fails the container
+    G->>I: GET /api/v1/auth/jwks
+    I-->>G: key set
+    G->>K: replace atomically
+    C->>G: request with token (kid=k2)
+    G->>K: lookup k2
+    alt kid known
+        K-->>G: public key
+        G->>G: verify locally, no call to identity
+    else kid unknown and last refresh older than JWT_JWKS_MIN_REFRESH_S
+        G->>I: GET /api/v1/auth/jwks
+        alt refresh ok
+            I-->>G: key set
+            G->>K: replace atomically
+        else refresh fails
+            G->>G: keep previous key set, log warning
+        end
+        G->>G: verify, or 401 invalid-token (unknown_kid)
+    end
+```
 
 **Rate-limit algorithm — fixed window counter.** For each applicable class, with `w = window_seconds`:
 
@@ -335,7 +471,53 @@ else:           allow; RateLimit-Remaining = limit - n; RateLimit-Reset = ceil(P
 
 The window starts at the first request in it and the key's TTL *is* the window, so the key pattern `rl:{scope}:{identifier}` needs no timestamp component and every key expires on its own. TTL is 60s for per-minute classes and 3600s for the one per-hour class (`generate`). Rejected requests still increment the counter, so hammering past the limit does not shorten the wait. The known weakness of a fixed window — up to 2× the limit across a window boundary — is accepted ([§3.3](#33-tradeoffs)).
 
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as gateway
+    participant R as Redis
+    participant U as Upstream
+    C->>G: request on a rate-limited route
+    G->>R: MULTI SET rl:scope:id 0 EX w NX, INCR, PTTL, EXEC
+    alt Redis error or slower than GATEWAY_RATELIMIT_REDIS_TIMEOUT_MS
+        G->>G: fail open, count failed_open
+        G->>U: forward
+        U-->>G: response
+        G-->>C: response
+    else n > limit
+        R-->>G: n, pttl
+        G-->>C: 429 rate-limited, Retry-After = ceil(pttl / 1000)
+    else n <= limit
+        R-->>G: n, pttl
+        G->>U: forward
+        U-->>G: response
+        G-->>C: response + RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset
+    end
+```
+
 **OpenAPI merge.** Paths are disjoint by construction (one prefix, one owner), so merging paths is a union; a collision is a route-table bug and is logged as an error. Component schemas are namespaced by service (`catalog.ProductOut`) and `$ref`s rewritten, because two services independently defining `Page` or `ProblemDetail` is normal. Every operation is tagged with its service. Paths whose rule is `blocked` are removed. The gateway's own operational endpoints are added under a `gateway` tag. `servers` is set to the gateway's public URL, so "Try it out" goes through the edge.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as gateway
+    participant Ca as OpenAPI cache
+    participant U as Each upstream
+    C->>G: GET /openapi.json or /docs
+    G->>Ca: cached document younger than GATEWAY_OPENAPI_CACHE_TTL_S?
+    alt fresh
+        Ca-->>G: merged document
+    else stale or empty
+        par concurrently, 2s timeout each
+            G->>U: GET /openapi.json
+            U-->>G: document, or failure
+        end
+        G->>G: union paths, namespace schemas, rewrite refs, tag by service, drop blocked paths
+        G->>G: failed upstream: reuse last good section, list in x-upstreams-unavailable
+        G->>Ca: store
+    end
+    G-->>C: 200 merged document (always)
+```
 
 ##### 3.1.1.5. Dependencies and degradation
 
@@ -520,6 +702,27 @@ Nothing the gateway serves is idempotency-keyed or asynchronous; `202` semantics
 
 Two routing notes. `/api/v1/search/*` is owned by `assistant` in full — keyword filtering is a `catalog` query parameter on `/products`, semantic and similarity search are `assistant` endpoints. And `catalog` owns `/products`, `/categories`, `/variants` and `/media` directly; there is no `/api/v1/catalog` prefix.
 
+**A proxied, authenticated request** (for example `PATCH /api/v1/products/{id}`, `bearer` · `merchant`, `admin`):
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as gateway
+    participant R as Redis
+    participant U as catalog
+    C->>G: PATCH /api/v1/products/42 with Bearer token
+    G->>G: start edge span, X-Request-ID = trace id
+    G->>G: route match, size limit
+    G->>R: per-IP default class
+    R-->>G: under limit
+    G->>G: verify JWT locally, role in merchant/admin, not a service token
+    G->>G: strip X-User-*, X-Internal-*, hop-by-hop, malformed X-Client-Id
+    G->>U: PATCH /api/v1/products/42 (path unchanged, Authorization unchanged, traceparent)
+    U->>U: re-verify token, check ownership (A5)
+    U-->>G: 200, or 403 problem+json if not the owner
+    G-->>C: streamed response + X-Request-ID, traceparent, CORS
+```
+
 **Headers — what the gateway does with each.**
 
 | Header | Direction | Handling |
@@ -614,6 +817,21 @@ traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 
 Every other status from an upstream — including upstream `401`, `403`, `404`, `409`, `422`, `429`, `501`, and any problem-detail `5xx` — is relayed unchanged. The gateway never retries a request to an upstream: it cannot know whether a non-idempotent request took effect, and `Idempotency-Key` retries are the client's to make.
 
+**Upstream response handling** (GW-11):
+
+```mermaid
+flowchart TD
+    up["Upstream call"] --> ok{"Response headers received?"}
+    ok -->|"connect refused, DNS, connect timeout,<br/>not configured, pool exhausted"| e503["503 upstream-unavailable, Retry-After: 5"]
+    ok -->|"read timeout"| e504["504 upstream-timeout"]
+    ok -->|"reset or malformed before headers"| e502["502 upstream-bad-response"]
+    ok -->|"yes"| pj{"Content-Type application/problem+json?"}
+    pj -->|"yes"| pass["Relay unchanged, any status"]
+    pj -->|"no"| five{"Status 5xx?"}
+    five -->|"yes"| wrap["Wrap as upstream-error,<br/>status kept, body discarded"]
+    five -->|"no"| pass
+```
+
 **SSE pass-through — the contract.** Two upstream surfaces stream: `notification` (`GET /notifications/stream`, long-lived, heartbeat every 20s, ticket-authenticated) and `assistant` (`POST /assistant/chat` and `POST /assistant/generate`, request-scoped, typically 5–15s). For both:
 
 | Concern | Gateway behaviour |
@@ -627,6 +845,35 @@ Every other status from an upstream — including upstream `401`, `403`, `404`, 
 | Errors before headers | Normal problem-detail responses (ticket redemption `401`, assistant budget `429`, connection limit `503`) are relayed as ordinary responses |
 | Tracing | Spans end at stream end, with a `first_byte` event (§3.1.1.7) |
 | Capacity | Per-replica cap (GW-22); one asyncio task and two sockets per open stream |
+
+**SSE pass-through with client disconnect** (assistant chat shown; the notification stream differs only in using the `ticket` policy and having no total bound):
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as gateway
+    participant A as assistant
+    C->>G: POST /api/v1/assistant/chat, Accept text/event-stream
+    G->>G: stages 1-8 (optional policy, chat_* class)
+    G->>A: POST /api/v1/assistant/chat (streamed body)
+    A-->>G: 200 text/event-stream headers
+    G-->>C: headers plus no-cache and X-Accel-Buffering no
+    loop each frame, no buffering
+        A-->>G: data frame
+        G-->>C: same bytes, verbatim
+    end
+    alt client disconnects
+        C--xG: http.disconnect
+        G->>A: aclose(), connection discarded (GW-13)
+        A->>A: cancel generation
+    else upstream fails mid-stream
+        A--xG: connection error
+        G-->>C: terminal error event with 502 problem detail, close (GW-12)
+    else idle or total timeout
+        G-->>C: terminal error event with 504 problem detail, close
+        G->>A: aclose()
+    end
+```
 
 ##### 3.1.2.2. Role matrix
 
@@ -697,7 +944,7 @@ It does shape two envelope fields indirectly, by what it forwards: the `correlat
 
 The `rl:*` keyspace was first listed with a uniform 60s TTL; the per-hour `generate` class needs its window as its TTL, so the TTL is "the class window". Redis is flushed freely in development — the only effect is that windows restart.
 
-**Migrations:** none. **Constraints and indexes:** none.
+**Migrations:** none. **Constraints and indexes:** none. There is no `erDiagram` for this service: it has no tables.
 
 #### 3.1.4. Breaking changes
 
@@ -761,6 +1008,45 @@ Ordered so that the proxy core is proven end to end before edge policies are lay
 | `/assistant/*` prefix, assistant stream and extended timeouts, `chat_*` / `generate` classes, time-to-first-token measurement (GW-T18) | M6 |
 
 ### 3.2. Rationale
+
+The register lists every significant decision in this RFC with its reason; the prose in [§3.2.2](#322-reasoning) argues the larger ones in full.
+
+#### 3.2.1. Decision register
+
+The gateway decisions already ID'd GW-1 … GW-22 in [§3.1.1.1](#3111-responsibility-and-boundaries) keep those IDs: a register row that records one of them says "= GW-n" in its Decision cell rather than renumbering it, and the remaining rows record decisions stated only in prose.
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| GW-D1 | One gateway is the single public entry point at `:8000`, routing by path prefix | Correlation, CORS, rate limiting and aggregated docs need exactly one place; per-service copies drift and cannot count across services ([§3.2.2](#322-reasoning)) | Expose services directly — eight ports, eight CORS configs, no cross-service limits; an nginx config — hides the decisions from review ([§5](#5-alternate-solutions) Alt. 1) | — (structural) |
+| GW-D2 | The gateway has no store and no business logic — a bounded exception to the ownership test | The exception is safe only because it cannot hold business state ([§3.1.3](#313-dataschema-changes)) | Thick gateway / BFF — authorisation needs the rows, and composition makes the gateway where features accrete ([§5](#5-alternate-solutions) Alt. 3) | A gateway feature seems to need a table — then it belongs in a service |
+| GW-D3 | = GW-20. Hand-written FastAPI, not an off-the-shelf proxy | Per-email and per-`sub` limits, strip-not-reject, RFC 9457 edge errors, the terminal SSE error frame and shared JWT code are code-shaped ([§3.2.2](#322-reasoning)) | Traefik / Kong / Envoy — need plugins or cannot express these; a second JWT implementation ([§5](#5-alternate-solutions) Alt. 2) | TLS becomes required; edge overhead exceeds upstream time on the hot path; routing rules become genuinely declarative (Q5) |
+| GW-D4 | Tokens are verified locally against the cached public key; the gateway rejects early but is never the security boundary (A5) | Cheap load-shedding and one uniform `401`; `identity` being down does not stop authenticated traffic (R7) ([§3.2.2](#322-reasoning)) | Call `identity` per request — a sync hop on every request; trust the gateway alone — services unsafe to call directly | Sub-15-minute revocation becomes a requirement (today a revoked user passes until expiry, [§4](#4-dependenciesblockersknown-issues)) |
+| GW-D5 | = GW-1. Coarse route-level role checks are necessary conditions only | Keeps the gateway table from becoming a second, divergent policy; drift fails safe ([§3.3](#33-tradeoffs)) | Full authorisation at the edge — needs ownership rows the gateway must not have | — |
+| GW-D6 | = GW-2. On `optional` routes a presented token must verify | Silent downgrade would show a merchant the public view of their own catalogue and hide the need to refresh | Treat a bad token as anonymous — hides the error | — |
+| GW-D7 | = GW-3. Service tokens are refused on every edge route | Service tokens are for in-network callers; one arriving publicly is a leak or misconfiguration | Let upstreams alone reject them — loses defence in depth | — |
+| GW-D8 | = GW-4. Only `/api/v1/*` is routed; `/internal/*` answers `404` | Defence in depth on top of the owning service's scope check; keeps internal routes out of public OpenAPI; a prefix needs no per-route change | Route internal paths and rely on scope checks only | — |
+| GW-D9 | = GW-5. Identity is never forwarded as a header; inbound `X-User-*` / `X-Internal-*` are stripped | A header trustworthy on one path and forgeable on another is worse than none; the token carries its own proof ([§3.2.2](#322-reasoning)) | Inject `X-User-*` and let services trust it — forgeable on direct calls; saves only microseconds ([§5](#5-alternate-solutions) Alt. 4) | — |
+| GW-D10 | = GW-6. Stream every body, buffer nothing, compress nothing; login body (≤ 16 KiB) is the one exception | A per-route "no buffering" switch is a switch to forget; bytes are never re-serialised, which the HMAC webhook needs ([§3.2.2](#322-reasoning)) | Buffer and special-case SSE — the failure both streaming designs warn about ([§5](#5-alternate-solutions) Alt. 8); response compression — the component most likely to buffer SSE | — |
+| GW-D11 | = GW-7. Rate limiting is a fixed-window counter in Redis, shared across replicas; per-IP classes before auth, per-subject after | Three commands, one self-expiring key; limits are abuse and spend controls, and the 2× boundary burst does not change their effect ([§3.2.2](#322-reasoning)) | Sliding log — a sorted set per identifier; GCRA — the upgrade path, not needed yet; per-service limits — cannot span services ([§5](#5-alternate-solutions) Alt. 5, 6) | A limit is observed being gamed at the window boundary (GW-Q1) |
+| GW-D12 | = GW-7. On Redis error or timeout, rate limiting fails open | A limiter outage must not become a platform outage; `failed_open` makes the gap visible ([§3.2.2](#322-reasoning)) | Fail closed — every request fails; per-replica in-process fallback — multiplies limits by replica count (GW-Q3) | Login brute force during Redis outages becomes a concern (GW-Q3) |
+| GW-D13 | = GW-17, GW-21. Gateway `429` uses type `rate-limited` with `Retry-After`; `RateLimit-*` advertised on rate-limited routes | A client should never discover a limit by hitting it, and must tell an edge limit from `assistant`'s budget | Bare `429` — clients cannot back off correctly | — |
+| GW-D14 | = GW-8. The login rate-limit key is a truncated SHA-256 of the normalised email | Redis never holds an address | `identity` counts per-email attempts — splits the login limit across two components ([§3.3](#33-tradeoffs)) | — |
+| GW-D15 | = GW-9. The client IP is the socket peer; `X-Forwarded-For` only from `GATEWAY_TRUSTED_PROXIES` | Otherwise any client could rotate its apparent IP to escape per-IP limits | Trust `X-Forwarded-For` always | A real proxy is placed in front of the gateway (then configure the trusted list) |
+| GW-D16 | = GW-10. `X-Request-ID` is the trace ID; the edge starts a new root trace and only links an untrusted inbound `traceparent` | One ID for logs and traces (C12); adopting arbitrary client trace IDs would let a client merge its requests into another's trace ([§3.3](#33-tradeoffs)) | Random UUID request ID — two IDs to correlate; adopt inbound `traceparent` — trace merging | A trusted front proxy exists (`GATEWAY_TRUST_INBOUND_TRACEPARENT`) |
+| GW-D17 | = GW-11. Gateway-originated failures are RFC 9457; upstream problem details pass through; non-problem `5xx` is wrapped | One error shape for failures no upstream can report; a crashed worker's body may contain a stack trace ([§3.1.2.1](#error-normalisation)) | Bare proxy error pages; rewriting every upstream error | — |
+| GW-D18 | The gateway never retries an upstream request | It cannot know whether a non-idempotent request took effect; retries double load when an upstream struggles | Retry idempotent requests — little gain at seven upstreams on one network ([§5](#5-alternate-solutions) Alt. 10) | — |
+| GW-D19 | No circuit breaker; per-upstream pools plus 2s connect / 10s read timeouts | A dead upstream fails fast and cannot starve others; a breaker adds per-replica state for little gain (GW-Q2) | Per-upstream circuit breaker | Slow (not dead) upstream failures are seen exhausting a pool (GW-Q2) |
+| GW-D20 | = GW-12, GW-13. A broken stream ends with a terminal `event: error` frame; a client disconnect closes the upstream immediately | Keeps the "never stops without explanation" promise when the upstream dies; an abandoned stream otherwise keeps spending tokens ([§3.2.2](#322-reasoning)) | Just close the socket; keep reading or pool the half-read connection — hides the disconnect | — |
+| GW-D21 | = GW-22. Per-replica cap on concurrent SSE relays; beyond it `503` with `Retry-After` | The gateway protects its own file descriptors; per-user and per-instance caps stay with the upstreams | Unbounded relays | — |
+| GW-D22 | SSE, not WebSockets; no `Upgrade` support (E4, C15) | Traffic is server → client only; SSE is plain HTTP, so routing, auth, limits, tracing and errors apply unchanged | WebSockets — stateful gateway path, bespoke auth handshake ([§5](#5-alternate-solutions) Alt. 7) | A surface needs bidirectionality |
+| GW-D23 | = GW-18. Stream route uses `ticket` policy; the ticket is redacted from logs and spans (C19) | `EventSource` cannot set `Authorization`; C19 exists to keep credentials out of logs, and the gateway logs URLs first | JWT in the SSE URL — leaks into logs and `Referer` ([§5](#5-alternate-solutions) Alt. 9) | — |
+| GW-D24 | = GW-14. Request bodies bounded at the edge: 1 MiB default, 10 MiB on media upload | Oversize is rejected before a byte reaches the upstream; upstreams keep tighter validation | Rely on upstream limits only | — |
+| GW-D25 | = GW-15. Aggregated OpenAPI is merged on demand, cached briefly, namespaced per service, and degrades per upstream | One docs page; a down upstream must not fail `/docs` ([§3.1.1.4](#3114-workflows-and-async-jobs)) | A separate docs tool; failing the whole document | — |
+| GW-D26 | = GW-16. Readiness depends only on the gateway itself, not on upstreams or Redis | Partial Compose profiles are normal; one failed service must not take the whole surface down ([§3.2.2](#322-reasoning)) | Readiness requires every upstream | — |
+| GW-D27 | = GW-19. CORS is an explicit allow-list (no `*`, no credentials), answered at the edge and applied to error responses | A `401` or `429` without CORS headers is an opaque network error to a browser | Per-service CORS; `*` | — |
+| GW-D28 | Entity-first layout with no `v<N>/` folders: `core/`, `health/`, `docs/`, `proxy/`; route table in `proxy/routing.py` | The gateway owns no API contract — paths are table rows forwarded unchanged — and no store, so no `models.py`, `repo.py` or `alembic/` ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Versioned folders per concern — would version a contract the gateway does not own | The gateway ever serves an API of its own beyond operational routes |
+
+#### 3.2.2. Reasoning
 
 **Why a gateway at all.** Correlation IDs, CORS, rate limiting and aggregated documentation need one place to live. Without a gateway they are either duplicated into eight services — eight CORS configurations that drift, eight rate limiters that cannot count across each other — or pushed into an nginx configuration nobody reviews. A rate limit on `/auth/login` that lives in `identity` cannot also bound `/search/semantic`; a limit that lives in each service cannot bound a client that spreads its requests across services.
 
@@ -1030,7 +1316,7 @@ No `sse-starlette`: the gateway relays upstream bytes and never constructs an SS
 | --- | --- | --- | --- |
 | Streaming works against the service but buffers at the gateway | **High** | Medium | GW-6 removes the buffering path; first-frame latency and time-to-first-token are **measured** through the gateway, never inspected |
 | Gateway role rules drift into being the de facto policy | Medium | High | GW-1; the superset unit test; direct-call tests (GW-G3) |
-| Business logic creeps into the gateway | Medium | Medium | The no-store, no-domain rule; no `models/` or `services/` package exists to put it in; review check |
+| Business logic creeps into the gateway | Medium | Medium | The no-store, no-domain rule; no `models.py`, `repo.py` or `core/db.py` exists to put it in; review check |
 | Redis outage silently removes brute-force protection | Low | Medium | `failed_open` metric and dashboard panel; GW-Q3 records the fallback option |
 | A missed hop-by-hop or identity header lets a client influence an upstream | Low | High | Header hygiene unit tests; services never read identity headers regardless |
 | A stale route table routes a new endpoint to `404` | Medium | Low | Route-table test enumerates every owning RFC's endpoint list |

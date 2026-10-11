@@ -38,6 +38,8 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
+     - 3.2.2. [Reasoning](#322-reasoning)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -73,7 +75,7 @@
 - **Reservation before payment, commit after (B4), with expiry (B5).** `OrderWorkflow` reserves before charging and commits only once payment settles; a failure releases. Every reservation expires after 15 minutes, and a sweeper returns stranded stock even when the workflow that held it is lost beyond Temporal's recovery.
 - **Row-level locking with a database constraint as the last line of defence.** Reserve runs `SELECT … FOR UPDATE` on the variant's `stock_items` row inside a short transaction, with `CHECK (on_hand >= reserved AND reserved >= 0)` beneath it. Under a flash sale writers queue on one row, which is correct: oversell is worse than queueing.
 
-The design principle inherited from `OrderWorkflow` holds here: **the workflow owns the sequence, the services own the state.** An activity is a thin adapter (B1) that calls an internal `inventory` endpoint; the endpoint calls the same service-layer function that the sweeper, the event consumers and the merchant routes call.
+The design principle inherited from `OrderWorkflow` holds here: **the workflow owns the sequence, the services own the state.** An activity is a thin adapter (B1) that calls an internal `inventory` endpoint; the endpoint's route calls the same repo method (`app/<entity>/repo.py`) that the sweeper, the event consumers and the merchant routes call.
 
 ### 2.1. Goals
 
@@ -115,28 +117,38 @@ G3, G5, G6 and G8 are the platform goals from [archive/0002](archive/0002-core-b
 
 #### 3.1.1. Architectural changes
 
-```
-                 ┌──────────────── gateway :8000 ────────────────┐
-                 │  /api/v1/inventory/*  (public + merchant/admin) │
-                 └───────────────────────┬────────────────────────┘
-                                         ▼
-  temporal-worker ──service JWT──▶ ┌──────────────────────┐ ◀── celery-worker (Beat)
-  reserve / commit / release       │  inventory  :8004    │     sweep_expired_reservations
-  init stock rows (publishing)     │  api · services ·    │     reconcile_inventory_ledger
-                                   │  consumers · tasks   │
-                                   └───┬──────────┬───────┘
-          Kafka ── catalog.product.published ─▶│  (inventory-consumer, group "inventory")
-          Kafka ── order.cancelled ───────────▶│
-                                       │          │  cache-aside, 10s
-                                       ▼          ▼
-                               ┌──────────────┐  ┌─────────────────────────┐
-                               │ inventory_db │  │ Redis                   │
-                               │ stock_items  │  │ cache:inventory:{vid}   │
-                               │ reservations │  └─────────────────────────┘
-                               │ stock_moves  │
-                               │ outbox ─────────▶ outbox-relay ─▶ Kafka
-                               │ processed_ev │     inventory.reserved / .released / .stockout
-                               └──────────────┘
+**Component diagram.**
+
+```mermaid
+flowchart LR
+    GW["gateway :8000<br/>/api/v1/inventory/*<br/>(public + merchant/admin)"]
+    TW["temporal-worker<br/>reserve / commit / release / reverse<br/>init stock rows (publishing)"]
+    CW["celery-worker (Beat)<br/>sweep_expired_reservations<br/>reconcile_inventory_ledger"]
+    KIN[["Kafka<br/>catalog.product.published<br/>order.cancelled"]]
+
+    subgraph INV["inventory :8004"]
+        ROUTES["routes<br/>stock/v1, reservations/v1"]
+        CONS["inventory-consumer<br/>group inventory"]
+        TASKS["tasks"]
+        REPOS["repos<br/>StockRepo · ReservationRepo · LedgerRepo"]
+    end
+
+    DB[("inventory_db<br/>stock_items · reservations · stock_movements<br/>outbox · processed_events")]
+    REDIS[("Redis<br/>cache:inventory:{vid}")]
+    RELAY["outbox-relay"]
+    KOUT[["Kafka<br/>inventory.reserved / .released / .stockout"]]
+
+    GW -->|"HTTP"| ROUTES
+    TW -->|"service JWT"| ROUTES
+    CW --> TASKS
+    KIN --> CONS
+    ROUTES --> REPOS
+    CONS --> REPOS
+    TASKS --> REPOS
+    REPOS --> DB
+    REPOS -->|"cache-aside, 10 s"| REDIS
+    DB -->|"outbox rows"| RELAY
+    RELAY --> KOUT
 ```
 
 ##### 3.1.1.1. Responsibility and boundaries
@@ -177,7 +189,7 @@ Why it is not folded into `catalog`: a different write profile entirely — high
 | R5 / A13 | `inventory` makes **no** synchronous call to another service. It is *called* synchronously (by `OrderWorkflow` activities and display reads), never a caller |
 | R6 / A14 | Product data is snapshotted (`sku`, `product_id`, `merchant_id`) at row creation |
 | R7 | Serves reads from its own data with local JWT verification; `identity` being down does not stop it |
-| R8 | Stock rules live in `services/inventory/app/services/`, never in `common` |
+| R8 | Stock rules live in the entity repos (`services/inventory/app/stock/repo.py`, `app/reservations/repo.py`), never in `common` |
 | A4 / A5 | Re-verifies every token itself; the gateway is an early rejection only |
 | A6 | Async throughout — `asyncpg`, SQLAlchemy 2.0 async |
 | A7 | Every error is an RFC 9457 problem detail |
@@ -192,32 +204,47 @@ Why it is not folded into `catalog`: a different write profile entirely — high
 
 **Internal module layout** ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)):
 
+Planned, following the entity-first template in [file-structure.md §4](../file-structure.md#4-service-layout-every-service); the entities are `stock/` (`stock_items`, `stock_movements`) and `reservations/` ([§5](../file-structure.md#5-per-service-differences)).
+
 ```
 services/inventory/
-├── app/
-│   ├── api/v1/
-│   │   ├── router.py           every route: /inventory/* and the internal reservation routes
-│   │   ├── stock.py            handlers: public + merchant/admin — parse, call, serialise
-│   │   └── internal.py         handlers: service-token reservations, stock-row initialisation
-│   ├── services/
-│   │   ├── stock_service.py    set, adjust, initialise, read, low-stock queries
-│   │   ├── reservation_service.py   reserve / commit / release / expire — the one hard function
-│   │   ├── locking.py          canonical lock order, lock_timeout, bounded retry
-│   │   ├── ledger.py           the only writer of stock_movements
-│   │   └── reconciliation.py   ledger vs current-value check
-│   ├── domain/
-│   │   ├── enums.py            ReservationStatus, StockMovementReason, StockoutTrigger
-│   │   └── state_machine.py    RESERVATION_TRANSITIONS
-│   ├── models/                 SQLAlchemy ORM — no behaviour
-│   ├── schemas/                Pydantic request/response and event payloads
-│   ├── consumers/              catalog_product_published.py, order_cancelled.py — thin
-│   ├── tasks/                  sweep_expired_reservations, reconcile_inventory_ledger — thin
-│   └── core/                   settings, security (service-token scope), dependencies
+├── main.py                     create_application(): settings, logging, DB, router, /health
 ├── alembic/                    per-service history; env.py carries the S4 render_item hook
-└── tests/
+├── app/
+│   ├── router.py               includes only: /api/v1 + /inventory (stock/v1) and
+│   │                           /internal/v1/inventory + /reservations, /stock-items
+│   ├── models.py               imports every entity's ORM models onto one metadata
+│   ├── core/
+│   │   ├── config.py           settings (§3.1.1.6)
+│   │   ├── db.py, logger.py    session factory, JSON logging
+│   │   ├── dependencies.py     principal, role guards, service-token scope guard (inventory:internal)
+│   │   ├── errors.py           DomainError subclasses: insufficient-stock, reservation-not-held, …
+│   │   └── schemas.py          Pydantic bases
+│   ├── stock/
+│   │   ├── models.py           StockItem, StockMovement — SQLAlchemy ORM, no behaviour
+│   │   ├── repo.py             StockRepo: set, adjust, initialise, read, low-stock queries
+│   │   ├── ledger_repo.py      LedgerRepo: the only writer of stock_movements; reconciliation check
+│   │   ├── locking.py          canonical lock order, lock_timeout, bounded retry
+│   │   ├── enums.py            StockMovementReason, StockoutTrigger
+│   │   ├── dependencies.py     builds the stock repos for a request
+│   │   └── v1/
+│   │       ├── routes.py       public + merchant/admin /inventory/*; internal POST /stock-items
+│   │       └── schemas.py      v1 request/response models
+│   ├── reservations/
+│   │   ├── models.py           Reservation
+│   │   ├── repo.py             ReservationRepo: reserve / commit / release / reverse / expire — the one hard function
+│   │   ├── enums.py            ReservationStatus
+│   │   ├── utils.py            RESERVATION_TRANSITIONS, transition() — no I/O
+│   │   ├── dependencies.py
+│   │   └── v1/
+│   │       ├── routes.py       internal (service token) /reservations routes
+│   │       └── schemas.py
+│   ├── consumers/              catalog_product_published.py, order_cancelled.py — thin, call the repos
+│   └── tasks/                  sweep_expired_reservations, reconcile_inventory_ledger — thin
+└── tests/                      unit/<entity>/…, integration/<entity>/…
 ```
 
-Handlers never touch the ORM; the service layer never constructs an HTTP response. That seam is what lets a route, a Temporal activity (via the internal route), a Kafka consumer and a Celery task reach one implementation of each rule.
+The internal routes live in each entity's `v1/routes.py` (on a second router the entity exports for `app/router.py` to mount under `/internal/v1/inventory`), so a path's full URL is still readable from `app/router.py` alone. Routes never touch the ORM; repos never construct an HTTP response. That seam is what lets a route, a Temporal activity (via the internal route), a Kafka consumer and a Celery task reach one implementation of each rule.
 
 ##### 3.1.1.2. Domain model
 
@@ -264,17 +291,17 @@ A reservation belongs to one stock item (one variant) and names one order. An or
 
 | # | Invariant | Enforced by |
 | --- | --- | --- |
-| I1 | `on_hand >= reserved AND reserved >= 0` (hence `on_hand >= 0`, `available >= 0`) | `CHECK` constraint (S11) — the last line of defence against oversell; the service layer checks first and returns a typed error, the constraint catches anything that slips |
+| I1 | `on_hand >= reserved AND reserved >= 0` (hence `on_hand >= 0`, `available >= 0`) | `CHECK` constraint (S11) — the last line of defence against oversell; the repo checks first and returns a typed error, the constraint catches anything that slips |
 | I2 | `available = on_hand − reserved`, always | Stored generated column — no caller can compute it differently |
 | I3 | At most one reservation per `(order_id, variant_id)` | Unique constraint — the idempotency guarantee for retried reserve activities (B3) |
 | I4 | `reservations.quantity > 0` | `CHECK` (S11) |
 | I5 | `reserved = Σ quantity of held reservations for the variant` | Maintained by every transition in one transaction; verified by `reconcile_inventory_ledger` |
-| I6 | `on_hand = Σ delta_on_hand`, `reserved = Σ delta_reserved` over the variant's ledger | Every quantity change writes its ledger row in the same transaction via `ledger.py`, the only writer of `stock_movements`; verified daily |
+| I6 | `on_hand = Σ delta_on_hand`, `reserved = Σ delta_reserved` over the variant's ledger | Every quantity change writes its ledger row in the same transaction via `app/stock/ledger_repo.py`, the only writer of `stock_movements`; verified daily |
 | I7 | A reserve for an order is all-or-nothing across its lines | One transaction for all lines |
 | I8 | A `committed` reservation can never return to `held`; terminal states are terminal | `RESERVATION_TRANSITIONS` (§3.1.1.3) |
 | I9 | `stock_movements` is append-only | No update or delete path in code; the inventory role is granted `INSERT, SELECT` only on the table (INV-12) |
 
-**`DomainEnum` vocabularies** (S4 — `text` columns, values in `app/models/enums.py`, enforced by `DomainEnumText` on write and Pydantic at the edge):
+**`DomainEnum` vocabularies** (S4 — `text` columns, values in `app/reservations/enums.py` (`ReservationStatus`) and `app/stock/enums.py` (`StockMovementReason`, `StockoutTrigger`), enforced by `DomainEnumText` on write and Pydantic at the edge):
 
 | Enum | Column | Values | Read policy |
 | --- | --- | --- | --- |
@@ -282,23 +309,26 @@ A reservation belongs to one stock item (one variant) and names one order. An or
 | `StockMovementReason` | `stock_movements.reason` | `initial`, `manual_adjustment`, `reserve`, `release`, `commit`, `expire`, `restock`, `return`, `compensation` | `passthrough` — a ledger vocabulary, displayed and filtered, expected to grow |
 | `StockoutTrigger` (INV-7) | event payload only (`inventory.stockout.trigger`) | `depleted`, `low_stock`, `reservation_refused` | n/a — not a column |
 
-Adding a value is one line in `enums.py`, plus an edge in the transition table if it is a state; no Alembic revision, and `alembic check` must report no pending diff. The creating migration comments the column with a pointer to the source of truth (`COMMENT ON COLUMN reservations.status IS 'DomainEnum ReservationStatus — see services/inventory/app/models/enums.py; transitions in app/utils/state_machine.py'`).
+Adding a value is one line in the entity's `enums.py`, plus an edge in the transition table if it is a state; no Alembic revision, and `alembic check` must report no pending diff. The creating migration comments the column with a pointer to the source of truth (`COMMENT ON COLUMN reservations.status IS 'DomainEnum ReservationStatus — see services/inventory/app/reservations/enums.py; transitions in app/reservations/utils.py'`).
 
 ##### 3.1.1.3. State machines
 
 **`ReservationStatus`** — the only state machine in `inventory`. `stock_items` has no status; its quantities are governed by I1–I6.
 
-```
-                 reserve
-                    │
-                    ▼
-               ┌─────────┐
-               │  held   │───── expires_at < now(), sweeper ─────▶ expired  (terminal)
-               └────┬────┘
-        commit      │      release (compensation / order.cancelled)
-     ┌──────────────┴──────────────┐
-     ▼                             ▼
- committed (terminal)          released (terminal)
+```mermaid
+stateDiagram-v2
+    [*] --> held: reserve (reserve_inventory)
+    held --> committed: commit (payment settled)
+    held --> released: release (compensation or order.cancelled)
+    held --> expired: sweeper, expires_at before now()
+    committed --> [*]
+    released --> [*]
+    expired --> [*]
+    note right of committed
+        terminal, never returns to held (I8).
+        reverse (INV-16) returns on_hand
+        but the status stays committed
+    end note
 ```
 
 ```python
@@ -349,7 +379,45 @@ Every status change goes through one guarded method, which raises `IllegalTransi
 
 **Error contract to the activities (INV-5).** Business outcomes are `4xx` and must be raised as Temporal `NonRetryableError`; contention and infrastructure outcomes are `503`/`5xx` and are retried under the workflow's retry policy. `inventory` never returns `5xx` for a business failure, which is what lets the workflow's retry policy be written without knowing inventory's rules. Recommended policy for the three `OrderWorkflow` inventory activities, adopted in RFC 0005: `start_to_close` 10 s, exponential backoff from 1 s, coefficient 2, maximum interval 10 s, maximum 5 attempts — well inside the 15-minute reservation TTL, so no retry chain can outlive the reservation it is retrying.
 
-**The reserve path**, `ReservationService.reserve(order_id, lines, actor, correlation_id)`:
+**`OrderWorkflow` against `inventory`** — the saga steps that reach this service (step order and compensation order are RFC 0005's; shown here for the calls and outcomes `inventory` serves):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant WF as OrderWorkflow (temporal-worker)
+    participant INV as inventory :8004
+    participant PAY as payment and shipment steps (RFC 0005)
+
+    WF->>INV: reserve_inventory: POST /internal/v1/inventory/reservations
+    alt 409 insufficient-stock / 422 unknown-variant
+        INV-->>WF: non-retryable 4xx
+        Note over WF: order failed (INSUFFICIENT_STOCK), no payment attempted
+    else 201 (or 200 replay)
+        INV-->>WF: reservation ids (held, expires_at)
+        WF->>PAY: charge_payment
+        alt payment declined
+            WF->>INV: release_inventory: DELETE /reservations/{id} per id
+            INV-->>WF: 200 (released, or no-op)
+        else payment succeeded
+            WF->>INV: commit_inventory: POST /reservations/{id}/commit per id, ascending variant_id
+            alt 200 committed
+                INV-->>WF: committed
+                WF->>PAY: create shipment
+                opt shipment creation fails
+                    WF->>INV: reverse_commit_inventory: POST /reservations/{id}/reverse per id
+                    INV-->>WF: 200 (on_hand returned, compensation ledger row)
+                end
+            else 409 reservation-not-held (expired before commit)
+                INV-->>WF: non-retryable 409
+                WF->>PAY: refund_payment
+                WF->>INV: release_inventory (no-op on expired)
+            end
+        end
+    end
+    Note over WF,INV: 503 inventory-contended and 5xx are retried under the workflow retry policy (INV-5)
+```
+
+**The reserve path**, `ReservationRepo.reserve(order_id, lines, actor, correlation_id)`:
 
 ```
   0. normalise: merge lines with the same variant_id (sum quantities); reject q ≤ 0 (422);
@@ -381,7 +449,120 @@ Every status change goes through one guarded method, which raises `IllegalTransi
 
 The stockout outbox row for a refused reservation is written **after** the reserve transaction has rolled back, because an outbox row inside a rolled-back transaction would vanish with it (G8 cuts both ways). It is the one inventory event not written in the state-change transaction — correctly, because there is no state change.
 
+**Reserve endpoint, sequence** (`POST /internal/v1/inventory/reservations`):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ACT as reserve_inventory activity
+    participant R as reservations/v1/routes.py
+    participant REPO as ReservationRepo
+    participant DB as inventory_db
+    participant C as Redis
+
+    ACT->>R: POST {order_id, lines} + service JWT
+    R->>R: verify JWT, scope inventory:internal
+    R->>REPO: reserve(order_id, lines, actor, correlation_id)
+    REPO->>REPO: merge duplicate variants, sort by variant_id
+    REPO->>DB: unlocked read of available (fast reject, INV-8)
+    alt some line has available below q
+        REPO->>DB: short tx: INSERT outbox inventory.stockout (reservation_refused)
+        REPO-->>R: InsufficientStock
+        R-->>ACT: 409 insufficient-stock, violations[]
+    else enough on the unlocked read
+        REPO->>DB: BEGIN, SET LOCAL lock_timeout
+        REPO->>DB: SELECT reservations WHERE order_id (replay check)
+        REPO->>DB: SELECT stock_items WHERE variant_id = ANY ORDER BY variant_id FOR UPDATE
+        alt replay or conflict or unknown or short under lock
+            REPO->>DB: COMMIT (replay) or ROLLBACK
+            REPO-->>R: existing reservations, or typed error
+            R-->>ACT: 200 replay / 409 / 422
+        else every line available under lock
+            loop each line in variant_id order
+                REPO->>DB: UPDATE stock_items reserved += q, version += 1
+                REPO->>DB: INSERT reservations (held, now() + TTL)
+                REPO->>DB: INSERT stock_movements reserve (0, +q)
+                REPO->>DB: INSERT outbox inventory.reserved (+ stockout if crossing)
+            end
+            REPO->>DB: COMMIT
+            REPO->>C: DEL cache:inventory:{variant_id} per line
+            REPO-->>R: reservations
+            R-->>ACT: 201 {order_id, reservations[]}
+        end
+    end
+```
+
+**Reserve decision flow:**
+
+```mermaid
+flowchart TD
+    A["lines received"] --> B{"1 to 100 lines,<br/>every q > 0?"}
+    B -- no --> E422["422 validation"]
+    B -- yes --> C["merge duplicate variants,<br/>sort by variant_id"]
+    C --> D{"fast reject:<br/>unlocked available below q<br/>for any line?"}
+    D -- yes --> REF["separate short tx:<br/>outbox inventory.stockout<br/>(reservation_refused) per short line"]
+    REF --> E409["409 insufficient-stock<br/>violations[]"]
+    D -- no --> F["BEGIN, SET LOCAL lock_timeout"]
+    F --> G{"reservations already<br/>exist for order_id?"}
+    G -- "all lines, same quantities" --> R200["COMMIT, 200 replay"]
+    G -- "any mismatch" --> RC["ROLLBACK, 409 reservation-conflict"]
+    G -- none --> H["SELECT stock_items ... ORDER BY variant_id FOR UPDATE"]
+    H --> I{"every variant<br/>has a stock row?"}
+    I -- no --> UV["ROLLBACK, 422 unknown-variant"]
+    I -- yes --> J{"available >= q<br/>for every line?"}
+    J -- no --> RB["ROLLBACK"] --> REF
+    J -- yes --> K["per line: reserved += q, insert reservation,<br/>ledger reserve (0,+q), outbox inventory.reserved"]
+    K --> L{"available_after = 0?"}
+    L -- yes --> DEP["outbox inventory.stockout (depleted)"]
+    L -- no --> M{"crossed<br/>low_stock_threshold?"}
+    M -- yes --> LOW["outbox inventory.stockout (low_stock)"]
+    M -- no --> N["COMMIT"]
+    DEP --> N
+    LOW --> N
+    N --> O["invalidate cache per line"] --> R201["201 reservations"]
+```
+
 **Commit and release paths** each lock, in canonical order, the variant's `stock_items` row and then the reservation row (`FOR UPDATE`), check the status against the idempotency table above, call `transition()`, update quantities, append the ledger row and the outbox row (release only), and commit. Each is a single-row, single-reservation short transaction.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ACT as commit / release / reverse activity
+    participant REPO as ReservationRepo
+    participant DB as inventory_db
+    participant C as Redis
+
+    ACT->>REPO: POST .../{id}/commit, DELETE .../{id}, or POST .../{id}/reverse
+    REPO->>DB: BEGIN, SET LOCAL lock_timeout
+    REPO->>DB: SELECT stock_items row FOR UPDATE (variant of the reservation)
+    REPO->>DB: SELECT reservations row FOR UPDATE
+    alt already in the requested end state (idempotency table)
+        REPO->>DB: COMMIT, no write
+        REPO-->>ACT: 200, existing reservation
+    else status does not allow the request
+        REPO->>DB: ROLLBACK
+        REPO-->>ACT: 409 reservation-not-held / -committed / -not-committed
+    else commit on held
+        REPO->>DB: transition held to committed, reserved -= q, on_hand -= q
+        REPO->>DB: INSERT stock_movements commit (-q, -q)
+        REPO->>DB: COMMIT
+        REPO->>C: DEL cache:inventory:{variant_id}
+        REPO-->>ACT: 200
+    else release on held
+        REPO->>DB: transition held to released, reserved -= q
+        REPO->>DB: INSERT stock_movements release (0, -q)
+        REPO->>DB: INSERT outbox inventory.released (compensation)
+        REPO->>DB: COMMIT
+        REPO->>C: DEL cache:inventory:{variant_id}
+        REPO-->>ACT: 200
+    else reverse on committed, not yet reversed
+        REPO->>DB: on_hand += q, status stays committed
+        REPO->>DB: INSERT stock_movements compensation (+q, 0)
+        REPO->>DB: COMMIT
+        REPO->>C: DEL cache:inventory:{variant_id}
+        REPO-->>ACT: 200
+    end
+```
 
 ###### Locking strategy (INV-1, INV-2, INV-3)
 
@@ -394,6 +575,20 @@ The stockout outbox row for a refused reservation is written **after** the reser
 | **Bounded retry** | On `55P03 lock_not_available`, `40P01 deadlock_detected` or `40001 serialization_failure`, the service retries the whole transaction up to 3 attempts with jittered exponential backoff (25 ms base). Exhausted → `503 inventory-contended` with `Retry-After`, which the activity treats as retryable | Deadlocks should be impossible given the lock order, but the retry makes the claim safe rather than load-bearing. The retry is bounded so contention surfaces as a typed, retryable error rather than a hung request |
 | Isolation level | `READ COMMITTED` plus explicit row locks | Row locks give the serialisation needed; `SERIALIZABLE` would add aborts on a path that is already serialised |
 | Last line of defence | `CHECK (on_hand >= reserved AND reserved >= 0)` | Even a code path that forgot to lock cannot oversell; it fails with `23514`, mapped to `409` |
+
+**Bounded retry (INV-1):**
+
+```mermaid
+flowchart TD
+    S["start attempt n"] --> T["BEGIN, SET LOCAL lock_timeout = 2 s<br/>locks in canonical order"]
+    T --> U{"outcome"}
+    U -- "committed" --> OK["return result"]
+    U -- "business rule refused" --> B4["typed 4xx, not retried"]
+    U -- "23514 check_violation" --> CV["409, count inventory_check_violations_total"]
+    U -- "55P03, 40P01 or 40001" --> V{"n below 3?"}
+    V -- yes --> W["jittered exponential backoff, 25 ms base"] --> S
+    V -- no --> X["503 inventory-contended<br/>with Retry-After (retryable)"]
+```
 
 **Flash-sale contention.** Under a flash sale on one variant, every reserve for it queues on one row lock. That is the intended behaviour — oversell is a business failure, queueing is a latency cost — and five measures keep the queue short and honest:
 
@@ -412,9 +607,35 @@ The known ceiling is the one the design accepts: a hot variant row serialises wr
 | `sweep_expired_reservations` | `maintenance` | Celery Beat, every minute | Selects up to `INVENTORY_SWEEP_BATCH_SIZE` `held` reservations with `expires_at < now()` (no lock, ordered by `expires_at`); for each, one short transaction in canonical lock order — lock the `stock_items` row, lock the reservation, **re-check** `held` and `expires_at < now()`, transition to `expired`, `reserved −= q`, ledger `expire (0,−q)`, outbox `inventory.released` (`reason: expired`). Loops batches until none remain or the run budget is spent. Safe on two workers and safe to run twice: the re-check under lock makes a lost race a no-op |
 | `reconcile_inventory_ledger` | `maintenance` | Celery Beat, daily | For every variant: `Σ delta_on_hand = on_hand`, `Σ delta_reserved = reserved`, `reserved = Σ held quantity`. Emits `inventory_ledger_drift_variants`, logs each drifting variant with its values. **Detects, never corrects** — a correction is a `manual_adjustment` a human makes, so the ledger stays the record |
 
-The sweeper is **a safety net beneath the compensation, not a replacement for it** (B5): the normal path releases through `release_inventory`. It exists so a workflow lost in a way Temporal cannot recover does not strand stock forever, and it is independent of Temporal, so a failure mode Temporal cannot see still self-heals. The same `ReservationService.expire_due()` also runs from an in-process asyncio loop when `INVENTORY_SWEEPER_INPROCESS=true` — the driver used before RabbitMQ and Celery are in the stack, and the fallback when they are down (INV-10). Both drivers call the same function; running both at once is safe for the same reason two Celery workers are.
+The sweeper is **a safety net beneath the compensation, not a replacement for it** (B5): the normal path releases through `release_inventory`. It exists so a workflow lost in a way Temporal cannot recover does not strand stock forever, and it is independent of Temporal, so a failure mode Temporal cannot see still self-heals. The same `ReservationRepo.expire_due()` also runs from an in-process asyncio loop when `INVENTORY_SWEEPER_INPROCESS=true` — the driver used before RabbitMQ and Celery are in the stack, and the fallback when they are down (INV-10). Both drivers call the same function; running both at once is safe for the same reason two Celery workers are.
 
 The sweeper does not cancel or fail orders; it cannot, because orders are not its fact. An order whose reservation expired fails at `commit_inventory` (`409 reservation-not-held`) and is compensated by `OrderWorkflow`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant BEAT as Celery Beat (or in-process loop)
+    participant T as sweep_expired_reservations
+    participant REPO as ReservationRepo.expire_due
+    participant DB as inventory_db
+
+    BEAT->>T: every minute
+    T->>REPO: expire_due()
+    loop batches of INVENTORY_SWEEP_BATCH_SIZE until none remain or budget spent
+        REPO->>DB: SELECT held reservations WHERE expires_at before now() ORDER BY expires_at (no lock)
+        loop each candidate, one short transaction
+            REPO->>DB: BEGIN, lock stock_items row, then the reservation row
+            alt still held and expires_at before now()
+                REPO->>DB: transition held to expired, reserved -= q
+                REPO->>DB: INSERT stock_movements expire (0, -q)
+                REPO->>DB: INSERT outbox inventory.released (expired)
+                REPO->>DB: COMMIT
+            else committed, released or already expired (lost race)
+                REPO->>DB: COMMIT, no-op
+            end
+        end
+    end
+```
 
 ###### Event consumers (process `inventory-consumer`, group `inventory`)
 
@@ -422,8 +643,61 @@ One consumer process per service, subscribing to both topics, dedupe keyed by co
 
 | Topic | Handler | Effect |
 | --- | --- | --- |
-| `catalog.product.published` | `consumers/catalog_product_published.py` → `StockService.initialise(product_id, merchant_id, variants)` | For each variant: `INSERT stock_items (variant_id, product_id, merchant_id, sku, on_hand 0, reserved 0, low_stock_threshold default) ON CONFLICT (variant_id) DO NOTHING`; for rows actually inserted, a ledger `initial (0,0)` row. Existing rows — created by the publishing workflow's `sync_downstream`, or by an earlier publish — are untouched; quantities are never reset by a republish (Q4) |
-| `order.cancelled` | `consumers/order_cancelled.py` → `ReservationService.release_for_order(order_id, reason=order_cancelled)` | Releases every `held` reservation of the order, one short transaction per reservation in ascending `variant_id`. `released`/`expired` are no-ops; `committed` is left alone and logged (post-commit cancellation is a refund in `order`, not a release). Normally the workflow's cancellation compensation has already released, so this is the backstop for a cancellation that bypassed or outlived the workflow |
+| `catalog.product.published` | `app/consumers/catalog_product_published.py` → `StockRepo.initialise(product_id, merchant_id, variants)` | For each variant: `INSERT stock_items (variant_id, product_id, merchant_id, sku, on_hand 0, reserved 0, low_stock_threshold default) ON CONFLICT (variant_id) DO NOTHING`; for rows actually inserted, a ledger `initial (0,0)` row. Existing rows — created by the publishing workflow's `sync_downstream`, or by an earlier publish — are untouched; quantities are never reset by a republish (Q4) |
+| `order.cancelled` | `app/consumers/order_cancelled.py` → `ReservationRepo.release_for_order(order_id, reason=order_cancelled)` | Releases every `held` reservation of the order, one short transaction per reservation in ascending `variant_id`. `released`/`expired` are no-ops; `committed` is left alone and logged (post-commit cancellation is a refund in `order`, not a release). Normally the workflow's cancellation compensation has already released, so this is the backstop for a cancellation that bypassed or outlived the workflow |
+
+**Stock-row initialisation — the two converging paths (Q4, INV-4):**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PW as ProductPublishingWorkflow (temporal-worker)
+    participant K as Kafka
+    participant INV as inventory (stock/v1/routes.py)
+    participant CON as inventory-consumer
+    participant REPO as StockRepo.initialise
+    participant DB as inventory_db
+
+    PW->>INV: sync_downstream: POST /internal/v1/inventory/stock-items
+    INV->>REPO: initialise(product_id, merchant_id, variants)
+    REPO->>DB: INSERT stock_items (on_hand 0, reserved 0) ON CONFLICT (variant_id) DO NOTHING
+    REPO->>DB: INSERT stock_movements initial (0, 0) for rows actually inserted
+    INV-->>PW: 200 {items}
+    K->>CON: catalog.product.published
+    CON->>DB: BEGIN, INSERT processed_events (inventory, event_id)
+    alt event already processed
+        CON->>DB: ROLLBACK, skip
+    else first delivery
+        CON->>REPO: initialise(product_id, merchant_id, variants)
+        REPO->>DB: same idempotent insert, existing rows untouched
+        CON->>DB: COMMIT
+    end
+```
+
+**`order.cancelled` backstop:**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as Kafka
+    participant CON as inventory-consumer
+    participant REPO as ReservationRepo.release_for_order
+    participant DB as inventory_db
+
+    K->>CON: order.cancelled {order_id}
+    CON->>DB: dedupe on processed_events (inventory, event_id)
+    CON->>REPO: release_for_order(order_id, reason=order_cancelled)
+    loop each reservation of the order, ascending variant_id, one short tx each
+        alt held
+            REPO->>DB: lock stock row then reservation, transition to released, reserved -= q
+            REPO->>DB: ledger release (0, -q), outbox inventory.released (order_cancelled)
+        else released or expired
+            Note over REPO: no-op
+        else committed
+            Note over REPO: left alone and logged (refund belongs to order)
+        end
+    end
+```
 
 ##### 3.1.1.5. Dependencies and degradation
 
@@ -455,7 +729,7 @@ One consumer process per service, subscribing to both topics, dedupe keyed by co
 
 ##### 3.1.1.6. Configuration
 
-Settings are read by `app/configs/env.py` from the environment. Values marked *(INV)* are proposed by this RFC; the others come from the sources.
+Settings are read by `app/core/config.py` from the environment. Values marked *(INV)* are proposed by this RFC; the others come from the sources.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -530,6 +804,69 @@ All routes are under `/api/v1/inventory` and reached through the gateway at `:80
 | `POST` | `/api/v1/inventory/{variant_id}/adjust` | `{delta: int ≠ 0, reason: restock \| return \| manual_adjustment, reference_id?: uuid}`; optional `Idempotency-Key` | The stock item after the change | `200`; `404`; `403`; `409 stock-below-reserved` (a negative δ that would take `on_hand` below `reserved`); `422` (δ = 0, `restock`/`return` with δ < 0, or a reason outside the three) | **Relative change** — preferred over `PUT` because it is safe under concurrency: it applies to whatever the row holds at lock time. `Idempotency-Key` replay returns the same result without a second ledger row (INV-11) |
 | `GET` | `/api/v1/inventory/{variant_id}/movements` | `?reason=&from=&to=&limit&offset` | Paginated ledger rows `{id, delta_on_hand, delta_reserved, reason, reference_type, reference_id, actor, correlation_id, created_at}`, newest first | `200`; `404`; `403` | The ledger — the audit trail for stock |
 
+**Public stock read** (`GET /api/v1/inventory/{variant_id}`, cache-aside):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CL as client (product page, catalog, assistant)
+    participant GW as gateway :8000
+    participant INV as inventory stock/v1/routes.py
+    participant C as Redis
+    participant DB as inventory_db
+
+    CL->>GW: GET /api/v1/inventory/{variant_id}
+    GW->>INV: forward
+    INV->>C: GET cache:inventory:{variant_id}
+    alt hit
+        C-->>INV: cached body
+    else miss or Redis down
+        INV->>DB: SELECT stock_items WHERE variant_id
+        alt no row
+            INV-->>GW: 404
+        else row
+            INV->>C: SET with 10 s TTL (skipped if Redis down)
+        end
+    end
+    INV-->>GW: 200 {variant_id, on_hand, reserved, available, in_stock}
+    GW-->>CL: 200
+```
+
+**Merchant adjust** (`POST /api/v1/inventory/{variant_id}/adjust`; `PUT` follows the same path with an absolute value and the `If-Match` check in place of the key replay):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as merchant
+    participant GW as gateway :8000
+    participant INV as inventory stock/v1/routes.py
+    participant REPO as StockRepo
+    participant DB as inventory_db
+    participant C as Redis
+
+    M->>GW: POST /api/v1/inventory/{variant_id}/adjust {delta, reason} + Idempotency-Key
+    GW->>INV: forward (early role check only, A5)
+    INV->>INV: verify JWT locally, role merchant or admin
+    INV->>REPO: adjust(variant_id, delta, reason, key, principal)
+    REPO->>DB: BEGIN, SET LOCAL lock_timeout, SELECT stock_items FOR UPDATE
+    alt no row
+        REPO-->>INV: 404
+    else merchant and stock_items.merchant_id differs from token merchant_id
+        REPO-->>INV: 403
+    else ledger row exists for (adjustment, key)
+        REPO-->>INV: 200, same result, no second ledger row (INV-11)
+    else on_hand + delta below reserved
+        REPO-->>INV: 409 stock-below-reserved
+    else allowed
+        REPO->>DB: UPDATE on_hand += delta, version += 1
+        REPO->>DB: INSERT stock_movements (restock, return or manual_adjustment)
+        REPO->>DB: COMMIT
+        REPO->>C: DEL cache:inventory:{variant_id}
+        REPO-->>INV: stock item
+    end
+    INV-->>M: 200 or problem detail (via gateway)
+```
+
 **Internal surface** — service JWT with scope `inventory:internal` only; user tokens are rejected (`403`) even for `admin`.
 
 | Method | Path | Request | Response | Status codes | Idempotency |
@@ -594,6 +931,50 @@ The consumed payload fields relied on: `catalog.product.published` — `product_
 
 Owned by `inventory` · PostgreSQL 16. The highest-contention writes
 in the platform: a single row per variant is the lock target under a flash sale.
+
+```mermaid
+erDiagram
+    stock_items ||--o{ reservations : "variant_id (FK inside inventory_db, INV-13)"
+    stock_items ||--o{ stock_movements : "variant_id (ledger, no FK)"
+    stock_items {
+        uuid id PK
+        uuid variant_id UK "unique, the lock target"
+        uuid product_id "snapshot, indexed"
+        uuid merchant_id "snapshot, indexed"
+        text sku "snapshot"
+        int on_hand "CHECK on_hand >= reserved"
+        int reserved "CHECK reserved >= 0"
+        int available "generated: on_hand - reserved"
+        int low_stock_threshold "default 5"
+        int version "S6"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    reservations {
+        uuid id PK
+        uuid order_id "no FK (R2), unique with variant_id"
+        uuid variant_id FK "references stock_items.variant_id"
+        int quantity "CHECK quantity > 0"
+        text status "ReservationStatus"
+        timestamptz expires_at "partial index WHERE status = held"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    stock_movements {
+        int id PK "bigserial"
+        uuid variant_id "indexed"
+        int delta_on_hand "signed"
+        int delta_reserved "signed"
+        text reason "StockMovementReason"
+        text reference_type "e.g. order"
+        uuid reference_id
+        text actor
+        text correlation_id
+        timestamptz created_at "indexed, no updated_at"
+    }
+```
+
+`outbox` and `processed_events` are omitted from the diagram: their DDL is shared and defined once in [RFC 0000 §3.1.3.2](0000-architecture.md#3132-shared-tables--outbox-and-processed_events).
 
 | Table | Purpose |
 | --- | --- |
@@ -706,7 +1087,7 @@ Vocabularies (`ReservationStatus`, `StockMovementReason`) are not migrations (S4
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
 | 1 | `inventory` service skeleton, settings, health, Alembic with the S4 `render_item` hook; `0001_initial` (three tables + outbox) | Migration to head; `alembic check` clean | `common` outbox, idempotency, service-token verify ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
-| 2 | Domain: `enums.py`, `RESERVATION_TRANSITIONS`, `transition()`, `ledger.py` | Unit tests incl. all 13 illegal pairs | 1 |
+| 2 | Domain: `stock/enums.py`, `reservations/enums.py`, `RESERVATION_TRANSITIONS` and `transition()` in `reservations/utils.py`, `stock/ledger_repo.py` | Unit tests incl. all 13 illegal pairs | 1 |
 | 3 | Inventory core: reserve / release / commit with canonical lock order, `lock_timeout`, bounded retry, ledger and outbox writes | **Concurrency test — 50 parallel reserves on 10 units yield 10 successes**; deadlock test | 2 |
 | 4 | Internal routes and service-token scope check; `POST /stock-items` initialisation | Contract tests; user tokens rejected | 3, `identity` client-credentials grant |
 | 5 | Merchant APIs: read, set (with `If-Match`), adjust (with `Idempotency-Key`), movements, `low_stock` / `out_of_stock` filters | Tests green, ownership enforced | 3 |
@@ -742,6 +1123,42 @@ Vocabularies (`ReservationStatus`, `StockMovementReason`) are not migrations (S4
 | Architecture and design re-review | M7 (review) |
 
 ### 3.2. Rationale
+
+The register lists every significant decision in this RFC in one place; §3.2.2 keeps the full reasoning.
+
+#### 3.2.1. Decision register
+
+Decisions that already carry an ID (B*, Q*, R*, INV-1 to INV-16, INV-A*) keep it: the register row names it with "= ID" in the Decision column rather than renumbering, and `INV-D*` is only the register's row number.
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| INV-D1 | `inventory` is its own service and sole writer of stock (R3) | A hot-row write profile unlike `catalog`'s, and several writers (orders, returns, sync) on one fact; [§3.1.1.1](#3111-responsibility-and-boundaries) | A stock column on `product_variants` — makes `catalog` a second writer, the bug Part A names ([§5](#5-alternate-solutions), Alt 6) | Never without re-opening R3 |
+| INV-D2 | Stock lives in Postgres `inventory_db`; reservations are Postgres rows | Reservations must survive restarts and reconcile against the ledger; row locks suffice at this scale; [§5](#5-alternate-solutions) | Redis reservations — faster, but not durable or reconcilable (Alt 7); event sourcing — heavy, makes simple reads hard | Lock-wait metrics show Postgres is the ceiling |
+| INV-D3 | Stored quantity plus an append-only signed ledger, `stock_movements` (= B6) | Makes drift between stored value and `sum(deltas)` detectable; gives merchants history; [§3.2.2](#322-reasoning) | Current value only — drift undetectable; event sourcing — cost (archive/0006 #5) | Never |
+| INV-D4 | `available` is a stored generated column | One definition every caller reads; nobody can compute it differently; [§3.2.2](#322-reasoning) | Computing it in code or per query — callers diverge | Never |
+| INV-D5 | Reserve before charge; commit after payment; release on failure (= B4) | The cheap failure (a released hold) comes first, never a refund; [§3.2.2](#322-reasoning) | Charge first — refunds for stock that does not exist; optimistic sell-then-cancel (Alt 5) — customer-facing failure | Never |
+| INV-D6 | Row lock (`SELECT … FOR UPDATE`) plus `CHECK (on_hand >= reserved AND reserved >= 0)` | Lock gives a typed refusal with numbers; the `CHECK` stops an unlocked writer; together oversell is impossible; [§3.2.2](#322-reasoning) | Single guarded `UPDATE` (INV-A2) — cannot tell unknown from insufficient; `SERIALIZABLE` (INV-A3) — aborts on the hot path | Hot-variant contention exceeds the budget (then INV-A1 sharding) |
+| INV-D7 | Canonical lock order: `stock_items` by ascending `variant_id`, then `reservations`, in one ordered statement (= INV-2) | A total order makes lock cycles, so deadlocks, impossible; [§3.2.2](#322-reasoning) | Lock in request order — `{A,B}` vs `{B,A}` deadlocks under flash sale | Any `40P01` is ever counted |
+| INV-D8 | `lock_timeout` 2 s and bounded retry (3 attempts, 25 ms jittered backoff), then `503 inventory-contended` (= INV-1, INV-3) | A request never hangs behind a stuck transaction; contention becomes a typed retryable error; [Locking strategy](#locking-strategy-inv-1-inv-2-inv-3) | Unbounded waits — piled-up connections; no retry — spurious failures | Lock-wait p99 nears the timeout |
+| INV-D9 | Fast reject on an unlocked read when `available < q` (= INV-8) | Sold-out variants never join the lock queue; an unlocked read can only reject, never grant; [Locking strategy](#locking-strategy-inv-1-inv-2-inv-3) | Always lock — queue grows with refused buyers | Never |
+| INV-D10 | Activity idempotency by natural key `(order_id, variant_id)` and reservation id (= B3) | Attempt-invariant and already unique; [§3.2.2](#322-reasoning) | A separate idempotency-key table — a second mechanism for the same fact | Never |
+| INV-D11 | Reservations expire after 15 min, swept by an independent sweeper (= B5, Q2) | Bounds stock stranded by a workflow Temporal cannot recover, without depending on Temporal; [§3.2.2](#322-reasoning) | No expiry — stock stranded forever; shorter TTL — slow payment retries fail | Flash-sale testing shows contention (Q2) |
+| INV-D12 | Sweeper on Celery Beat, with an in-process fallback (= INV-10) | Same function under both drivers; safe twice because of the re-check under lock; [§3.1.1.4](#3114-workflows-and-async-jobs) | Bespoke loop only — no shared scheduler; Celery only — no sweep before Celery exists | Celery hosting changes (INV-Q7) |
+| INV-D13 | Commit follows status, not the clock (= INV-6) | A `held` past expiry still holds its stock, so committing cannot oversell; refusing would refund a paid order; [§3.2.2](#322-reasoning) | Refuse commit past `expires_at` — needless failure and refund | Never |
+| INV-D14 | Post-commit compensation is `reverse` with a `compensation` ledger row, status stays `committed` (= INV-16) | Keeps I8 and the transition table unchanged, no new column; idempotent via the ledger index; [§11](#11-notes) | A new `reversed` state — changes the state machine and schema | RFC 0005 needs a reversed status visible |
+| INV-D15 | Error contract: business outcomes `4xx` non-retryable, contention and infra `503`/`5xx` retryable (= INV-5) | Workflow retry policy can be written without knowing inventory rules; [§3.1.1.4](#3114-workflows-and-async-jobs) | `5xx` for business failures — retried uselessly | Never |
+| INV-D16 | Stock rows initialised zero-quantity on publish, by `sync_downstream` and by the `catalog.product.published` consumer (= Q4, INV-4) | No synchronous `catalog` → `inventory` call (R5); the activity guarantees readiness, the consumer convergence; [§3.2.2](#322-reasoning) | Merchant pre-stocking before publish (INV-Q4) — needs trusting request ownership | Merchants need pre-publish stock (INV-Q4, INV-Q5) |
+| INV-D17 | `inventory` makes no synchronous call out (R5); orchestration is Temporal's (A12) | It is a callee only; workflow owns the sequence, services own the state; [§2](#2-overview) | Choreographed saga over Kafka (Alt 1) — compensation scattered; 2PC/XA (Alt 2) — blocking | Never |
+| INV-D18 | Internal routes require a service JWT with scope `inventory:internal`; user tokens rejected | A stolen customer or admin token cannot reserve, commit or release; [§3.1.2.2](#3122-role-matrix) | One role for users and services — opens `/internal/*` to user tokens | mTLS added between services |
+| INV-D19 | Merchant ownership checked against snapshot `stock_items.merchant_id` (= INV-14) | Local, fast, independent of `catalog`; claims are the only trusted assertion; [§3.2.2](#322-reasoning) | Request field — untrusted; call `catalog` — breaks R5/R7 | Product ownership becomes transferable |
+| INV-D20 | `adjust` (relative) preferred; `PUT` (absolute) only safe with `If-Match` (= INV-9, INV-11) | A relative change never overwrites a concurrent commit; [§3.2.2](#322-reasoning) | Absolute set only — lost updates | Never |
+| INV-D21 | Events `inventory.reserved` / `.released` / `.stockout` via the outbox; commit emits none (= INV-7, INV-Q2) | Atomic with the state change (G8); `order.confirmed` already carries the commit fact; [§3.1.2.3](#3123-events-produced) | `inventory.committed` — not in the catalogue, redundant | `analytics` needs a commit event |
+| INV-D22 | Stockout for a refused reserve written in a separate transaction after rollback | An outbox row in the rolled-back transaction would vanish; there is no state change to be atomic with; [§3.3](#33-tradeoffs) | Inside the reserve tx — lost on rollback | Never |
+| INV-D23 | `stock_movements` append-only by grant (= INV-12); reconciliation detects, never corrects | Ledger stays the record; an automatic fix would erase evidence; [§3.3](#33-tradeoffs) | Auto-correction — destroys the audit trail | Never |
+| INV-D24 | Public read cached in Redis for 10 s, invalidated after commit; reserve never reads the cache | Absorbs display and hydration reads; correctness never depends on the cache; [§3.3](#33-tradeoffs) | No cache — every page view hits Postgres; longer TTL — stale stock | Hydration latency (INV-Q8) |
+| INV-D25 | Entity-first layout: `stock/` and `reservations/` with `v1/` routes, repos hold the rules | One rule implementation for routes, activities, consumers and tasks; [§3.1.1.1](#3111-responsibility-and-boundaries) | Layered `api/` + `services/` trees — entity split across folders ([review §3](../reviews/2026-10-06-mentor-review.md#3-entity-first-service-layout-with-versions)) | Never |
+
+#### 3.2.2. Reasoning
 
 **Why reserve before charging (B4).** If payment runs first and the reservation then fails, money has been taken for stock that does not exist, and the fix is a refund the customer did not ask for. Reserving first means the worst case is a released reservation, which costs nothing and is invisible. The ordering is chosen so that the cheap failure comes first.
 
@@ -986,8 +1403,8 @@ Numbered alternatives keep their archive/0002 §5 numbers.
 | Risk | Likelihood | Impact | Mitigation |
 | --- | --- | --- | --- |
 | Compensation logic subtly wrong, failing only under a race | Medium | High | Failure injection at every step is required; the ledger makes any drift detectable; the sweeper bounds stranded stock |
-| A code path changing quantity without the lock or the ledger | Medium | High | `ledger.py` is the only writer of `stock_movements`; reconciliation detects drift; the `CHECK` stops oversell; `inventory_check_violations_total` shows it firing |
-| Lock order violated by a new path, producing deadlocks under load | Low | High | `locking.py` is the only place rows are locked; the deadlock test and the `40P01` counter |
+| A code path changing quantity without the lock or the ledger | Medium | High | `app/stock/ledger_repo.py` is the only writer of `stock_movements`; reconciliation detects drift; the `CHECK` stops oversell; `inventory_check_violations_total` shows it firing |
+| Lock order violated by a new path, producing deadlocks under load | Low | High | `app/stock/locking.py` is the only place rows are locked; the deadlock test and the `40P01` counter |
 | Flash-sale contention exceeding the lock-timeout budget | Medium | Medium | Fast reject at zero; bounded retry; Temporal retry with backoff; upstream rate limit; sharding as the recorded escape |
 | Scope creep into multi-warehouse or returns | Medium | Medium | Listed as non-goals with the reason attached |
 | Activity code accreting stock rules | Medium | Medium | B1 is a review check; activities only call internal routes |
@@ -1057,13 +1474,13 @@ Numbered alternatives keep their archive/0002 §5 numbers.
 - archive/0002 T3 says "all four tables" for `inventory`: the three domain tables plus `outbox`.
 - archive/0000 §3.1.1 says service-to-service calls need no separate trust model and that a no-user call would need a client-credentials token "as an amendment"; archive/0002's service JWT is that amendment.
 - archive/0003's delivery-scope table cites "the reservation sweeper" among causes of `order_cancelled`. The sweeper cannot change an order; an expired reservation surfaces as a failed commit and a `failed` order. The notification wording belongs to [RFC 0007](0007-notification-service.md).
-- archive/0002's B1 ("an activity calls one service function") and its internal-authentication paragraph ("activities call `inventory` as a service") are reconciled as: the activity calls the internal HTTP route, whose handler calls the one service function. R1 forbids `temporal-worker` a grant on `inventory_db`.
+- archive/0002's B1 ("an activity calls one service function") and its internal-authentication paragraph ("activities call `inventory` as a service") are reconciled as: the activity calls the internal HTTP route, whose route calls the one repo method. R1 forbids `temporal-worker` a grant on `inventory_db`.
 
 ---
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against the numbered decisions (B3–B6, INV-1–INV-15), the open questions (§3.3.1), or the rejected alternatives in §5, so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against the numbered decisions (B3–B6, INV-1–INV-16), the open questions (§3.3.1), or the rejected alternatives in §5, so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

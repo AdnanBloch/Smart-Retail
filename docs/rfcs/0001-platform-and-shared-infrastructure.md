@@ -51,6 +51,7 @@
        - 3.1.1.10. [Temporal server](#31110-temporal-server)
        - 3.1.1.11. [Observability stack](#31111-observability-stack)
        - 3.1.1.12. [Local environment — Compose, Makefile, Dockerfiles](#31112-local-environment--compose-makefile-dockerfiles)
+       - 3.1.1.13. [Engineering practice: tests, coverage, hooks and CI](#31113-engineering-practice-tests-coverage-hooks-and-ci)
      - 3.1.2. [API changes](#312-api-changes)
        - 3.1.2.1. [common public API](#3121-common-public-api)
        - 3.1.2.2. [The event envelope on the wire](#3122-the-event-envelope-on-the-wire)
@@ -67,6 +68,7 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -128,7 +130,7 @@ The platform also carries the one constraint that is not a design choice: the la
 | --- | --- |
 | Business logic inside workers — saga steps, compensations, chunking, embedding, rollup maths, dispatch rendering | Owned by the service whose state it changes: [0004](0004-catalog-service.md), [0005](0005-order-service.md), [0006](0006-inventory-service.md), [0007](0007-notification-service.md), [0008](0008-analytics-service.md), [0009](0009-assistant-service.md). This RFC hosts them |
 | Gateway routing, rate-limit *policy* and SSE proxying | [RFC 0002](0002-gateway-service.md). This RFC supplies the Redis keyspace and the limiter mechanism |
-| Kubernetes, cloud deployment, managed services, CI/CD pipelines | The target environment for the whole assignment is Docker Compose on a developer machine ([Execution Guidelines](../execution-guidelines.md)) |
+| Kubernetes, cloud deployment, managed services, continuous *deployment* | The target environment for the whole assignment is Docker Compose on a developer machine ([Execution Guidelines](../execution-guidelines.md)). Continuous *integration* is in scope (§3.1.1.13) |
 | Alerting — Alertmanager, PagerDuty, on-call | No operational context to alert into. Dashboards and traces cover the stated requirement (`0003-Q7`) |
 | Log aggregation — Loki, ELK | Structured JSON to stdout plus `docker compose logs` is sufficient at this scale. Correlation, which is the actual requirement, comes from the trace ID being in every line |
 | Kafka Streams, ksqlDB, Flink | Consumers in Python are adequate for the metric set; a stream processor is a large new concept for no requirement |
@@ -150,39 +152,48 @@ The platform also carries the one constraint that is not a design choice: the la
 
 **Where the platform sits.** Services own state; the platform moves it, schedules work over it, and watches it.
 
-```
-                         client ── HTTP / JSON / SSE ──▶ gateway (:8000)          [RFC 0002]
-                                                            │
-      ┌───────────────┬──────────────┬───────────────┬──────┴───────┬──────────────┬──────────────┐
-      ▼               ▼              ▼               ▼              ▼              ▼              ▼
-  identity        catalog         order          inventory    notification     analytics      assistant
-  (:8001)         (:8002)         (:8003)        (:8004)        (:8005)         (:8006)        (:8007)
-      │  every service imports common: auth · config · logging · errors · pagination · db ·
-      │  idempotency · outbox · events · consumer base · tracing · metrics · DomainEnum
-      ▼
- ┌──────────────── PostgreSQL 16 (pgvector image) — one instance, one database + role per service ──┐
- │ identity_db · catalog_db · order_db · inventory_db · notification_db · assistant_db · temporal*  │
- └──────┬─────────────────────────────────────────────────────────────────────────────────────────┘
-        │ outbox (5 producer DBs)                                   MongoDB (analytics_db) ◀─┐
-        ▼                                                                                     │
- ┌──────────────┐  produce   ┌────────────────────────────────────────┐  consume              │
- │ outbox-relay │──────────▶│ Kafka (KRaft) + Schema Registry (Avro)  │──────────┬────────────┤
- └──────────────┘            │ smartretail.<domain>.<event> + .dlq     │          │            │
-                             └────────────────────────────────────────┘   service consumers  indexer-worker
-                                                                          (catalog, inventory, (assistant code)
- ┌──────────────────┐ gRPC ┌─────────────────────┐                        notification, analytics)
- │ temporal-worker  │◀────▶│ Temporal server + UI │   ┌───────┐
- │ publishing, order│      └─────────────────────┘   │ MinIO │◀── catalog upload, media task
- └──────────────────┘                                 └───────┘
- ┌──────────────────┐ AMQP ┌──────────┐      ┌─────────────────────────────────────────────┐
- │ celery-worker    │◀────▶│ RabbitMQ │      │ Redis: rate limits · idempotency fast path · │
- │ (+ Beat)         │      └──────────┘      │ cache · notification pub/sub · SSE tickets · │
- │ celery-worker-ai │                        │ presence · token budgets · Celery results    │
- └──────────────────┘                        └─────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    client["client"] -- "HTTP / JSON / SSE" --> gateway["gateway :8000<br/>RFC 0002"]
+    gateway --> identity["identity :8001"]
+    gateway --> catalog["catalog :8002"]
+    gateway --> order["order :8003"]
+    gateway --> inventory["inventory :8004"]
+    gateway --> notification["notification :8005"]
+    gateway --> analytics["analytics :8006"]
+    gateway --> assistant["assistant :8007"]
 
- every component ── OTLP traces ──▶ OTel Collector ──▶ Jaeger
- every component ── /metrics ◀── scrape ── Prometheus ──▶ Grafana
- every component ── JSON logs (trace_id on every line) ──▶ stdout
+    common[["common (smartretail_common)<br/>auth · config · logging · errors · pagination · db ·<br/>idempotency · outbox · events · consumer base ·<br/>tracing · metrics · DomainEnum"]]
+    identity & catalog & order & inventory & notification & analytics & assistant -.->|import| common
+
+    subgraph PG["PostgreSQL 16 (pgvector image) — one instance, one database + role per service"]
+        dbs[("identity_db · catalog_db · order_db · inventory_db ·<br/>notification_db · assistant_db · temporal*")]
+    end
+    identity & catalog & order & inventory & notification & assistant --> dbs
+    mongo[("MongoDB analytics_db")]
+    analytics --> mongo
+
+    relay["outbox-relay"]
+    dbs -- "outbox (5 producer DBs)" --> relay
+    kafka["Kafka (KRaft) + Schema Registry (Avro)<br/>smartretail.{domain}.{event} + .dlq"]
+    relay -- "produce" --> kafka
+    kafka -- "consume" --> consumers["service consumers<br/>catalog, inventory, notification, analytics"]
+    kafka -- "consume" --> indexer["indexer-worker<br/>(assistant code)"]
+
+    tworker["temporal-worker<br/>publishing, order"] <-->|gRPC| temporal["Temporal server + UI"]
+    minio[("MinIO")]
+    catalog -- "upload" --> minio
+    cworker["celery-worker (+ Beat)<br/>celery-worker-ai"] <-->|AMQP| rabbit["RabbitMQ"]
+    cworker -- "media task" --> minio
+    redis[("Redis: rate limits · idempotency fast path · cache ·<br/>notification pub/sub · SSE tickets · presence ·<br/>token budgets · Celery results")]
+
+    subgraph OBS["observability"]
+        otel["OTel Collector"] --> jaeger["Jaeger"]
+        prom["Prometheus"] --> grafana["Grafana"]
+    end
+    every["every component"] -- "OTLP traces" --> otel
+    prom -- "scrape /metrics" --> every
+    every -- "JSON logs (trace_id on every line)" --> stdout["stdout"]
 ```
 
 **Decisions this RFC carries.** Each is defined where its archive text put it and is restated here because this RFC implements it.
@@ -220,7 +231,7 @@ The platform also carries the one constraint that is not a design choice: the la
 | S12, S13 | Identical `outbox` DDL in every producer; `processed_events` in every consumer | DDL in [RFC 0000 §3.1.3.2](0000-architecture.md#3132-shared-tables--outbox-and-processed_events) |
 | S14 | Per-service Alembic history, explicit step, working `downgrade` on every migration | §3.1.1.12 |
 
-**Decisions added by this RFC.** Each resolves a gap or a conflict between archive sources; the conflict is named in the decision.
+**Decisions added by this RFC.** Each resolves a gap or a conflict between archive sources; the conflict is named in the decision. The [decision register](#321-decision-register) gives each its reason, rejected alternatives and revisit condition.
 
 - **PLT-1 — Workers are hosts, not owners.** Activity and task code lives in the owning service's package (`services/<svc>/app/workflows/`, `services/<svc>/app/tasks.py`) and calls that service's service layer, exactly as a router does (B1, the layering seam of [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)). A worker process imports that code and binds each activity or task to **its owning service's settings object and database role only**. An effect on *another* service's state is never a direct write: it is a call to that service's internal API with a service token ([archive/0002 §3.1.2](archive/0002-core-business-logic-and-workflows.md#312-api-changes) — the `/internal/v1/inventory/reservations*` routes). This reconciles B1 ("an activity calls one service function") with R1 ("a service reads and writes only its own database"): the function is called in-process when the workflow's owner owns the state, and through the API when it does not. The cost — one worker process holding more than one service's credentials — is stated in §3.3 and bounded by a static binding test (§7).
 - **PLT-2 — One active relay loop per source database.** `SKIP LOCKED` (C2) prevents double-publishing across relay instances but does not preserve per-aggregate order across them: instance A can hold rows 1–100 while instance B publishes row 150 of the same aggregate first, breaking C3. Each relay instance therefore takes a session-level `pg_try_advisory_lock` per source database; the holder runs the claim loop, the others are hot standbys. `SKIP LOCKED` is retained as the safety net against double-publishing during a lock hand-over.
@@ -254,7 +265,7 @@ The platform also carries the one constraint that is not a design choice: the la
 
 **Responsibility.** Shared, non-domain code that every service imports so a cross-cutting convention has one implementation: JWT verification and the claim model, the role and scope dependencies, configuration, structured logging, the RFC 9457 error handler, pagination, the async DB session, the `Idempotency-Key` mechanism, the event envelope and Avro serialisation, the outbox writer, the consumer base with `processed_events` dedupe, the Kafka producer wrapper, tracing and metrics setup, the Temporal client factory, the Celery app factory, the Redis helpers (cache, rate limiter), the service-token client, health checks, and the `DomainEnum` / `DomainEnumText` pair. It is a package (`smartretail_common`) installed into every image's shared base layer ([archive/0000 §6.3](archive/0000-system-architecture.md#63-deployment-strategy)).
 
-**What it must not contain (R8).** Any business rule belonging to a single service — including any *vocabulary*. `DomainEnum` is the mechanism; the values (`draft`, `confirmed`, …) live in each service's `app/models/enums.py`. It answers "who is this", never "may they" ([RFC 0000 §3.1.1.4](0000-architecture.md#3114-authentication-and-authorisation-split)). It never imports from `services.*`. It holds no persistence model for any domain table: services share an *event* contract and an *API* contract, never a persistence model ([archive/0006 §5](archive/0006-service-decomposition-and-data-model.md#5-alternate-solutions), alternative 6).
+**What it must not contain (R8).** Any business rule belonging to a single service — including any *vocabulary*. `DomainEnum` is the mechanism; the values (`draft`, `confirmed`, …) live in each service's entity `enums.py` (`app/<entity>/enums.py`, or `app/core/enums.py` when several entities share one). It answers "who is this", never "may they" ([RFC 0000 §3.1.1.4](0000-architecture.md#3114-authentication-and-authorisation-split)). It never imports from `services.*`. It holds no persistence model for any domain table: services share an *event* contract and an *API* contract, never a persistence model ([archive/0006 §5](archive/0006-service-decomposition-and-data-model.md#5-alternate-solutions), alternative 6).
 
 **Module layout.**
 
@@ -430,26 +441,25 @@ class EventConsumer(ABC):
 
 Processing one message:
 
+```mermaid
+flowchart TD
+    poll["poll"] --> deser{"deserialise<br/>(Avro, Schema Registry)"}
+    deser -- "fails: poison" --> dlqNow["produce to topic.dlq immediately"] --> commitA["commit offset"]
+    deser -- "ok" --> span["extract traceparent (Kafka header, else envelope field)<br/>start CONSUMER span as its child"]
+    span --> begin["BEGIN"]
+    begin --> claim{"INSERT INTO processed_events<br/>(consumer_group, event_id, event_type, processed_at)<br/>ON CONFLICT DO NOTHING"}
+    claim -- "conflict: already processed" --> dup["ROLLBACK<br/>count outcome=duplicate"] --> commitB["commit offset, done"]
+    claim -- "inserted" --> handle{"handle(event, tx)<br/>the effect, same transaction"}
+    handle -- "ok" --> commit["COMMIT"] --> after["after_commit(event)<br/>side effects that must follow durability"] --> commitC["commit offset<br/>(manual, enable.auto.commit=false)"]
+    handle -- "raises DependencyUnavailable" --> pause["ROLLBACK · pause the partition<br/>back off 0.5 s … 8 s · no attempt counted (PLT-5)"]
+    pause -- "resume and retry" --> begin
+    handle -- "raises anything else" --> rb["ROLLBACK · attempts += 1"]
+    rb --> more{"attempts below CONSUMER_MAX_ATTEMPTS (3)?"}
+    more -- "yes: exponential backoff" --> begin
+    more -- "no" --> dlq["produce to topic.dlq<br/>original key, value, headers + dlq.* headers"] --> commitD["commit offset, move on (C6)"]
 ```
-poll → deserialise (Avro, Schema Registry)             ── failure: poison → DLQ immediately, commit offset
-     → extract traceparent (Kafka header, else envelope field) → start CONSUMER span as its child
-     → BEGIN
-         INSERT INTO processed_events (consumer_group, event_id, event_type, processed_at)
-           VALUES (:group, :event_id, :type, now()) ON CONFLICT DO NOTHING
-         conflict → ROLLBACK, count outcome=duplicate, commit offset, done
-         handle(event, tx)                               # the effect, same transaction
-       COMMIT
-     → after_commit(event)                               # side effects that must follow durability
-     → commit offset (manual; enable.auto.commit=false)
 
-handle raises:
-  DependencyUnavailable → ROLLBACK; pause the partition; back off (0.5 s … 8 s); resume and retry;
-                          no attempt counted, never dead-lettered (PLT-5)
-  any other exception   → ROLLBACK; retry in-process up to CONSUMER_MAX_ATTEMPTS (3) with exponential backoff;
-                          then produce to <topic>.dlq with the original key, value and headers plus
-                          dlq.error.class, dlq.error.message, dlq.attempts, dlq.consumer_group, dlq.failed_at;
-                          commit the offset and move on (C6)
-```
+A dead-lettered message keeps its original key, value and headers and gains `dlq.error.class`, `dlq.error.message`, `dlq.attempts`, `dlq.consumer_group` and `dlq.failed_at`. A `DependencyUnavailable` pause is never dead-lettered.
 
 The dedupe row and the effect are one transaction, which is why C4 and the dedupe table are a single design rather than two ([archive/0003 §3.1.1](archive/0003-events-and-observability.md#311-architectural-changes)). `after_commit` runs only after the transaction is durable, so a Redis fan-out or a Celery enqueue never announces an effect that rolled back; a crash between commit and `after_commit` loses only that side effect, which is why the side effects enqueued there must be re-derivable (the notification row is durable, [0007](0007-notification-service.md)). One consumer process per service subscribes to several topics, with dedupe keyed by consumer group (`0003-Q2`). Consumers retry broker connection with backoff rather than crash-looping ([archive/0003 §6.3](archive/0003-events-and-observability.md#63-deployment-strategy)).
 
@@ -467,16 +477,16 @@ The dedupe row and the effect are one transaction, which is why C4 and the dedup
 | `render_item` hook | A helper each service's `alembic/env.py` passes to `context.configure(render_item=…, compare_type=True)`, so autogenerate renders `DomainEnumText` as `sa.Text()` rather than a constructor call missing its `enum_class` |
 | `widen_for_response(enum_class)` | A Pydantic `BeforeValidator` that widens a response field to `Enum \| str` for `passthrough` columns, so a tolerant ORM read is not cancelled by a strict response schema. Request schemas stay strict |
 
-**The R8 "no business rules" guard.** Two unit tests in `common/tests/`, run in every service's CI job:
+**The R8 "no business rules" guard.** Two unit tests in `common/tests/`, run in the `common` leg of the CI test matrix on every push (§3.1.1.13):
 
-1. **Vocabulary scan.** Discover every `DomainEnum` subclass in `services/*/app/models/enums.py`, collect the union of their values, and walk the AST of every module under `smartretail_common` for string constants in that set. Any hit fails. An allow-list is supported but empty; adding to it is a review decision. This is the grep [archive/0006 §7](archive/0006-service-decomposition-and-data-model.md#7-test-plan) requires, made robust to formatting.
+1. **Vocabulary scan.** Discover every `DomainEnum` subclass in `services/*/app/**/enums.py` (each entity's `enums.py` and `app/core/enums.py`), collect the union of their values, and walk the AST of every module under `smartretail_common` for string constants in that set. Any hit fails. An allow-list is supported but empty; adding to it is a review decision. This is the grep [archive/0006 §7](archive/0006-service-decomposition-and-data-model.md#7-test-plan) requires, made robust to formatting.
 2. **Import direction.** No module under `smartretail_common` imports `services.*` or any service package.
 
 The remaining half of R8 — "does this helper encode a rule?" — is a review question at every design review, because no test can answer it.
 
 **Configuration** (component). None beyond the table above.
 
-**Failure behaviour.** A `common` defect is a platform-wide defect; the mitigation is that every service's CI runs the library's own tests, and that the library is versioned with the repository rather than published, so a change and its consumers are reviewed in one diff. Every helper that touches an optional dependency (Redis, the collector) fails open: a cache miss, an allowed request, a dropped span — never a failed request.
+**Failure behaviour.** A `common` defect is a platform-wide defect; the mitigation is that every CI run tests the library and every service against the current `common` in the same commit (§3.1.1.13), and that the library is versioned with the repository rather than published, so a change and its consumers are reviewed in one diff. Every helper that touches an optional dependency (Redis, the collector) fails open: a cache miss, an allowed request, a dropped span — never a failed request.
 
 **Change propagation and rollout (PLT-27).** The library is never deployed on its own. Each service's Dockerfile copies `common` into its build and runs a regular (non-editable) `pip install`, so every image holds a **snapshot of the library taken at build time**. Editing `common` changes nothing in a running container; a service sees the change only when its image is rebuilt and its container recreated. The package version stays `0.1.0` and services depend on it unpinned (`smartretail-common`), because the repository *is* the version.
 
@@ -534,6 +544,40 @@ COMMIT;
 ```
 
 The query is served by the partial index on `outbox (id) WHERE published_at IS NULL` defined with the table in [RFC 0000 §3.1.3.2](0000-architecture.md#3132-shared-tables--outbox-and-processed_events) — "the relay's only query". Because published rows leave the index, its size is the backlog, not the table, and the scan stays cheap however large the table grows between sweeps.
+
+One cycle for one source database, end to end:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as outbox-relay
+    participant DB as Producer DB (outbox)
+    participant SR as Schema Registry
+    participant K as Kafka
+    participant C as Consumer (EventConsumer)
+    R->>DB: pg_try_advisory_lock (PLT-2)
+    DB-->>R: acquired (otherwise stay hot standby)
+    loop every OUTBOX_POLL_INTERVAL_MS (500 ms), at once if the batch was full
+        R->>DB: BEGIN · SELECT … WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED
+        DB-->>R: batch of rows
+        loop each row in id order, skipping held aggregates (PLT-4)
+            R->>R: build envelope from registry (PLT-26)
+            R->>SR: resolve schema id (cached)
+            SR-->>R: schema id
+            R->>K: produce(topic, key=aggregate_id, Avro value, traceparent header)
+        end
+        R->>K: flush
+        K-->>R: delivery reports (acks=all)
+        alt delivery reports received
+            R->>DB: UPDATE outbox SET published_at = now() WHERE id = ANY(acked_ids) · COMMIT
+            Note over R,DB: unacknowledged rows stay unpublished and go first next cycle
+        else broker or registry error
+            R->>DB: ROLLBACK (rows unlocked, retried with backoff 0.5 s to 30 s)
+        end
+    end
+    K-->>C: event (possibly a duplicate after a relay crash)
+    C->>C: dedupe on (consumer_group, event_id) (C4)
+```
 
 **Ordering (C3).** The Kafka key is `aggregate_id`, so every event of one aggregate lands on one partition. Within a batch rows are produced in `id` order by an idempotent producer (`enable.idempotence=true`, `acks=all`, `max.in.flight.requests.per.connection=5`), which Kafka guarantees not to reorder even across internal retries. Across relay instances, order is preserved by PLT-2. Global ordering is neither required nor achievable at any useful throughput (C3).
 
@@ -832,12 +876,14 @@ Task names are fully qualified in code (`smartretail.<owner>.<task>`); the routi
 
 **Pipeline.**
 
-```
- service / worker ──OTLP gRPC :4317──▶ otel-collector ──OTLP──▶ jaeger (all-in-one, in-memory)
-        │                                   │
-        │                                   └─ /metrics :8888 (collector self-metrics)
-        │
-        └──/metrics (OTel SDK Prometheus reader)◀──scrape 15 s── prometheus ──▶ grafana
+```mermaid
+flowchart LR
+    app["service / worker"] -- "OTLP gRPC :4317" --> otel["otel-collector"]
+    otel -- "OTLP" --> jaeger["jaeger<br/>(all-in-one, in-memory)"]
+    otel --- selfm["/metrics :8888<br/>(collector self-metrics)"]
+    prom["prometheus"] -- "scrape every 15 s" --> appm["/metrics<br/>(OTel SDK Prometheus reader)"]
+    app --- appm
+    prom --> grafana["grafana"]
 ```
 
 **OTel Collector** (`otel/opentelemetry-collector-contrib` 0.112.x, config in `ops/otel-collector/config.yaml`):
@@ -987,6 +1033,12 @@ SmartRetail/
 ├── README.md                    # overview, architecture, setup, API tour, role matrix,
 │                                # the diagnosis walkthroughs, AI section and cost model
 ├── pyproject.toml               # workspace; ruff, mypy, pytest config
+├── .pre-commit-config.yaml      # hooks, installed by `make hooks` (§3.1.1.13)
+├── .editorconfig
+├── CONTRIBUTING.md
+├── .github/
+│   ├── workflows/ci.yml         # lint · typecheck · test matrix · audit (§3.1.1.13)
+│   └── pull_request_template.md # What / Why / Decision IDs / How tested
 ├── docs/                        # specification documents and RFCs
 ├── common/                      # smartretail_common (§3.1.1.1) + its tests
 ├── services/
@@ -1027,6 +1079,66 @@ Inside each service the layering is the one fixed in [RFC 0000 §3.1.1.7](0000-a
 
 Startup ordering is health-gated `depends_on: condition: service_healthy` — Postgres before every service, Kafka and the registry before the relay and consumers, Temporal before the worker ([archive/0003 §6.3](archive/0003-events-and-observability.md#63-deployment-strategy)). Services in a later profile that another profile's container calls are reached by DNS and degrade when absent (for example `order` without `events` still writes outbox rows).
 
+**Deployment topology.** One Compose project on one host, one internal network, grouped by profile. Only the gateway and the UIs are published, and only on `127.0.0.1` (PLT-21).
+
+```mermaid
+flowchart TB
+    dev["developer browser / API client<br/>(127.0.0.1)"]
+    subgraph host["Docker host — one Compose network"]
+        subgraph core["profile: core"]
+            postgres[("postgres :5432<br/>pgvector/pgvector:pg16")]
+            gateway["gateway :8000"]
+            identity["identity :8001"]
+            catalog["catalog :8002"]
+        end
+        subgraph workflow["profile: workflow"]
+            temporal["temporal :7233"]
+            tui["temporal-ui :8080"]
+            minio[("minio :9000 / console :9001")]
+            minioinit["minio-init (one-shot)"]
+            tworker["temporal-worker :8090"]
+            order["order :8003"]
+            inventory["inventory :8004"]
+        end
+        subgraph events["profile: events"]
+            kafka["kafka :9092"]
+            sr["schema-registry :8081"]
+            rabbit["rabbitmq :5672 / mgmt :15672"]
+            redis[("redis :6379")]
+            mongo[("mongo :27017")]
+            relay["outbox-relay :8090"]
+            notification["notification :8005"]
+            analytics["analytics :8006"]
+            cworker["celery-worker + Beat :8090"]
+        end
+        subgraph obs["profile: observability (off by default)"]
+            otel["otel-collector :4317/4318"]
+            jaeger["jaeger :16686"]
+            prom["prometheus :9090"]
+            grafana["grafana :3000"]
+        end
+        subgraph ai["profile: ai"]
+            assistant["assistant :8007"]
+            indexer["indexer-worker :8090"]
+            cworkerai["celery-worker-ai :8090"]
+        end
+    end
+    dev -- "host-bound" --> gateway
+    dev -.->|UIs, host-bound| tui & minio & rabbit & jaeger & prom & grafana
+    gateway --> identity & catalog & order & inventory & notification & analytics & assistant
+    identity & catalog & order & inventory & notification & assistant --> postgres
+    temporal --> postgres
+    analytics --> mongo
+    relay --> postgres
+    relay --> kafka
+    kafka --- sr
+    tworker <--> temporal
+    cworker <--> rabbit
+    cworkerai <--> rabbit
+    indexer --> kafka
+    minioinit --> minio
+```
+
 **Port map (PLT-21).** Host-bound: `gateway` 8000, `temporal-ui` 8080, MinIO console 9001, RabbitMQ management 15672, Jaeger 16686, Prometheus 9090, Grafana 3000 — all bound to `127.0.0.1`. Internal only: services 8001–8007, Postgres 5432, Kafka 9092, Schema Registry 8081, Temporal 7233, MinIO 9000, RabbitMQ 5672, Redis 6379, MongoDB 27017, collector 4317/4318, worker ops port 8090. Broker ports are never published ([archive/0003 §6.2](archive/0003-events-and-observability.md#62-security-considerations)).
 
 **Container count** — worth stating, because the laptop is a real constraint ([archive/0000 §3.1.5](archive/0000-system-architecture.md#315-action-plan)):
@@ -1059,6 +1171,9 @@ Expect roughly 8 GB for the full stack; running everything plus an IDE on 16 GB 
 | `make topics` | Create topics and DLQs, set configs, register every schema; idempotent |
 | `make seed` | Load demo data idempotently (below) |
 | `make test` | Unit, integration and e2e suites |
+| `make cov` | Every package's tests with branch coverage; HTML report in each package's `htmlcov/`; fails below 85% (§3.1.1.13) |
+| `make audit` | `pip-audit` over the installed environment (§3.1.1.13) |
+| `make hooks` | Install the pre-commit hooks (§3.1.1.13) |
 | `make lint` / `make fmt` | ruff (lint and format) and mypy |
 | `make reindex` | Full, resumable backfill of the retrieval index ([0009](0009-assistant-service.md)) |
 | `make evaluate` | Retrieval evaluation ([0009](0009-assistant-service.md)) |
@@ -1107,6 +1222,91 @@ Worker images use the same stages with a different `CMD`. Images carry no secret
 
 **Observability.** `make logs` and `docker compose ps` for liveness; the platform overview dashboard for everything else.
 
+##### 3.1.1.13. Engineering practice: tests, coverage, hooks and CI
+
+**Responsibility.** The checks every change goes through, on a laptop before commit and on GitHub after push. None of this is required by [Part A](../part-a.md) or [Part B](../part-b.md). It is adopted because a production codebase would have it ([mentor review §5](../reviews/2026-10-06-mentor-review.md#5-standard-engineering-practice)). The decisions are PLT-D27 to PLT-D32 in the [register](#321-decision-register).
+
+**Packages.** The unit of testing, coverage and type-checking is the package: `common` (the shared library, at the repository root as `common/`, imported as `smartretail_common` — PLT-D26), `services/identity`, `services/catalog` and `services/gateway`. A service joins this list, in the Makefile's `PACKAGES` and the CI matrix, when its package is created.
+
+**Unit tests and the coverage gate.** Tests run with `pytest` and `pytest-cov`, branch coverage on. Each package's `pyproject.toml` carries its own `[tool.coverage]` section:
+
+```toml
+[tool.coverage.run]
+branch = true
+source = ["app", "main"]    # ["smartretail_common"] in common/
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.coverage.html]
+directory = "htmlcov"
+```
+
+The threshold is per package, not a repository average, so a well-tested package cannot hide an untested one. Below 85% the run fails, locally and in CI. `make cov` runs every package's tests with coverage and writes an HTML report to `htmlcov/` inside each package (gitignored); `make test` stays the fast path without coverage. Integration tests run against the throwaway Postgres from `make test-db` locally and a Postgres service container in CI.
+
+**Dependency audit.** `make audit` runs `pip-audit` over the installed development environment (every package and its dependencies). A known vulnerability fails the target and the CI job.
+
+**pre-commit hooks.** `.pre-commit-config.yaml` at the repository root, installed into `.git/hooks` with `make hooks`:
+
+| Hook | Does |
+| --- | --- |
+| `ruff` (with `--fix`) | Lint, auto-fixing what is safe to fix |
+| `ruff-format` | Format |
+| `mypy` | Type-check |
+| `trailing-whitespace`, `end-of-file-fixer` | Whitespace and final newline |
+| `check-yaml`, `check-toml` | Config files parse |
+| `check-merge-conflict` | No leftover conflict markers |
+| `detect-private-key` | No private key is committed (the RS256 pair from `make keys` lives in the gitignored `keys/`, PLT-25) |
+
+**CI.** GitHub Actions, `.github/workflows/ci.yml`, triggered on `push` and `pull_request`, Python 3.12. Four jobs:
+
+| Job | Steps |
+| --- | --- |
+| `lint` | `ruff check` and `ruff format --check` over the repository |
+| `typecheck` | `mypy` per package, with the shared configuration in the root `pyproject.toml` |
+| `test` | Matrix over `common`, `services/identity`, `services/catalog`, `services/gateway`. Each matrix leg starts a Postgres service container (`pgvector/pgvector:pg16`, the image Compose uses) and runs `pytest` with coverage; the leg fails below the 85% branch-coverage gate |
+| `audit` | `pip-audit` |
+
+```mermaid
+flowchart LR
+    trigger(["push / pull_request"]) --> lint & typecheck & test & audit
+    subgraph lint["job: lint"]
+        l1["ruff check"] --> l2["ruff format --check"]
+    end
+    subgraph typecheck["job: typecheck"]
+        m1["mypy per package"]
+    end
+    subgraph test["job: test (matrix per package)"]
+        direction TB
+        pg[("Postgres service container<br/>pgvector/pgvector:pg16")]
+        m["common · services/identity ·<br/>services/catalog · services/gateway"] --> py["pytest --cov (branch)"]
+        pg -.-> py
+        py --> gate{"coverage ≥ 85%?"}
+    end
+    subgraph audit["job: audit"]
+        a1["pip-audit"]
+    end
+    gate -- "no" --> red["build fails"]
+    gate -- "yes" --> green["leg passes"]
+    l2 & m1 & a1 --> result["required checks"]
+    green --> result
+```
+
+The jobs are independent and run in parallel, so one failure does not hide another. Each is a required check on the pull request. CI covers the packages that exist today; the Kafka, Schema Registry and Redis service containers and the schema-compatibility step of §3.1.2.3 join the `test` job when the packages that need them do (§6.3).
+
+**Repository hygiene.**
+
+| File | Purpose |
+| --- | --- |
+| `.github/pull_request_template.md` | Sections **What**, **Why**, **Decision IDs added or changed**, **How tested**. Asks for the reason behind a change, and for the register rows it touches, at the point of change |
+| `CONTRIBUTING.md` | How to set up (`make dev-install`, `make hooks`), which checks to run before a pull request (`make lint`, `make cov`, `make audit`), and that a design change updates its RFC's decision register |
+| `.editorconfig` | Editor settings (encoding, line endings, final newline, indentation) that match what the hooks enforce, so an editor does not fight the formatter |
+
+**Failure behaviour.** A failing hook blocks the commit locally (it can be bypassed with `--no-verify`, which CI then catches). A failing CI job blocks the merge. The coverage gate and `pip-audit` fail closed: there is no warning-only mode.
+
 #### 3.1.2. API changes
 
 The platform exposes no public business endpoint. Its interfaces are internal: the library API services import, the event envelope on the wire, the schema registration flow, the operational endpoints every component serves, and the names workers and services agree on.
@@ -1137,7 +1337,7 @@ What a service may import. Anything not listed is private to the package and may
 | `redis` | `get_redis(settings)`, `Cache`, `RateLimiter`, `PubSub` | `gateway`, `catalog`, `inventory`, `notification`, `assistant`, `order` |
 | `health` | `health_router(checks=…)`, `DatabaseCheck`, `KafkaCheck`, `RedisCheck`, `TemporalCheck`, `ConsumerLagReport` | Every component |
 
-Versioning: the package is versioned with the repository. A breaking change to a public symbol changes every caller in the same diff, and every service's CI runs on it.
+Versioning: the package is versioned with the repository. A breaking change to a public symbol changes every caller in the same diff, and every package's CI test leg runs on it.
 
 ##### 3.1.2.2. The event envelope on the wire
 
@@ -1150,7 +1350,7 @@ The envelope's fields and meaning are defined once in [RFC 0000 §3.1.2.4](0000-
 | Value | Confluent Avro: magic byte, schema id, then one Avro record containing the envelope fields and a typed `payload` record |
 | Headers | `traceparent` (and `tracestate` if present), `event_id`, `event_type`, `producer` — duplicated from the envelope so a tool can filter without deserialising |
 
-Each topic's schema is the shared envelope fields from `common/events/schemas/envelope.avsc`, expanded by the registration script, plus that topic's payload record:
+Each topic's schema is the shared envelope fields from `common/smartretail_common/events/schemas/envelope.avsc`, expanded by the registration script, plus that topic's payload record:
 
 ```json
 {
@@ -1175,26 +1375,24 @@ Each topic's schema is the shared envelope fields from `common/events/schemas/en
 
 ##### 3.1.2.3. Avro schema registration flow
 
-```
- developer edits common/events/schemas/<topic>.avsc
-        │
-        ▼
- CI: scripts/topics.py --check
-        │  1. expand envelope fields into each topic schema
-        │  2. parse every schema (fastavro) — syntax and logical types
-        │  3. POST /compatibility/subjects/<topic>-value/versions/latest
-        │       against a registry started by the test job, pre-loaded with the last released schemas
-        │  4. round-trip: a fixture record per topic serialises and deserialises
-        │  5. old-reader/new-writer and new-reader/old-writer tests for every changed schema
-        │  → any incompatible change fails the build, with the registry's message
-        ▼
- make topics (local) / deploy step
-        │  1. create topics and <topic>.dlq with the configs in §3.1.3.3 (idempotent: describe, create if absent, alter configs)
-        │  2. PUT /config  {"compatibility": "BACKWARD"}   (global)
-        │  3. POST /subjects/<topic>-value/versions   for each schema (no-op if identical)
-        │  4. record the returned ids in the log
-        ▼
- producers and consumers resolve schemas by id at run time (cached by the serde)
+```mermaid
+flowchart TD
+    edit["developer edits common/smartretail_common/events/schemas/{topic}.avsc"] --> ci
+    subgraph ci["CI: scripts/topics.py --check"]
+        c1["1. expand envelope fields into each topic schema"] --> c2["2. parse every schema (fastavro):<br/>syntax and logical types"]
+        c2 --> c3["3. POST /compatibility/subjects/{topic}-value/versions/latest<br/>against a registry started by the test job,<br/>pre-loaded with the last released schemas"]
+        c3 --> c4["4. round-trip: a fixture record per topic<br/>serialises and deserialises"]
+        c4 --> c5["5. old-reader/new-writer and new-reader/old-writer<br/>tests for every changed schema"]
+    end
+    c5 --> ok{"compatible?"}
+    ok -- "no" --> fail["build fails with the registry's message"]
+    ok -- "yes" --> topics
+    subgraph topics["make topics (local) / deploy step"]
+        t1["1. create topics and {topic}.dlq with the §3.1.3.3 configs<br/>(idempotent: describe, create if absent, alter configs)"] --> t2["2. PUT /config compatibility BACKWARD (global)"]
+        t2 --> t3["3. POST /subjects/{topic}-value/versions for each schema<br/>(no-op if identical)"]
+        t3 --> t4["4. record the returned ids in the log"]
+    end
+    t4 --> run["producers and consumers resolve schemas by id at run time<br/>(cached by the serde)"]
 ```
 
 Subject naming is `TopicNameStrategy` (`<topic>-value`); keys are plain strings and have no registered schema. Producers never auto-register (`auto.register.schemas=false`): a schema that was not registered by the flow above cannot be produced, so every event on the wire went through the compatibility check. The registry is the enforcement point; CI is where the failure is reported.
@@ -1357,7 +1555,7 @@ Ordered so that each platform piece exists before the first service that needs i
 
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
-| P1 | Repository skeleton, tooling, `.env.example`, Makefile, ruff + mypy config, pytest config | `make lint` and `make test` run against an empty suite | — |
+| P1 | Repository skeleton, tooling, `.env.example`, Makefile, ruff + mypy config, pytest and coverage config, pre-commit, CI workflow, PR template (§3.1.1.13) | `make lint`, `make test`, `make cov` and `make audit` run; CI green on an empty suite | — |
 | P2 | `common` core: settings base, async DB session, JSON logging with request-ID contextvar, problem-detail errors, pagination, `DomainEnum` and `DomainEnumText` with the `render_item` hook | Importable package, unit-tested. The S4 pair has tests for strict write, tolerant read, and the R8 vocabulary scan | P1 |
 | P3 | Compose `core`: Postgres 16 (pgvector image) with the database-per-service init script, roles, grants, healthchecks, named volume; `make keys` | `docker compose up postgres` healthy; databases and roles exist; a role cannot connect to another's database | P1 |
 | P4 | `common` auth: RS256 verification with mounted key and JWKS refresh, `Principal`, `require_roles`, `optional_principal` | Unit tests for verify, expiry, tamper, wrong key, claim contents, dependency allow/deny/missing/malformed | P2 |
@@ -1366,7 +1564,7 @@ Ordered so that each platform piece exists before the first service that needs i
 | P7 | `common`: outbox model and writer, idempotency mechanism, service-token client and `require_scope`, Temporal client factory, default activity options | Unit-tested, importable | P2, P6 |
 | P8 | Worker binding test and PLT-1 wiring in `temporal-worker` | A worker can import each service's activities with that service's settings only | P7 |
 | P9 | Kafka (KRaft) + Schema Registry under `events`; `make topics` | Broker healthy; topics and DLQs exist; console produce/consume works | P5 |
-| P10 | Avro schemas for every topic in `common/events/schemas/`, the envelope template (with `client_id` and `traceparent`), registration script and CI compatibility check | Registry holds every schema; compatibility `BACKWARD`; a v1 consumer reads a v2 record and vice versa | P9 |
+| P10 | Avro schemas for every topic in `common/smartretail_common/events/schemas/`, the envelope template (with `client_id` and `traceparent`), registration script and CI compatibility check | Registry holds every schema; compatibility `BACKWARD`; a v1 consumer reads a v2 record and vice versa | P9 |
 | P11 | `common` events: envelope, request context with `client_id`, Avro serde, producer wrapper, consumer base with dedupe, retry, pause and DLQ | Unit-tested | P10 |
 | P12 | `outbox-relay`: advisory lock, poll, `SKIP LOCKED` claim, produce, mark published, poison hold, metrics — **one topic end to end** | Crash-restart test shows no loss (G1) | P11 |
 | P13 | Relay widened to all five producer databases; `outbox_relay` grants in each producer's migration | Every outbox row reaches its topic | P12 |
@@ -1408,6 +1606,47 @@ Ordered so that each platform piece exists before the first service that needs i
 | Review of the Part B platform additions | M7 |
 
 ### 3.2. Rationale
+
+The register below lists every significant decision this RFC makes or implements, one row each. The prose after it gives the longer argument for the main ones.
+
+#### 3.2.1. Decision register
+
+The `PLT-1` … `PLT-27` decisions in [§3.1.1](#311-architectural-changes) and the archive decisions (A*, B*, C*, R*, S*) keep their IDs. A register row that records one of them says so (`= PLT-2`) and does not renumber it. Rows without such a reference (PLT-D26 to PLT-D32) are decisions first made here.
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| PLT-D1 | Events go through a transactional outbox, published by a separate polling `outbox-relay` (= A10, B11, C1) | Publishing from the handler can lose an event on a crash between commit and produce. The outbox makes state and event one transaction, so the relay's failure mode is a duplicate ([§3.2](#32-rationale)) | Publish from the handler (loses events). Debezium CDC (Kafka Connect, connector, logical replication and a transform, heavier than a ~150-line relay; [§5](#5-alternate-solutions) Alt. 2) | Publish latency of one poll interval (500 ms) starts to matter (`0003-Q1`) |
+| PLT-D2 | One active relay loop per source database, held by `pg_try_advisory_lock`; `SKIP LOCKED` kept as the safety net (= PLT-2) | `SKIP LOCKED` alone stops double publishing but lets two instances interleave one aggregate's events, breaking per-aggregate order (C3) ([§3.2](#32-rationale)) | `SKIP LOCKED` alone (reorders aggregates). Global ordering (not needed, not achievable at useful throughput) | Relay throughput per database becomes a real bottleneck |
+| PLT-D3 | The relay has its own `outbox_relay` role, granted on `outbox` only (= PLT-3) | Lets the relay be one process for all databases (C1) without holding any service's credentials. The one bounded exception to R1 | Relay uses each service's role (gives it every service's data). A relay thread inside each service (rejected by C1) | A service needs to publish without the shared relay |
+| PLT-D4 | A poison outbox row holds its own aggregate, in memory, and is retried every 60 s (= PLT-4) | Skipping the row would reorder its aggregate; blocking the table would stall every aggregate ([§3.1.1.2](#3112-outbox-relay)) | Skip and log (breaks C3). Block the whole table (breaks C2) | Poison rows become frequent, or the hold must survive restarts (Q-PLT-2) |
+| PLT-D5 | At-least-once delivery with idempotent consumers; `(consumer_group, event_id)` recorded in the effect's transaction (= C4, A11) | Kafka's exactly-once stops at Kafka, so consumer idempotency is needed anyway ([§3.2](#32-rationale)) | Kafka transactions (coordination cost for a guarantee that does not reach Postgres or email; [§5](#5-alternate-solutions) Alt. 3) | — |
+| PLT-D6 | A poison event is retried 3 times then dead-lettered; a `DependencyUnavailable` pauses the partition instead (= C6, PLT-5) | One bad event must not stop a partition, but an outage is not a bad event: dead-lettering every event in it would mean replaying a whole topic ([§3.2](#32-rationale)) | Dead-letter everything after 3 attempts (outage floods the DLQ). Retry forever (one poison event stalls the partition) | — |
+| PLT-D7 | Avro with Schema Registry, `BACKWARD` compatibility, producers never auto-register (= C5) | An incompatible change fails at registration in CI instead of crashing a consumer. Part A names the registry ([§3.2](#32-rationale)) | JSON (no compatibility check). JSON Schema (Avro is what "Schema Registry" implies and has real evolution rules) | — |
+| PLT-D8 | 3 partitions per topic on one broker; one DLQ per topic, 30-day retention; replay by `make dlq-replay`, never automatic (= PLT-22, `0003-Q8`, `0003-Q9`) | Several partitions make per-key ordering and multi-partition consumption real and tested. Automatic replay of a poison message is an infinite loop ([§3.1.1.6](#3116-kafka--schema-registry)) | 1 partition (hides ordering bugs). Automatic replay loop. A replay API (a footgun with no operator) | A second broker is added (replication factor becomes a variable) |
+| PLT-D9 | Workers host service code; each activity and task binds only its owner's settings and role; cross-service effects go through internal APIs (= PLT-1) | Keeps one implementation per business rule (B1) and R1's grant test, without an internal endpoint per task ([§3.2](#32-rationale)) | Credential-free workers calling every owner over HTTP (doubles service surface, a network hop in every sweep; [§5](#5-alternate-solutions) Alt. 13) | Q-PLT-1 is decided for per-service workers |
+| PLT-D10 | Temporal for multi-step processes, Kafka for facts, Celery for one-shot jobs; media processing moves to Celery (= A12, C7) | Each has a distinct operational job: retained broadcast, per-task retry, durable compensation ([§3.2](#32-rationale)) | RabbitMQ or Celery for everything (no retention, no fan-out). Kafka for everything (no workflow state). Celery chains instead of Temporal ([§5](#5-alternate-solutions) Alt. 1, 4–6) | — |
+| PLT-D11 | Bulk generation runs on a separate `celery-worker-ai` consuming only the `assistant` queue (= PLT-12) | Keeps the LLM API key, the only real credential, out of the shared worker, and stops a bulk job starving other queues | One shared worker with an `assistant` queue (spreads the key to every Part A task) | — |
+| PLT-D12 | Beat is a singleton, embedded in the one `celery-worker` replica (= PLT-13) | Two Beats would fire every schedule twice; one embedded Beat saves a container locally | A separate Beat container from day one (one more container for no gain at one replica) | `celery-worker` is scaled past one replica (Beat moves out first) |
+| PLT-D13 | One Temporal namespace, `smartretail`, with two task queues, `catalog-publishing` and `order-lifecycle`, in one worker process (= PLT-14) | Separate queues stop an order burst starving publishing, and either can move to its own container by configuration ([§3.1.1.3](#3113-temporal-worker)) | One queue (bursts starve each other). A namespace per service (no isolation need locally) | — |
+| PLT-D14 | Trace context and actor are stored on the outbox row and carried across Kafka, Temporal and Celery (= PLT-6, C11) | The relay publishes after the request span has closed; without a stored `traceparent` a trace stops at the producer, where the diagnosis Part A §6 asks for begins ([§3.2](#32-rationale)) | Start a new trace at the relay (traces join by ID only, losing parentage; the interim fallback) | RFC 0000 rejects the amendment (Q-PLT-3) |
+| PLT-D15 | Traces are pushed over OTLP to one collector; metrics are pulled from `/metrics` (= C10, PLT-7) | Pull gives `up` as free liveness and keeps metrics when the collector is off; the collector keeps backends out of service code ([§3.2](#32-rationale)) | Push metrics through the collector (a missing collector loses metrics). Single-vendor APM ([§5](#5-alternate-solutions) Alt. 9) | A backend needs pushed metrics (collector config only) |
+| PLT-D16 | One metric vocabulary; unbounded identifiers are never labels, links to requests are exemplars (= PLT-8) | High-cardinality labels break Prometheus; one naming scheme makes dashboards templatable ([§3.1.1.11](#31111-observability-stack)) | Per-service naming (no shared dashboards) | — |
+| PLT-D17 | JWT verifiers load a mounted public key at start-up and refresh from JWKS by `kid` (= PLT-9) | Services start and serve authenticated traffic with `identity` down (R7), and key rotation needs no redeploy | JWKS only (cannot start without `identity`). Mounted key only (rotation needs a redeploy) | Production key management is designed (`0001-Q4`) |
+| PLT-D18 | Redis is never the source of truth; every Redis helper fails open (= C13, PLT-19) | Every use is disposable or backed by a durable record, so a Redis outage is a latency event, never a data event ([§3.1.1.8](#3118-redis)) | Redis as the idempotency claim (a lost key could create a second order). Redis Streams as the event log ([§5](#5-alternate-solutions) Alt. 7) | — |
+| PLT-D19 | Rate limits are fixed-window counters whose TTL equals the rule's window (= PLT-10) | Per-minute and per-hour rules share one mechanism; a 60 s TTL would break the 20-per-hour generation rule | One fixed 60 s TTL (archive/0003; breaks hourly rules). Sliding window (more Redis work for no stated need) | Burst at window edges becomes a problem |
+| PLT-D20 | `processed_events` kept 30 days, published outbox rows 7 days, both swept by Beat (= PLT-17, PLT-18) | Dedupe must outlive the longest time-based topic retention (7 days) with margin; outbox retention matches Kafka's | Keep forever (unbounded growth). Shorter dedupe (a replay could re-apply). Compacted topics are covered by state-idempotent handlers ([§3.1.3.3](#3133-kafka-topic-configuration)) | Topic retention changes (Q-PLT-4) |
+| PLT-D21 | One PostgreSQL instance with one database and one role per service (= A2) | Separate databases and roles make cross-service SQL impossible, which is the property wanted; more containers buy nothing on a laptop ([§3.2](#32-rationale)) | One container per service database ([§5](#5-alternate-solutions) Alt. 15) | A service needs its own instance (a connection-string change) |
+| PLT-D22 | Migrations are an explicit `make migrate` step, per-service Alembic history, never on start-up (= S14) | Auto-migration races N replicas on one database and hides schema changes in a deploy ([§3.2](#32-rationale)) | Migrate on container start | — |
+| PLT-D23 | Compose profiles (`core`, `workflow`, `events`, `observability`, `ai`); observability off by default; `make up-all` starts every profile; a fixed port map with only the gateway and UIs on `127.0.0.1` (= C14, PLT-20, PLT-21) | The full stack is ~8 GB; profiles keep iteration light. Broker ports are never published ([§3.1.1.12](#31112-local-environment--compose-makefile-dockerfiles)) | Everything always on (a tax on every test run). Managed cloud services ([§5](#5-alternate-solutions) Alt. 12) | — |
+| PLT-D24 | `common` holds mechanisms only, never a business rule or vocabulary, enforced by a vocabulary scan and an import-direction test (= R8, S4, PLT-26) | Conventions are implemented once (G9) without `common` turning into a hidden monolith ([§3.3](#33-tradeoffs)) | Per-service copies of auth, errors, pagination (drift). Shared persistence models (couples services by schema) | — |
+| PLT-D25 | `common` reaches a service only by rebuilding its image; all consumers are rebuilt together with `make up`; contract-bearing modules change expand/contract (= PLT-27) | The repository is the version, so one diff reviews a change and its consumers; rebuilds are not atomic, so cross-service contracts must tolerate skew ([§3.1.1.1](#3111-common)) | Publishing `common` to an index with pinned versions (version management for one repository). Editable installs in images | Version skew needs to be visible (Q-PLT-6) |
+| PLT-D26 | The shared package lives at `common/` at the repository root; the import name stays `smartretail_common` | A `libs/` folder holding one package adds a level that means nothing. The distinct import name lets a reader, and the R8 scan, tell platform code from service code ([review §1](../reviews/2026-10-06-mentor-review.md#1-shared-package-folder)) | `libs/common/` (the old layout, an empty level). `packages/common/` (same depth, built for packages that don't exist). Import name `common` (clashes with a PyPI name and local modules; noisy grep) | A second shared package appears |
+| PLT-D27 | Unit tests with `pytest-cov`, branch coverage, `fail_under = 85` per package in each `pyproject.toml`; `make cov` writes an HTML report to each package's `htmlcov/` ([§3.1.1.13](#31113-engineering-practice-tests-coverage-hooks-and-ci)) | Shows which code no test runs and stops coverage shrinking quietly. Per package, so one well-tested package cannot hide another ([review §5](../reviews/2026-10-06-mentor-review.md#5-standard-engineering-practice)) | No gate (coverage erodes unseen). One repository-wide average (hides an untested package). Line coverage only (misses untaken branches) | The threshold blocks valuable changes more than it catches gaps |
+| PLT-D28 | `make audit` and a CI job run `pip-audit` over the installed environment | Known-vulnerable dependencies are caught at the point of change, not later | No audit. Manual review of advisories (depends on someone remembering) | A different scanner is adopted org-wide |
+| PLT-D29 | pre-commit hooks: ruff (`--fix`), ruff-format, mypy, trailing-whitespace, end-of-file-fixer, check-yaml, check-toml, check-merge-conflict, detect-private-key; installed with `make hooks` | Catches problems before commit rather than in review; `detect-private-key` backs up PLT-25 ([review §5](../reviews/2026-10-06-mentor-review.md#5-standard-engineering-practice)) | CI only (slower feedback, noisy fix-up commits). Editor settings only (not shared, not enforced) | Hook run time makes commits slow |
+| PLT-D30 | GitHub Actions `ci.yml` on push and pull request, Python 3.12, four parallel jobs: lint, typecheck, test, audit | Every change gets the same checks, independent of one developer's machine; separate jobs report every failure at once ([review §5](../reviews/2026-10-06-mentor-review.md#5-standard-engineering-practice)) | Local `make` targets only (depend on one machine). One sequential job (first failure hides the rest) | The repository moves off GitHub |
+| PLT-D31 | The CI `test` job is a matrix over `common`, `services/identity`, `services/catalog` and `services/gateway`, each against a `pgvector/pgvector:pg16` Postgres service container, with the coverage gate | Integration tests need the real database and image Compose uses; a matrix leg per package keeps each package's gate and failure separate | SQLite or mocks (different SQL and types from production). One job over all packages (one failure hides the others) | Kafka, Schema Registry or Redis become test dependencies (add service containers, §6.3) |
+| PLT-D32 | Repository hygiene: `.github/pull_request_template.md` (What / Why / Decision IDs added or changed / How tested), `CONTRIBUTING.md`, `.editorconfig` | Asks for the reason behind each change, and the register rows it touches, at the point of change ([review §2, §5](../reviews/2026-10-06-mentor-review.md#5-standard-engineering-practice)) | Free-form PR descriptions (reasons go missing) | — |
 
 **Why the outbox relay rather than publishing from the handler.** A handler that commits to Postgres and then produces to Kafka has a window: crash in between, and the state changed but nobody was told. There is no retry that fixes it, because the process that knew is gone. The outbox makes the event part of the same transaction as the state change, so the two cannot disagree; the relay then has the much easier job of publishing rows that are already durable, and its failure mode is a duplicate rather than a loss. The outbox tables were written before Kafka existed specifically so that adding the backbone was a new process rather than a rewrite of every handler (B11).
 
@@ -1495,7 +1734,11 @@ Ordered so that each platform piece exists before the first service that needs i
 | PyJWT | 2.10.x | RS256 sign and verify |
 | httpx | 0.28.x | Service-to-service calls, gateway proxying, test client |
 | pytest / pytest-asyncio | 8.x / 0.24.x | Tests |
+| pytest-cov | current | Branch coverage and the 85% gate |
 | ruff, mypy | current | Lint, format, type-check |
+| pre-commit | current | Local hooks |
+| pip-audit | current | Dependency vulnerability audit |
+| GitHub Actions | — | CI |
 | PostgreSQL (`pgvector/pgvector:pg16`) | 16 (pgvector 0.7.x) | Data store for six services and Temporal |
 | Docker + Compose | v2 | Local environment |
 | Temporal server + UI | 1.25.x | Workflow orchestration |
@@ -1656,7 +1899,7 @@ Ordered so that each platform piece exists before the first service that needs i
 - **Independent deployability.** Consumers deploy independently of their service's API process; a consumer restart never interrupts an API. Workers deploy separately from the services they call, so workflow and task code can be redeployed without restarting an API.
 - **Workflow deploys** — `workflow.patched()` for sequence changes; drain-and-restart locally; the replay test gates a deploy.
 - **Rollback.** Per-service Alembic `downgrade`; registry schema versions are additive and never deleted; a bad consumer is rolled back and its offsets rewound if needed; `make reset` for a broken local environment. Because histories are per service, rolling back one never requires rolling back another.
-- **CI** — lint, type-check, the full test suite against ephemeral Postgres, Kafka, Schema Registry and Redis service containers, the schema compatibility check, and the R8 scan.
+- **CI** — GitHub Actions on every push and pull request: lint, type-check, each package's tests against a Postgres service container with the 85% branch-coverage gate (the R8 scan runs in `common`'s suite), and `pip-audit` (§3.1.1.13). Kafka, Schema Registry and Redis service containers and the schema compatibility check join the test job with the packages that need them.
 
 ---
 
@@ -1677,6 +1920,7 @@ Ordered so that each platform piece exists before the first service that needs i
 - Rate limiter: window boundaries, per-scope isolation, TTL equals the window, fail-open on a Redis error.
 - Trace context injection into and extraction from the outbox row, the envelope, Kafka headers and Celery headers.
 - Celery routing table: every registered task maps to exactly one queue; every Beat entry names a registered task.
+- Coverage: every package meets its 85% branch-coverage gate under `make cov` and in the CI `test` job (§3.1.1.13, PLT-D27).
 
 **Integration** — real Postgres, Kafka, Schema Registry, Redis and RabbitMQ (Compose services or testcontainers).
 
@@ -1847,14 +2091,14 @@ Ordered so that each platform piece exists before the first service that needs i
 - **On what "basic monitoring" means.** RED metrics with dashboards for every component, one trace across every hop, and the diagnosis walkthroughs — not a subset. What is deliberately not included is alerting, SLOs and log aggregation (§2.2).
 - **On decision IDs from archive/0001.** That RFC numbered its own decisions A1–A8, which overlap the platform-wide A1–A14 of archive/0000 with different meanings. This RFC uses the archive/0000 numbering throughout. For traceability: archive/0001 A1 = A1, A2 = A2, A3 = A3, A4 = A4, A6 ("the gateway verifies; each service re-verifies") = A5, A7 (async) = A6, A8 (per-service Alembic) = S14; archive/0001 A5 (stateless access, stateful refresh tokens) is `identity`'s ([0003](0003-identity-service.md)).
 - **On counts.** The archive refers to "fourteen topics"; that is the number of rows in the event catalogue, two of which name a pair (`payment.succeeded` / `payment.failed`, `inventory.reserved` / `inventory.released`), so there are sixteen topics and sixteen DLQs (§3.1.3.3). The archive's container table (4 / 9 / 21 / 24) is replaced by §3.1.1.12's, which counts one-shot init containers and `celery-worker-ai`; the archive's infrastructure figures did not reconcile with the containers it named.
-- **On things this RFC decided that the archive left open.** Every `PLT-` decision fills a gap — a name, a TTL, a retention, a hosting rule — or resolves a conflict between archive sources. Each names what it resolves, so a reviewer who disagrees can disagree with one decision rather than with the document.
+- **On things this RFC decided that the archive left open.** Every `PLT-1` … `PLT-27` decision fills a gap — a name, a TTL, a retention, a hosting rule — or resolves a conflict between archive sources. Each names what it resolves, so a reviewer who disagrees can disagree with one decision rather than with the document.
 - **Definition of done.** Goals G1–G13 verified by their stated checks; `make reset && make up-all && make migrate && make seed && make test` green from a clean clone; the replay, poison-message, relay hand-over, single-trace and worker-binding tests green; Grafana dashboards loading with live data; the diagnosis walkthroughs written up; this RFC moved to **DONE** with review outcomes folded in.
 
 ---
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against a numbered decision (A*, B*, C*, D*, E*, R8, S4/S12–S14 as implemented here, or PLT-1 … PLT-26), an open question, a keyspace, a topic configuration, or a rejected alternative in §5, so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against a numbered decision (A*, B*, C*, D*, E*, R8, S4/S12–S14 as implemented here, PLT-1 … PLT-27, or a register row PLT-D*), an open question, a keyspace, a topic configuration, or a rejected alternative in §5, so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

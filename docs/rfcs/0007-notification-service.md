@@ -38,6 +38,7 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -110,27 +111,37 @@ Recording a notification is not delivering one, and the design turns on one cons
 
 #### 3.1.1. Architectural changes
 
-```
-                     Kafka  smartretail.{order,payment,shipment,inventory,identity}.*
-                       │  (consumer group "notification", keyed by aggregate_id)
-                       ▼
- ┌─────────────────────────────── notification (:8005, N replicas) ───────────────────────────┐
- │ consumers/  ── dedupe (processed_events) ── resolve recipient ── derive type, channels,    │
- │                scope ── render template ── INSERT notifications (at-most-one) ── COMMIT     │
- │                   │                                    │                                    │
- │                   │ after commit: PUBLISH nt:user:{id} │ after commit: enqueue              │
- │                   ▼                                    ▼ dispatch_notification (non-in_app) │
- │   api/v1/ ── list · read · read-all · unread-count · ack · admin · stream-ticket · stream   │
- │   stream/ ── ticket redeem ── cursor/cold start ── bounded catch-up ── SUBSCRIBE ── frames  │
- └───────┬──────────────────────────┬──────────────────────────────┬──────────────────────────┘
-         │ notification_db (PG 16)  │ Redis: nt:user pub/sub,      │ RabbitMQ "notifications" /
-         │ notifications,           │ nt:ticket, nt:conns,         │ "maintenance" queues
-         │ delivery_attempts,       │ nt:client presence, rl:*     ▼
-         │ push_subscriptions,      │                        celery-worker + Beat
-         │ stream_cursors,          │                        dispatch_notification · promote_…
-         │ processed_events         │                        sweep_stale_stream_cursors · redispatch_…
-         ▼                          ▼
-                     gateway (:8000, no buffering on text/event-stream) ──▶ client (EventSource)
+```mermaid
+flowchart TB
+    kafka[["Kafka smartretail.order, payment, shipment, inventory, identity topics<br/>consumer group notification, keyed by aggregate_id"]]
+    subgraph svc["notification (:8005, N replicas)"]
+        consumer["consumers/<br/>dedupe (processed_events), resolve recipient,<br/>derive type, channels, scope, render template,<br/>INSERT notifications (at-most-one), COMMIT"]
+        api["notifications/v1/routes.py<br/>list, read, read-all, unread-count, ack, admin"]
+        streamapi["stream/v1/routes.py<br/>stream-ticket, stream"]
+        stream["stream/<br/>ticket redeem, cursor or cold start,<br/>bounded catch-up, SUBSCRIBE, frames"]
+    end
+    db[("notification_db (PG 16)<br/>notifications, delivery_attempts,<br/>push_subscriptions, stream_cursors,<br/>processed_events")]
+    redis[("Redis<br/>nt:user pub/sub, nt:ticket, nt:conns,<br/>nt:client presence, rl:*")]
+    rabbit[["RabbitMQ queues notifications and maintenance"]]
+    worker["celery-worker + Beat<br/>dispatch_notification, promote_undelivered_notifications,<br/>sweep_stale_stream_cursors, redispatch_undispatched_notifications"]
+    gateway["gateway (:8000)<br/>no buffering on text/event-stream"]
+    client["client (EventSource)"]
+
+    kafka --> consumer
+    consumer --> db
+    consumer -- "after commit: PUBLISH nt:user:{id}" --> redis
+    consumer -- "after commit: enqueue dispatch_notification (non in_app)" --> rabbit
+    rabbit --> worker
+    worker --> db
+    worker -- "re-PUBLISH promoted rows" --> redis
+    api --> db
+    api -- "unread_count message" --> redis
+    streamapi --> stream
+    stream --> db
+    stream -- "SUBSCRIBE nt:user:{id}" --> redis
+    client --> gateway
+    gateway --> api
+    gateway --> streamapi
 ```
 
 **Decisions that bind this service.** Carried from the archive with their original IDs:
@@ -180,8 +191,8 @@ Recording a notification is not delivering one, and the design turns on one cons
 | Per-`(user, device)` SSE replay floor | `stream_cursors` |
 | Consumer dedupe | `processed_events` |
 | Stream tickets, per-user connection counts, presence hints, the per-user fan-out channel | Redis `nt:*` (§3.1.3) |
-| Templates for the six `NotificationType`s | code, `app/templates/` |
-| The SSE stream contract and frame vocabulary | code, `app/stream/` |
+| Templates for the six `NotificationType`s | code, `app/notifications/templates/` |
+| The SSE stream contract and frame vocabulary | code, `app/stream/` (`app/stream/v1/` for the HTTP contract) |
 
 **Does not own.**
 
@@ -222,38 +233,60 @@ Since the ownership test was applied, the service has also acquired the per-devi
 | S4 | Four `DomainEnum` vocabularies (§3.1.1.2) |
 | S8 | `payload jsonb` holds the source envelope — never filtered except by the NTF-1 expression index, which is a uniqueness guard, not a query path |
 
-**Module layout** ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)):
+**Module layout** ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service); entity-first per [file-structure §4–§5](../file-structure.md#4-service-layout-every-service)). The entities are `notifications/` (`notifications`, `delivery_attempts`), `subscriptions/` (`push_subscriptions`) and `stream/` (`stream_cursors` and the SSE machinery); `consumers/` and `tasks/` are the service's additions to the template.
 
 ```
 services/notification/
+├── main.py                       create_application(): settings, logging, DB, router, /health, consumer start/stop
+├── alembic.ini
+├── alembic/versions/             0001_initial.py, 0002_stream_cursors.py, 0003_enum_comments.py
 ├── app/
-│   ├── api/v1/
-│   │   ├── router.py            every route: /notifications/*, stream-ticket, stream
-│   │   ├── notifications.py     handlers: list, read, read-all, unread-count, ack, admin
-│   │   └── stream.py            handlers: stream-ticket, stream (HTTP only; delegates to stream/)
-│   ├── services/
-│   │   ├── recording.py         event → recipient → type → channels → scope → rows
-│   │   ├── read_state.py        mark-read, read-all, unread count
-│   │   ├── delivery_report.py   ack: delivered_at stamping, cursor advance with clamp
-│   │   └── promotion.py         the origin_first promoter
+│   ├── router.py                 includes only: owns /api/v1 and the /notifications prefix for both entity routers
+│   ├── models.py                 imports every entity's ORM models onto one metadata
+│   ├── core/
+│   │   ├── config.py             NotificationSettings (§3.1.1.6)
+│   │   ├── db.py  logger.py  dependencies.py  errors.py  schemas.py  utils.py
+│   ├── health/routes.py          /health, /health/ready
+│   ├── notifications/
+│   │   ├── models.py             Notification, DeliveryAttempt
+│   │   ├── repo.py               NotificationRepo: list, mark-read, read-all, unread count, admin view
+│   │   ├── recording_repo.py     event → recipient → type → channels → scope → rows (called by consumers/)
+│   │   ├── delivery_report_repo.py  ack: delivered_at stamping; calls stream/cursor_repo.py for the clamped advance
+│   │   ├── promotion_repo.py     the origin_first promoter (called by tasks/)
+│   │   ├── dispatch_repo.py      attempt rows and the adapter call (called by tasks/)
+│   │   ├── dependencies.py
+│   │   ├── enums.py              NotificationType, NotificationChannel, DeliveryStatus, NotificationDeliveryScope
+│   │   ├── utils.py              scope derivation, channel table, DeliveryStatus transition table; no I/O
+│   │   ├── templates/            one module per NotificationType
+│   │   ├── adapters/
+│   │   │   ├── base.py           NotificationAdapter protocol
+│   │   │   ├── email_log.py      logging email adapter
+│   │   │   ├── sms_log.py        logging SMS adapter
+│   │   │   └── web_push.py       specified, not registered
+│   │   └── v1/
+│   │       ├── routes.py         list, read, read-all, unread-count, ack, admin
+│   │       └── schemas.py
+│   ├── subscriptions/
+│   │   ├── models.py             PushSubscription (specified, unused)
+│   │   └── repo.py               PushSubscriptionRepo, read by adapters/web_push.py; no v1/ until an endpoint exists
 │   ├── stream/
-│   │   ├── tickets.py           mint / redeem (GETDEL)
-│   │   ├── catchup.py           floor, bounded query, truncation
-│   │   ├── fanout.py            PUBLISH / SUBSCRIBE, message schema
-│   │   ├── connection.py        per-connection queue, scope filter, heartbeat, presence, cap
-│   │   └── frames.py            typed frame serialisers
-│   ├── adapters/
-│   │   ├── base.py              NotificationAdapter protocol
-│   │   ├── email_log.py         logging email adapter
-│   │   ├── sms_log.py           logging SMS adapter
-│   │   └── web_push.py          specified, not registered
-│   ├── templates/               one module per NotificationType
-│   ├── consumers/               thin handlers per topic → services/recording.py
-│   ├── tasks/                   Celery task bodies (hosted by celery-worker)
-│   ├── domain/enums.py          NotificationType, NotificationChannel, DeliveryStatus, NotificationDeliveryScope
-│   ├── models/  schemas/
-└── alembic/
+│   │   ├── models.py             StreamCursor
+│   │   ├── cursor_repo.py        cold start, greatest() upsert with clamp, last_seen_at
+│   │   ├── tickets.py            mint / redeem (GETDEL)
+│   │   ├── catchup.py            floor, bounded query, truncation
+│   │   ├── fanout.py             PUBLISH / SUBSCRIBE, message schema
+│   │   ├── connection.py         per-connection queue, heartbeat, presence, cap
+│   │   ├── frames.py             typed frame serialisers
+│   │   ├── utils.py              per-connection frame filter; no I/O
+│   │   └── v1/
+│   │       ├── routes.py         stream-ticket, stream (HTTP only; delegates to the modules above)
+│   │       └── schemas.py
+│   ├── consumers/                thin handlers per topic → notifications/recording_repo.py
+│   └── tasks/                    Celery task bodies (hosted by celery-worker) → notifications/*_repo.py, stream/cursor_repo.py
+└── tests/  unit/<entity>/  integration/<entity>/
 ```
+
+Both entity routers mount under `/notifications`. Literal segments (`/unread-count`, `/read-all`, `/ack`, `/admin`, `/stream-ticket`, `/stream`) are declared before `/{id}` in their `v1/routes.py`, and `app/router.py` includes `stream/v1` before `notifications/v1` so the stream literals are never captured by `/{id}`.
 
 ##### 3.1.1.2. Domain model
 
@@ -279,7 +312,7 @@ services/notification/
 | I7 | `client_id` is always stored and queried under an authenticated `user_id` | Every query takes `user_id` from the verified token or the redeemed ticket |
 | I8 | A read notification stays read; `read_at` is written once | `SET read_at = coalesce(read_at, now())` |
 
-**Vocabularies** (S4; `app/models/enums.py`).
+**Vocabularies** (S4; `app/notifications/enums.py`, imported by `stream/` for the scope filter).
 
 | `DomainEnum` | Values | Column(s) | Read policy |
 | --- | --- | --- | --- |
@@ -343,6 +376,24 @@ Scope applies to the `in_app` row only; dispatched channels have no devices and 
 
 Notes: a row may be *read* without ever being *delivered* (read from the list on a device that never streamed it) — that is correct and is why the two are separate facts. A *delivered* row is never *promoted* afterwards. `origin_only` and `all_devices` rows never enter *promoted*. No transition goes backwards; nothing clears a timestamp.
 
+The three facts are independent, so the diagram draws them as concurrent regions rather than one chain. Not shown, because it is a guard rather than a state: a row that is already *delivered* is never *promoted* afterwards, and only `origin_first` rows enter the promotion region at all.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Notification : consumer inserts the row (I1)
+    state Notification {
+        [*] --> not_promoted
+        [*] --> promoted : inserted with promoted_at, origin_first and presence absent (NTF-9)
+        not_promoted --> promoted : promote_undelivered_notifications, origin_first, undelivered, 45 s to 1 h old
+        --
+        [*] --> undelivered
+        undelivered --> delivered : POST /notifications/ack names the id, first writer wins
+        --
+        [*] --> unread
+        unread --> read : POST read or read-all, owner only
+    }
+```
+
 **Delivery attempt** (`DeliveryStatus`, dispatched channels only, NTF-4).
 
 | From | To | Triggered by | Guard |
@@ -352,6 +403,15 @@ Notes: a row may be *read* without ever being *delivered* (read from the list on
 | `pending` | `failed` | adapter raised or returned an error; `error` recorded | — |
 
 `sent` and `failed` are terminal *for the attempt row*. A retry inserts attempt *n + 1* as a new `pending` row rather than reopening a failed one, so the history is append-only. After the fifth failure (NTF-5) no further row is written; the notification's effective state is "dispatch exhausted", visible in the admin view as a notification whose newest attempt is `failed`. A `pending` row older than the task's hard time limit is a crashed attempt: the next retry, or the NTF-6 sweep, supersedes it with attempt *n + 1*.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending : dispatch_notification inserts attempt n + 1 (no sent attempt exists)
+    pending --> sent : adapter returned Sent
+    pending --> failed : adapter raised or returned Failed, error recorded
+    sent --> [*]
+    failed --> [*] : retry writes a new pending row, max 5 (NTF-5)
+```
 
 **Stream cursor.**
 
@@ -363,6 +423,15 @@ Notes: a row may be *read* without ever being *delivered* (read from the list on
 | exists | exists, `last_seen_at` refreshed | stream open, ack | — |
 | exists | deleted | `sweep_stale_stream_cursors` | `last_seen_at` older than 90 days, or beyond the 20 newest for the user |
 
+```mermaid
+stateDiagram-v2
+    [*] --> exists : stream open cold start, cursor_seq = max(seq), client_id not null
+    [*] --> exists : ack from a client_id with no row, cursor_seq = clamp(up_to_seq)
+    exists --> exists : ack raises cursor_seq with greatest() and the clamp (I5)
+    exists --> exists : stream open or ack refreshes last_seen_at
+    exists --> [*] : sweep_stale_stream_cursors, idle 90 days or beyond the 20 newest
+```
+
 **Stream connection** (in memory, per replica — not persisted).
 
 | From | To | Trigger |
@@ -373,6 +442,17 @@ Notes: a row may be *read* without ever being *delivered* (read from the list on
 | `catching_up` | `live` | `hello` (and `catchup_truncated`) sent; replay and buffered live messages drained |
 | `live` | `closing` | JWT expiry reached (`error` frame), queue overflow, client disconnect, replica shutdown (`retry:` hint) |
 | `closing` | — | `UNSUBSCRIBE`; `DECR nt:conns:{user_id}`; `DEL nt:client:{user_id}:{client_id}` on clean close |
+
+```mermaid
+stateDiagram-v2
+    [*] --> opening : GET /stream with a ticket
+    opening --> rejected : ticket invalid, expired or spent (401), fourth concurrent stream (429)
+    rejected --> [*]
+    opening --> catching_up : ticket redeemed, slot claimed, SUBSCRIBE issued (NTF-10)
+    catching_up --> live : hello and catchup_truncated sent, replay and buffer drained
+    live --> closing : JWT expiry, queue overflow, client disconnect, replica shutdown
+    closing --> [*] : UNSUBSCRIBE, DECR nt-conns, DEL presence key on clean close
+```
 
 ##### 3.1.1.4. Workflows and async jobs
 
@@ -413,6 +493,59 @@ Consumer group `notification`, one process per replica subscribing to every cons
 
 A `PUBLISH` failure after commit is logged and counted (`notification_fanout_publish_errors_total`) and never fails the event: the row is durable and the next connect replays it (C16, C18). An enqueue failure is likewise logged and counted; NTF-6 recovers it. A render or recipient-resolution error is a poison message: three in-process attempts, then `<topic>.dlq`, then offset commit (C6). An infrastructure error pauses the partition (NTF-14).
 
+**Decision flow per event.**
+
+```mermaid
+flowchart TD
+    start(["event from Kafka"]) --> dedupe{"INSERT processed_events<br/>inserted a row?"}
+    dedupe -- "no, duplicate (C4)" --> commitOnly["COMMIT, commit offset"]
+    dedupe -- yes --> resolve{"event maps to a NotificationType?<br/>(§3.1.1.2 table)"}
+    resolve -- "no: payment.*, shipment created (NTF-7)" --> commitOnly
+    resolve -- yes --> origin{"envelope.client_id present?"}
+    origin -- no --> all["scope = all_devices (I2)"]
+    origin -- yes --> def["scope = default_scope(type)"]
+    def --> first{"scope = origin_first?"}
+    first -- no --> insert
+    first -- yes --> presence{"nt:client presence key<br/>for the origin exists?"}
+    presence -- yes --> insert
+    presence -- "no (NTF-9)" --> promote["promoted_at = now()"] --> insert
+    all --> insert["per channel: render template,<br/>INSERT ... ON CONFLICT DO NOTHING (I1)"]
+    insert --> commit["COMMIT"]
+    commit --> inapp{"in_app row inserted?"}
+    inapp -- yes --> publish["count unread, PUBLISH nt:user (NTF-11)"]
+    inapp -- no --> enqueue
+    publish --> enqueue["dispatch_notification.delay for each<br/>dispatched-channel row inserted"]
+    enqueue --> offset["commit offset"]
+    insert -. "render or recipient error" .-> poison["3 attempts, then topic.dlq (C6)"]
+    insert -. "DB or Redis outage" .-> pause["pause partition, capped backoff (NTF-14)"]
+```
+
+**Consume to frame, across replicas** (C17, G5a). The replica that consumes is usually not the one holding the connection.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as Kafka
+    participant B as Replica B consumer
+    participant DB as notification_db
+    participant R as Redis
+    participant MQ as RabbitMQ
+    participant A as Replica A stream
+    participant C as Client EventSource
+    K->>B: order.confirmed envelope (traceparent, client_id)
+    B->>DB: BEGIN, INSERT processed_events
+    B->>R: EXISTS nt:client presence key (origin_first only)
+    B->>DB: INSERT notifications per channel ON CONFLICT DO NOTHING
+    B->>DB: COMMIT
+    B->>DB: count unread in_app rows
+    B->>R: PUBLISH nt:user:{id} with scope and unread_count
+    B->>MQ: dispatch_notification.delay(email row id)
+    B->>K: commit offset
+    R-->>A: message on nt:user:{id}
+    A->>A: per-connection scope filter
+    A-->>C: notification frame (id = seq) and unread_count frame
+```
+
 ###### The SSE stream
 
 **Opening a stream.**
@@ -438,6 +571,68 @@ GET  /api/v1/notifications/stream?ticket=…   Last-Event-ID: 84213   (often abs
   6. SET nt:client:{user_id}:{client_id} 1 EX 45   (presence, refreshed by the heartbeat; not for ephemeral streams)
   7. `: keepalive` comment and a `ping` frame every 20s; each refreshes nt:client:* (EX 45) and nt:conns:* (EX 60)
   8. at jwt_exp: emit error frame (type …/stream-token-expired) and close
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as Gateway
+    participant N as notification
+    participant R as Redis
+    participant DB as notification_db
+    C->>G: POST /api/v1/notifications/stream-ticket (Bearer, X-Client-Id)
+    G->>N: forward, X-Client-Id shape-checked or stripped
+    N->>R: SET nt:ticket:{ticket} user_id, client_id, jwt_exp EX 60
+    N-->>C: 200 ticket, expires_in 60
+    C->>G: GET /api/v1/notifications/stream?ticket=... (Last-Event-ID optional)
+    G->>N: forward, unbuffered
+    N->>R: GETDEL nt:ticket:{ticket}
+    alt ticket missing, expired or spent
+        N-->>C: 401 problem detail
+    end
+    N->>R: INCR nt:conns:{user_id}, EXPIRE 60
+    alt more than 3 streams
+        N->>R: DECR nt:conns:{user_id}
+        N-->>C: 429 problem detail
+    end
+    N->>R: SUBSCRIBE nt:user:{user_id}, buffer live messages (NTF-10)
+    N->>DB: SELECT stream_cursors for (user_id, client_id)
+    alt no row (cold start)
+        N->>DB: INSERT cursor at the user's max(seq)
+        N-->>C: hello cold_start true, unread_count
+    else row exists (resume)
+        N->>DB: bounded catch-up, LIMIT 51
+        N-->>C: hello, catchup_truncated if 51 rows, then up to 50 frames
+    end
+    N-->>C: drained buffered frames, skipping ids already sent
+    N->>R: SET nt:client presence key EX 45
+    loop every 20 s
+        N-->>C: keepalive comment and ping frame
+        N->>R: refresh presence (EX 45) and nt:conns (EX 60)
+    end
+    N-->>C: error frame stream-token-expired at jwt_exp, then close
+```
+
+**Choosing the replay floor.**
+
+```mermaid
+flowchart TD
+    open(["ticket redeemed, SUBSCRIBE issued"]) --> cid{"ticket client_id null?"}
+    cid -- "yes (NTF-12)" --> eph{"Last-Event-ID sent?"}
+    eph -- yes --> ephFloor["EPHEMERAL: floor = Last-Event-ID,<br/>no cursor row"]
+    eph -- no --> cold
+    cid -- no --> row{"stream_cursors row exists?"}
+    row -- no --> cold["COLD START: hello cold_start true,<br/>replay nothing"]
+    row -- yes --> resume["RESUME: floor = greatest(cursor_seq, Last-Event-ID or 0)"]
+    ephFloor --> q
+    resume --> q["catch-up: in_app, last 24 h, seq above floor or last 5 s,<br/>scope filter, ORDER BY seq LIMIT 51"]
+    q --> n{"51 rows?"}
+    n -- yes --> trunc["hello, catchup_truncated with omitted_count,<br/>then the oldest 50"]
+    n -- no --> all["hello, then every row"]
+    cold --> drain
+    trunc --> drain["drain buffer, skip ids already sent, live"]
+    all --> drain
 ```
 
 **The bounded catch-up query (C22).** The 5-second overlap window is the `seq` visibility trap's fix; the age bound, the scope filter, and the limit are the bound.
@@ -497,6 +692,19 @@ deliver notification frame  iff  scope = 'all_devices'
 always deliver unread_count frame
 ```
 
+```mermaid
+flowchart LR
+    msg(["Pub/Sub message on nt:user"]) --> kind{"kind = unread_count?"}
+    kind -- yes --> uc["deliver unread_count frame<br/>(never scope-filtered)"]
+    kind -- "no, notification" --> s1{"scope = all_devices?"}
+    s1 -- yes --> deliver["deliver notification frame,<br/>then unread_count frame"]
+    s1 -- no --> s2{"origin_client_id null?"}
+    s2 -- yes --> deliver
+    s2 -- no --> s3{"connection client_id not null<br/>and equals origin_client_id?"}
+    s3 -- yes --> deliver
+    s3 -- no --> skip["filter the notification frame,<br/>still deliver unread_count"]
+```
+
 A promoted re-publish arrives with `scope = 'all_devices'`; the origin device, if it already rendered the targeted frame, receives it again and de-duplicates by `id`.
 
 **Promotion.** `promote_undelivered_notifications` runs on Celery Beat every 15 s rather than as a per-notification countdown task, which would be a task storm and a scheduling dependency for a cosmetic outcome:
@@ -511,6 +719,25 @@ RETURNING …            → re-PUBLISH each with scope = 'all_devices'
 ```
 
 Idempotent by `promoted_at IS NULL`, bounded by the one-hour floor, safe on two workers. **The worst-case toast delay is arithmetic, not a guess:** heartbeat 20 s + presence TTL 45 s + promotion grace 45 s + sweep interval 15 s ≈ **75 seconds** for a laptop whose lid closes immediately after the event; sub-second in the common case. If that is judged too slow for `order_failed`, the lever is a 30 s presence TTL with a 12 s heartbeat, not a redesign.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Beat as Celery Beat
+    participant W as celery-worker
+    participant DB as notification_db
+    participant R as Redis
+    participant N as notification replicas
+    participant D as Other devices
+    Beat->>W: promote_undelivered_notifications (every 15 s)
+    W->>DB: UPDATE promoted_at WHERE origin_first, undelivered, unpromoted, 45 s to 1 h old RETURNING
+    loop each promoted row
+        W->>DB: count unread for the user
+        W->>R: PUBLISH nt:user:{id} scope all_devices, unread_count
+        R-->>N: message
+        N-->>D: notification frame (origin device de-duplicates by id)
+    end
+```
 
 **The `seq` visibility trap.** ⚠️ `bigserial` values are allocated before commit, so a transaction holding `seq` 84214 can commit *after* one holding 84215. A client that catches up to 84215 would then skip 84214 permanently — a silent, unreproducible loss. The catch-up query therefore reads a small overlap window, `seq > :cursor OR created_at > now() - interval '5 seconds'`, and the client de-duplicates by `id`. Cheap, and it removes the one genuinely nasty bug in this design.
 
@@ -577,6 +804,35 @@ A real email provider needs a user email address, which `identity` owns: it woul
 | `redispatch_undispatched_notifications` (NTF-6) | `maintenance` | Beat, every 5 min | For rows with `channel <> 'in_app'`, no `delivery_attempts` row, created between 2 minutes and 24 hours ago → `dispatch_notification.delay(id)`. Also re-enqueues rows whose newest attempt is `pending` and older than the hard time limit, while fewer than 5 attempts exist |
 
 Separate queues so a burst of media processing cannot starve notification delivery ([RFC 0001](0001-platform-and-shared-infrastructure.md) owns routing). The `processed_events` retention sweep is shared infrastructure ([RFC 0000](0000-architecture.md#3132-shared-tables--outbox-and-processed_events)).
+
+**Dispatch, with its two triggers** (NTF-5, NTF-6):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Src as Consumer or redispatch sweep
+    participant MQ as RabbitMQ notifications queue
+    participant W as celery-worker
+    participant DB as notification_db
+    participant Ad as Channel adapter
+    Src->>MQ: dispatch_notification(notification_id)
+    MQ->>W: deliver task (acks_late)
+    W->>DB: load row, any sent attempt?
+    alt a sent attempt exists
+        W-->>MQ: ack, return (idempotent)
+    else none sent
+        W->>DB: INSERT delivery_attempts attempt n + 1, pending
+        W->>Ad: send(notification)
+        alt Sent
+            Ad-->>W: Sent(provider_ref)
+            W->>DB: UPDATE attempt to sent
+        else Failed retryable
+            Ad-->>W: Failed(error, retryable)
+            W->>DB: UPDATE attempt to failed, error
+            W->>MQ: self.retry(countdown = backoff(n)), max 5
+        end
+    end
+```
 
 ##### 3.1.1.5. Dependencies and degradation
 
@@ -742,6 +998,26 @@ Idempotent by construction: `SET delivered_at = coalesce(delivered_at, now()), d
 
 Client policy, which is what keeps C23 honest: ack on frame render, 2-second debounce, coalesced into one call, `fetch(…, {keepalive: true})`, no retry, no user-visible failure.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as Gateway
+    participant N as notification
+    participant R as Redis
+    participant DB as notification_db
+    C->>G: POST /api/v1/notifications/ack (client_id, up_to_seq, ids)
+    G->>N: forward with Bearer
+    N->>N: validate body shape, else 400
+    N->>R: INCR rl:notif-ack:{user_id}:{client_id} (NTF-15)
+    alt over 12 per minute
+        N-->>C: 429, client drops it
+    end
+    N->>DB: UPDATE notifications SET delivered_at, delivered_client_id WHERE id in ids, user_id, delivered_at IS NULL
+    N->>DB: UPSERT stream_cursors cursor_seq = greatest(cursor_seq, least(up_to_seq, settled max seq)), last_seen_at
+    N-->>C: 204 No Content
+```
+
 ###### `GET /notifications/admin`
 
 | Query | Notes |
@@ -827,6 +1103,66 @@ Owned by `notification` · PostgreSQL 16 · its own logical database and role on
 | `push_subscriptions` | `uuid` `‡` | 8 | Specified, unused — makes the offline channel an adapter |
 | `stream_cursors` | `uuid`, unique `(user_id, client_id)` | 8 | Per-device SSE replay floor — what stops a fresh session replaying everything |
 | `processed_events` | `(group, event_id)` | 4 | S13 |
+
+The only foreign key is `delivery_attempts.notification_id` (same database, R2). `user_id` columns carry no FK (identity owns users); `stream_cursors` relates to `notifications` only logically, by `user_id` and by `cursor_seq` mirroring `seq`. `processed_events` is the shared S13 table, drawn with the columns the consumer writes.
+
+```mermaid
+erDiagram
+    notifications ||--o{ delivery_attempts : "dispatched via"
+    notifications {
+        uuid id PK
+        bigint seq "bigserial, S1 exception, indexed with user_id"
+        uuid user_id "no FK"
+        text type "NotificationType"
+        text channel "NotificationChannel"
+        text title
+        text body
+        jsonb payload "source envelope, unique with user_id and channel on payload event_id (NTF-1)"
+        timestamptz read_at "nullable"
+        text correlation_id "indexed"
+        text origin_client_id "nullable, opaque client token"
+        text delivery_scope "NotificationDeliveryScope, default all_devices"
+        timestamptz delivered_at "nullable, first writer wins"
+        text delivered_client_id "nullable, null iff delivered_at null"
+        timestamptz promoted_at "nullable"
+        timestamptz created_at
+    }
+    delivery_attempts {
+        uuid id PK
+        uuid notification_id FK "ON DELETE CASCADE"
+        text channel "NotificationChannel"
+        text status "DeliveryStatus"
+        text error "nullable"
+        int attempt "1-based"
+        timestamptz created_at "indexed"
+    }
+    push_subscriptions {
+        uuid id PK
+        uuid user_id "no FK, unique with endpoint"
+        text endpoint
+        text p256dh
+        text auth
+        text user_agent "nullable"
+        timestamptz created_at
+        timestamptz last_seen_at
+    }
+    stream_cursors {
+        uuid id PK
+        uuid user_id "no FK, unique with client_id"
+        text client_id "max 64 chars"
+        bigint cursor_seq "default 0, monotonic"
+        timestamptz last_seen_at "indexed"
+        text user_agent "nullable"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    processed_events {
+        text consumer_group PK
+        uuid event_id PK
+        text event_type
+        timestamptz processed_at
+    }
+```
 
 **Markers**, as in the archived catalogue:
 
@@ -925,7 +1261,7 @@ Constraint: unique `(user_id, client_id)` — the whole table is an upsert targe
 | `stream_cursors` | unique `(user_id, client_id)` | Upsert target |
 | `stream_cursors` | `(last_seen_at)` | Retention sweep and the per-user cap |
 
-Every enum-valued column is `text` with a `COMMENT ON COLUMN` pointing at `app/models/enums.py` (S4). No `CHECK` constraints on vocabularies.
+Every enum-valued column is `text` with a `COMMENT ON COLUMN` pointing at `app/notifications/enums.py` (S4). No `CHECK` constraints on vocabularies.
 
 ###### Shared tables carried
 
@@ -1012,6 +1348,37 @@ If the schedule slips, the reducible scope is fixed in advance (Q13): T16a + T16
 | `push` adapter registration | Not scheduled |
 
 ### 3.2. Rationale
+
+#### 3.2.1. Decision register
+
+This RFC already numbers its decisions (C4–C23 from the archive, NTF-1–NTF-16 new here). The register gives one row per significant decision and does not renumber them: a row that restates an existing ID says so in the Decision cell (“= C16”), and rows without one (NTF-D1, NTF-D2, NTF-D6, NTF-D20, NTF-D22, NTF-D23, NTF-D24) are decisions that until now were stated only in prose. The full reasoning stays in the linked sections.
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| NTF-D1 | `notification` is its own service, owning `notification_db` | Passes all four parts of the ownership test, and its profile (bursty, async, failure-tolerant, connection-holding) is unlike any neighbour's ([§3.2](#32-rationale), [§3.1.1.1](#3111-responsibility-and-boundaries)) | Fold into `order`: puts SSE connections and email retries inside the service with the strongest consistency need, and makes a notification outage a checkout risk | Notifications have to join the checkout transaction, or the long-lived connections move to a dedicated edge service |
+| NTF-D2 | A terminal consumer: no outbox, no events produced, no synchronous call in or out except the gateway | Nothing reacts to a notification having been sent; a producer would make a failure-tolerant service a dependency of something (R4, R5, R7; [§3.1.2.3](#3123-events-produced)) | A `notification.delivered` event for `orders.notified_at`: a new producer for a cosmetic column (NTF-Q1, option b) | NTF-Q1 is decided for option (b), or another service needs to react to delivery |
+| NTF-D3 | = C4 + NTF-1. At-least-once consumption made idempotent twice: `processed_events` and a unique `((payload->>'event_id'), user_id, channel)` index | The second guard keeps the outcome idempotent even when a replay tool or backfill bypasses the dedupe table; the expression index keeps the catalogued columns exact ([§3.2](#32-rationale), [§3.1.1](#311-architectural-changes)) | Kafka transactions: exactly-once does not extend to a Postgres write or an email. An explicit `event_id` column: a second copy of the id (NTF-Q6) | Review prefers an explicit column (NTF-Q6): one additive migration |
+| NTF-D4 | = NTF-2. One row per channel; only `in_app` rows are listed, counted or streamed | The invariant is per channel, so the row must be ([§3.3](#33-tradeoffs)) | One row with a channel array: at-most-one is then not enforceable by a constraint | Channels need a shared read state across email and in-app |
+| NTF-D5 | = NTF-3 + NTF-7. The channel set is a per-type constant in code; `payment.*` and `shipment created` produce nothing | Preferences are deferred, so a per-type table is the honest shape; notifying both `payment.failed` and `order.failed` would be the duplicate the service exists to prevent ([§3.1.1.2](#3112-domain-model)) | Per-user preferences now (deferred, §2.2); a payment notification type (duplicates the order outcome) | Preferences or unsubscribe come into scope ([§2.2](#22-non-goals)) |
+| NTF-D6 | Render `title`/`body` at consume time with plain per-type Python format functions; keep the envelope in `payload` | The rendered text is a record of what the user was told; re-rendering stays possible, but only deliberately ([§3.2](#32-rationale), [§3.1.1.2](#3112-domain-model)) | Render on read: rewrites history when a template changes and puts templates on the read path. A template engine: there is no HTML | Localisation or HTML email arrives with a real provider |
+| NTF-D7 | = C6 + NTF-14. Poison messages: 3 in-process attempts, then DLQ. Infrastructure outages: pause the partition and retry, never DLQ | A poison message must not stop a partition, but an outage is not the event's fault and would otherwise DLQ every event ([§3.1.1](#311-architectural-changes)) | DLQ everything after 3 attempts: empties an outage into the DLQ | The `common` consumer base class cannot tell the two apart ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
+| NTF-D8 | = C7 + NTF-5. Email/SMS dispatch is a Celery task with 5 retries, exponential backoff with jitter, `acks_late`, one attempt row per try | "One job soon, with per-task retry" is the Celery shape; inline sending would hold a Kafka partition hostage to an SMTP timeout ([§3.2](#32-rationale), [Celery tasks](#celery-tasks)) | Send inside the consumer; a Temporal workflow (nothing here is a process) | A real provider needs rate shaping or batching beyond per-task retry |
+| NTF-D9 | = NTF-6. A Beat sweep re-enqueues dispatched-channel rows with no attempt, or a stale `pending` one | A crash or RabbitMQ outage between commit and enqueue would otherwise leave a row undispatched forever; the task is idempotent ([§3.1.1](#311-architectural-changes)) | An outbox for the enqueue: a second relay for a recoverable gap | Enqueue loss is frequent enough that 5 minutes of delay matters |
+| NTF-D10 | = C15. Push to connected clients over SSE | Checkout returns `202`, so the notification is the customer's only window into the outcome; SSE is plain HTTP, so gateway auth, rate limits, tracing and problem details apply unchanged ([§3.2](#32-rationale)) | Polling: latency bound by the interval and load scaling with idle users ([§5](#5-alternate-solutions) Alt 9). WebSockets: bidirectionality nobody needs, at the cost of a stateful gateway path (Alt 10) | The product needs client→server streaming or typing indicators |
+| NTF-D11 | = C16. The push path is an accelerant over the durable `notifications` row, never the source of truth | Lets fan-out be lossy, replicas die mid-frame and every failure degrade to latency, never loss ([§3.2](#32-rationale), [§11](#11-notes)) | Treat the open connection as the delivery guarantee: what makes real-time systems fragile | Never, without redesigning the stream |
+| NTF-D12 | = C17. Fan-out between replicas over Redis Pub/Sub, one channel per user, filtered per connection | The consuming replica is almost never the holding replica; at-most-once is enough under C16 and Redis is already in the stack ([§3.1.1](#311-architectural-changes)) | Per-replica Kafka groups (Alt 11: offset garbage, persistence and delivery entangled); Redis Streams or a second topic (Alt 12: protects data not at risk); per-device or sharded channels (Q11) | `SUBSCRIBE` churn shows up in Redis latency (Q11) |
+| NTF-D13 | = C18 + NTF-10. A global `bigserial` `seq` with `Last-Event-ID` resume; subscribe before catch-up; a 5-second overlap window with client de-duplication by `id` | One catch-up query recovers blips, restarts and dropped messages alike; subscribing first closes the gap between query and subscription; the window fixes the `seq` visibility trap ([The SSE stream](#the-sse-stream)) | A per-user sequence: needs a lock or a second table. Catch-up before subscribe: a notification can be neither replayed nor received live | Out-of-order commits take longer than 5 s under load |
+| NTF-D14 | = C19. Streams authenticate with a 60-second single-use Redis ticket redeemed by `GETDEL` | `EventSource` cannot set `Authorization`, and a JWT in the URL leaks into logs and `Referer` ([§6.2](#62-security-considerations)) | JWT in the query string; WebSockets to avoid the ticket (Alt 10) | Clients move to `fetch`-based streaming that can send headers |
+| NTF-D15 | = C20. No replica-affine state; only shared, advisory, fail-safe state (Postgres cursor, Redis presence key) | Any replica serves any reconnect with no sticky sessions, so scaling stays ordinary ([§3.1.3](#non-database-state-redis-owned-by-notification), "the C20 retreat") | A connection registry mapping clients to replicas, or sticky sessions: routing becomes sticky | A feature needs to address one specific connection |
+| NTF-D16 | = C21 + NTF-9. Frames are scoped by the originating `client_id` per type; `origin_first` widens immediately when the origin's presence key is absent, else after 45 s by a 15 s Beat promoter | A toast on the wrong device is noise, but scope narrows only frames, never the count or list, so a wrong rule only misplaces a toast ([§3.2](#32-rationale), [§3.1.1.2](#3112-domain-model)) | No presence key: makes the 45 s delay the common case. Never promote: an unseen payment failure. A per-notification countdown task: a task storm | The presence key disappoints (recorded fallback), or the ~75 s worst case is too slow for `order_failed` |
+| NTF-D17 | = C22. A server-side replay floor in `stream_cursors`; catch-up bounded at 50 frames and 24 h; a first-seen `client_id` cold-starts with zero frames | `Last-Event-ID` survives only `EventSource`'s own reconnects; an unbounded replay is a self-inflicted denial of service ([§3.2](#32-rationale), [`stream_cursors`](#stream_cursors)) | Unbounded `seq > cursor`; cursor in Redis (a flush turns every device cold); newest 50 on truncation (a hole below); courtesy frames on cold start (Q14) | UX feedback on cold start (Q14) |
+| NTF-D18 | = C23 + NTF-15. The ack is a batched, idempotent, rate-limited report that always returns `204`; `delivered_at` is stamped by explicit id, the cursor by a clamped high-water mark | Records what happened without anything depending on it; stamping by id avoids reporting deliveries that scope filtering prevented; the clamp stops a high ack stranding a lower `seq` ([`POST /notifications/ack`](#post-notificationsack)) | Ack as an at-least-once protocol (rebuilds TCP badly); stamping by range; gateway rate limiting (cannot see the body's `client_id`) | Offline push needs per-device delivery receipts |
+| NTF-D19 | = NTF-13. The notification lifecycle is derived from `read_at`, `delivered_at`, `promoted_at`; no status column | Three facts with three writers and no order between them; a status would be a fourth thing to keep consistent ([§3.1.1.3](#3113-state-machines)) | A status enum on `notifications` | A reader needs to filter on a combined state at scale |
+| NTF-D20 | Delivery attempts are append-only: a retry inserts attempt *n + 1*; `in_app` has no attempt rows (NTF-4) | Keeps the full history for the admin view; `in_app`'s delivery record is `delivered_at` ([§3.1.1.3](#3113-state-machines)) | Reopening a failed row (loses history); attempt rows for SSE frames (the ack already records it) | `push` is registered and needs per-subscription attempts |
+| NTF-D21 | = NTF-12. A ticket without `client_id` opens an ephemeral stream: no cursor row, never an origin, never receives `origin_only` frames | A missing or stripped `X-Client-Id` must never fail a request (C21) ([§3.1.1](#311-architectural-changes)) | Reject the stream; mint a server-side id (the server does not get to assume one) | Most clients turn out to be ephemeral |
+| NTF-D22 | `push_subscriptions` and the `push` channel value are specified now; the adapter is not registered | Makes the offline half of delivery an adapter swap rather than a redesign, without owning VAPID keys or a service worker ([§2.2](#22-non-goals)) | Leave push out of the schema entirely: a later migration and redesign | A client with a service worker exists |
+| NTF-D23 | Connection hygiene: bounded 100-message queue that closes on overflow, 3 streams per user, 20 s heartbeat, jittered `retry:`, drain on shutdown | Closing is lossless because reconnect catches up by `seq`; unbounded buffering is how push systems die under load ([§6.1](#61-scalability-and-fault-tolerance)) | Unbounded per-connection buffering; per-connection count keys (a `SCAN` on open, NTF-Q8) | `nt:conns` false `429`s are seen in practice (NTF-Q8) |
+| NTF-D24 | Entity-first layout: `notifications/`, `subscriptions/`, `stream/`, plus `consumers/` and `tasks/` | The binding template in [file-structure §4–§5](../file-structure.md#4-service-layout-every-service): only the HTTP contract is versioned (`<entity>/v1/`), and repos are the one place rules live, called by routes, consumers and tasks alike ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Layer-first `api/`, `services/`, `models/`: scatters one entity across folders and cannot version the contract alone | The template changes in [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) |
 
 **Why a service at all.** It passes all four parts of the ownership test: it alone writes notifications, delivery attempts and device cursors; it protects at-most-one per `(event, user, channel)`; its requirements (templates, channels, preferences, push) move for reasons unrelated to orders or stock; and its profile — bursty, fully async, failure-tolerant, connection-holding — is unlike any neighbour's. Folding it into `order` would put SSE connections and email retries inside the service with the strongest consistency need, and make a notification outage a checkout risk.
 

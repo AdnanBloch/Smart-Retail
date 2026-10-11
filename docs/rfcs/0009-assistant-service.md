@@ -38,6 +38,8 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
+     - 3.2.2. [Consolidation decisions and rationale](#322-consolidation-decisions-and-rationale)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -145,71 +147,49 @@ Domain wording follows the mapping in [RFC 0000](0000-architecture.md): *course 
 
 **Topology.**
 
-```
-   catalog ──▶ outbox ──▶ outbox-relay ──▶ Kafka
-                                            │ catalog.product.published
-                                            │ catalog.product.updated
-                                            │ catalog.product.unpublished
-                                            ▼
-                               ┌────────────────────────────┐
-                               │      indexer-worker        │  runtime: RFC 0001
-                               │  (assistant code, §3.1.1.4)│
-                               │  1 read search_document    │
-                               │  2 render → chunk          │
-                               │  3 hash → cache lookup     │
-                               │  4 embed misses (batched)  │
-                               │  5 upsert/prune + index_st.│
-                               └─────────────┬──────────────┘
-                                             │
-                          ┌──────────────────▼────────────────────┐
-                          │  assistant_db (PostgreSQL 16+pgvector)│
-                          │  product_chunks · embedding_cache     │
-                          │  index_state · query_log              │
-                          │  conversations · messages             │
-                          │  generations · token_budgets          │
-                          │  bulk_generation_jobs · prompt_templ. │
-                          │  outbox · processed_events            │
-                          └──────────────────▲────────────────────┘
-                                             │
-  client ──HTTP/SSE──▶ gateway ──SSE──▶ ┌────┴─────────────────────────────┐
-                                        │  assistant (:8007)               │
-                                        │  router: /api/v1/search/*        │
-                                        │  router: /api/v1/assistant/*     │
-                                        │  ┌────────────────────────────┐  │
-                                        │  │  LangGraph agent           │  │
-                                        │  │  guard → classify → route  │  │
-                                        │  │     ├─ retrieve → generate │  │
-                                        │  │     ├─ clarify             │  │
-                                        │  │     ├─ compare             │  │
-                                        │  │     └─ refuse              │  │
-                                        │  │        persist + emit      │  │
-                                        │  └────────────────────────────┘  │
-                                        └──┬──────────┬──────────┬─────────┘
-                                           │          │          │ outbox
-                         live hydration    │          │          ▼
-                  ┌────────────────────────▼──┐  ┌────▼─────┐  Kafka: assistant.interaction
-                  │ catalog · inventory       │  │ embedding│        │
-                  │ (public APIs, read-only)  │  │ + LLM    │        ▼
-                  └───────────────────────────┘  │ provider │    analytics
-                                                 └──────────┘
-   celery-worker (queue: assistant_bulk) ── bulk generation, budget reconciliation, sweeps
+```mermaid
+flowchart TB
+    subgraph svc["assistant :8007"]
+        api["app/router.py<br/>/api/v1/search/* · /api/v1/assistant/*"]
+        agent["LangGraph agent<br/>guard → classify → route<br/>retrieve → generate · clarify · compare · refuse<br/>persist + emit"]
+        api --> agent
+    end
+    client["client"] -->|"HTTP / SSE"| gateway["gateway :8000"]
+    gateway -->|"SSE"| api
+    catalog["catalog"] --> catOutbox["catalog outbox"] --> relay["outbox-relay"] --> kafka[("Kafka")]
+    kafka -->|"catalog.product.published<br/>catalog.product.updated<br/>catalog.product.unpublished"| indexer["indexer-worker<br/>(assistant code, §3.1.1.4, runtime RFC 0001)<br/>1 read search_document<br/>2 render → chunk<br/>3 hash → cache lookup<br/>4 embed misses (batched)<br/>5 upsert/prune + index_state"]
+    indexer --> db[("assistant_db (PostgreSQL 16 + pgvector)<br/>product_chunks · embedding_cache · index_state · query_log<br/>conversations · messages<br/>generations · token_budgets · bulk_generation_jobs · prompt_templates<br/>outbox · processed_events")]
+    api --> db
+    agent -->|"live hydration (read-only public APIs)"| live["catalog · inventory"]
+    agent --> provider["embedding + LLM provider"]
+    indexer --> provider
+    db -->|"outbox → outbox-relay"| kafkaOut[("Kafka: assistant.interaction")]
+    kafkaOut --> analytics["analytics"]
+    celery["celery-worker<br/>queue: assistant_bulk"] -->|"bulk generation, budget reconciliation, sweeps"| db
 ```
 
 **Flow 3 — Assistant query** (the third critical flow in [RFC 0000](0000-architecture.md#3116-critical-flows)).
 
-```
-customer        gateway       assistant        vector store      catalog       LLM
-   │               │              │                 │               │           │
-   │ POST /assistant/chat (SSE)   │                 │               │           │
-   ├──────────────▶├─────────────▶│                 │               │           │
-   │               │              │ embed query ────┼───────────────┼──────────▶│
-   │               │              │ top-k search ──▶│               │           │
-   │               │              │◀── chunks ──────┤               │           │
-   │               │              │ hydrate live price/stock ──────▶│           │
-   │               │              │ assemble prompt + history       │           │
-   │               │              ├─────────────────┼───────────────┼──────────▶│
-   │◀═══ token stream (SSE) ══════┤◀════════════════┼═══════════════┼═══════════┤
-   │               │              │ persist message, emit usage event           │
+```mermaid
+sequenceDiagram
+    participant C as customer
+    participant G as gateway
+    participant A as assistant
+    participant V as vector store (assistant_db)
+    participant K as catalog
+    participant L as LLM / embedding provider
+    C->>G: POST /assistant/chat (SSE)
+    G->>A: forward
+    A->>L: embed query
+    A->>V: top-k search
+    V-->>A: chunks
+    A->>K: hydrate live price/stock
+    Note over A: assemble prompt + history
+    A->>L: generate
+    L-->>A: token stream
+    A-->>G: token stream (SSE)
+    G-->>C: token stream (SSE)
+    Note over A: persist message, emit usage event
 ```
 
 Live availability is hydrated from `inventory` alongside price from `catalog` (D9); the diagram names only the catalog column for brevity.
@@ -274,24 +254,47 @@ Two rejected candidates land here: **`search`** (no owned state — the index is
 
 **Internal module layout** (the [RFC 0000 module structure](0000-architecture.md#3117-module-structure-inside-a-service), instantiated).
 
+Planned entities ([file-structure.md §5](../file-structure.md#5-per-service-differences)): `search/` (`product_chunks`, `embedding_cache`, `index_state`, `query_log`), `chat/` (`conversations`, `messages`), `generations/` (`generations`, `token_budgets`, `bulk_generation_jobs`) and `prompts/` (`prompt_templates`). `app/router.py` owns `/api/v1` and the entity prefixes: `search/v1` is mounted at `/search`; `chat/v1` and `generations/v1` are both mounted at `/assistant`, since the public URLs share that prefix. `prompts/` has no HTTP surface, so it has no `v1/`.
+
 ```
 services/assistant/
+├── main.py                    create_application(); the service is also the indexer-worker entry point (RFC 0001)
+├── alembic.ini
+├── alembic/versions/          0001_create_vector_extension … 0004_generation_tables (§3.1.3)
 ├── app/
-│   ├── api/v1/
-│   │   ├── router.py          every route: /api/v1/search/*, /api/v1/assistant/*
-│   │   ├── search.py          handlers: /api/v1/search/*   (retrieval)
-│   │   ├── chat.py            handlers: /api/v1/assistant/chat*, conversations, messages
-│   │   ├── generate.py        handlers: /api/v1/assistant/generate*, generations
-│   │   └── usage.py           handlers: /api/v1/assistant/usage*
-│   ├── services/
-│   │   ├── retrieval/
-│   │   │   ├── renderer.py    structured record → prose (D5)
-│   │   │   ├── chunker.py     typed chunks, identity prefix, bounds
-│   │   │   ├── embeddings.py  EmbeddingProvider protocol + real/disk-cached/fake (D10)
-│   │   │   ├── cache.py       content-hash cache (D6)
-│   │   │   ├── vector_store.py VectorStore protocol: upsert/search/delete_by_product/count
-│   │   │   ├── search.py      dense, keyword, RRF fusion, grouping, hydration (D4, D7–D9)
-│   │   │   └── indexing.py    per-event index/remove logic, reindex
+│   ├── router.py              includes only: /api/v1 + /search (search), /assistant (chat, generations)
+│   ├── models.py              imports every entity's ORM models onto one metadata
+│   ├── seed.py                seeds prompt_templates from ops/prompts/ (`make seed`)
+│   ├── core/
+│   │   ├── config.py          EMBEDDING_*, LLM_*, CHUNK_*, budgets, bounds (§3.1.1.6)
+│   │   ├── db.py              Database factory, get_db
+│   │   ├── logger.py
+│   │   ├── dependencies.py    principal from the verified JWT, role guards
+│   │   ├── security.py        local RS256 verification (A4 / A5)
+│   │   ├── errors.py          DomainError subclasses (problem types)
+│   │   ├── enums.py           ContentType (shared by generations/ and prompts/)
+│   │   ├── safety.py          sanitisation, injection scan, output filter (E8) — used by search/, chat/, generations/
+│   │   ├── schemas.py
+│   │   └── utils.py
+│   ├── health/routes.py
+│   ├── search/                product_chunks, embedding_cache, index_state, query_log
+│   │   ├── models.py
+│   │   ├── repo.py            SearchRepo: dense, keyword, RRF fusion, grouping, hydration, query_log (D4, D7–D9)
+│   │   ├── indexing_repo.py   per-event index/remove logic, reindex (§3.1.1.4)
+│   │   ├── cache_repo.py      content-hash embedding cache (D6)
+│   │   ├── vector_store.py    VectorStore protocol: upsert/search/delete_by_product/count
+│   │   ├── renderer.py        structured record → prose (D5)
+│   │   ├── chunker.py         typed chunks, identity prefix, bounds
+│   │   ├── enums.py           ChunkType, IndexStatus, SearchMode
+│   │   ├── utils.py           index_state transition table (AST-7), RRF arithmetic; no I/O
+│   │   ├── dependencies.py
+│   │   └── v1/
+│   │       ├── routes.py      /api/v1/search/*
+│   │       └── schemas.py
+│   ├── chat/                  conversations, messages
+│   │   ├── models.py
+│   │   ├── repo.py            ConversationRepo: persistence, windowed memory, rolling summary (E9)
+│   │   ├── enums.py           MessageRole, Intent, FinishReason
 │   │   ├── agent/
 │   │   │   ├── state.py       typed graph state (E2)
 │   │   │   ├── nodes/         guard, load_memory, classify, retrieve, compare,
@@ -299,20 +302,35 @@ services/assistant/
 │   │   │   │                  assemble_context, generate, persist
 │   │   │   ├── graph.py       customer graph + merchant generation graph
 │   │   │   └── streaming.py   astream_events → typed SSE events (E3, E5)
-│   │   ├── llm/               LLMProvider protocol + real/cassette/scripted-fake (E11)
-│   │   ├── prompts.py         prompt_templates lookup and rendering
-│   │   ├── budgets.py         Redis fast path + token_budgets reconciliation (E10)
-│   │   ├── safety.py          sanitisation, injection scan, output filter (E8)
-│   │   └── clients/           catalog, inventory HTTP clients (live lookups)
+│   │   ├── dependencies.py
+│   │   └── v1/
+│   │       ├── routes.py      /api/v1/assistant/chat*, /conversations*, /messages/{id}/feedback
+│   │       └── schemas.py
+│   ├── generations/           generations, token_budgets, bulk_generation_jobs
+│   │   ├── models.py
+│   │   ├── repo.py            GenerationRepo: ownership check, drafts, applied false → true
+│   │   ├── bulk_repo.py       BulkGenerationJobRepo: job creation, counters, cancellation
+│   │   ├── budget_repo.py     Redis fast path + token_budgets reconciliation (E10)
+│   │   ├── enums.py           BulkJobStatus
+│   │   ├── utils.py           BulkJobStatus transition table; no I/O
+│   │   ├── dependencies.py
+│   │   └── v1/
+│   │       ├── routes.py      /api/v1/assistant/generate*, /generations*, /usage*
+│   │       └── schemas.py
+│   ├── prompts/               prompt_templates (no HTTP surface, so no v1/)
+│   │   ├── models.py
+│   │   └── repo.py            active-version lookup and rendering
+│   ├── clients/
+│   │   ├── catalog.py         live lookups and ownership reads (R5 / A13)
+│   │   ├── inventory.py       live availability lookups
+│   │   ├── embeddings.py      EmbeddingProvider protocol + real/disk-cached/fake (D10)
+│   │   └── llm.py             LLMProvider protocol + real/cassette/scripted-fake (E11)
 │   ├── consumers/
-│   │   └── product_events.py  thin handler → services.retrieval.indexing
-│   ├── tasks/                 Celery: bulk generation, reconciliation, sweeps
-│   ├── models/  schemas/  core/
-│   └── domain/enums.py        ChunkType, IndexStatus, SearchMode, MessageRole,
-│                              Intent, FinishReason, ContentType, BulkJobStatus
+│   │   └── product_events.py  thin handler → search/indexing_repo.py
+│   └── tasks/                 Celery: bulk generation, reindex, reconciliation, sweeps
 ├── eval/                      retrieval set (30 queries), answer sets (25 conv.,
 │                              8 vague, adversarial, injection)
-└── alembic/
+└── tests/                     unit/<entity>/, integration/<entity>/, test_migrations.py
 ops/prompts/                   template sources seeded into prompt_templates
 ```
 
@@ -332,24 +350,19 @@ ops/prompts/                   template sources seeded into prompt_templates
 
 **Chunk model — the chunking strategy.** A product is not a document; it is a record with fields of very different character. Chunking it as if it were prose loses the structure that makes it findable.
 
-```
-  product + variants + category + merchant   (from search_document)
-                │
-                ▼
-   render to natural language (D5)
-                │
-    ┌───────────┼────────────┬─────────────┬──────────────┐
-    ▼           ▼            ▼             ▼              ▼
- identity   description   attributes    variants      category
- chunk      chunk(s)      chunk         chunk         chunk
- (always)   (split if     (rendered     (rendered     (path +
-            > 512 tok,    from jsonb)   options)      siblings)
-            80 tok
-            overlap)
-                │
-                ▼
-  every chunk is prefixed with the product's identity line:
-  "PRODUCT: Acme Runner X1 | BRAND: Acme | CATEGORY: Footwear > Running"
+```mermaid
+flowchart TB
+    src["product + variants + category + merchant<br/>(from search_document)"] --> render["render to natural language (D5)"]
+    render --> c1["identity chunk<br/>(always)"]
+    render --> c2["description chunk(s)<br/>split if > 512 tok, 80 tok overlap"]
+    render --> c3["attributes chunk<br/>rendered from jsonb"]
+    render --> c4["variants chunk<br/>rendered options"]
+    render --> c5["category chunk<br/>path + siblings"]
+    c1 --> prefix
+    c2 --> prefix
+    c3 --> prefix
+    c4 --> prefix
+    c5 --> prefix["every chunk is prefixed with the product's identity line:<br/>PRODUCT: Acme Runner X1 | BRAND: Acme | CATEGORY: Footwear > Running"]
 ```
 
 - **Identity prefix on every chunk.** A chunk reading "Machine washable, 280g" is unretrievable and, worse, unusable as context because nothing says what it describes. The prefix costs tokens (~30 per chunk) and buys both.
@@ -379,34 +392,17 @@ ops/prompts/                   template sources seeded into prompt_templates
 
 **Search pipeline, per query.**
 
-```
-  query: "affordable running shoes for beginners"
-   + filters {category_id?, min_price?, max_price?, merchant_id?}
-        │
-        ├─▶ embed query (cached by hash; typical queries repeat)
-        │        │
-        │        ▼
-        │   dense: pgvector cosine, HNSW, pre-filtered on
-        │          product_status = 'published' + optional filters (D8)
-        │          → top 50 chunks
-        │
-        └─▶ keyword: Postgres full-text over search_vector,
-                     same WHERE clause
-                     → top 50 chunks
-                        │
-                        ▼
-              Reciprocal Rank Fusion (D7)
-                 score = Σ w_i / (k + rank_i),  k = 60
-                        │
-                        ▼
-              group chunks → products, keep best chunk per product  (D4)
-                        │
-                        ▼
-              hydrate live price and availability                  (D9)
-                        │
-                        ▼
-              top N products, each with its matching chunk,
-              scores, and the reason it matched
+```mermaid
+flowchart TB
+    q["query: affordable running shoes for beginners<br/>+ filters: category_id?, min_price?, max_price?, merchant_id?"]
+    q --> emb["embed query<br/>(cached by hash, typical queries repeat)"]
+    emb --> dense["dense: pgvector cosine, HNSW<br/>pre-filtered on product_status = 'published' + optional filters (D8)<br/>→ top 50 chunks"]
+    q --> kw["keyword: Postgres full-text over search_vector<br/>same WHERE clause<br/>→ top 50 chunks"]
+    dense --> rrf["Reciprocal Rank Fusion (D7)<br/>score = Σ w_i / (k + rank_i), k = 60"]
+    kw --> rrf
+    rrf --> group["group chunks → products<br/>keep best chunk per product (D4)"]
+    group --> hyd["hydrate live price and availability (D9)"]
+    hyd --> out["top N products, each with its matching chunk,<br/>scores, and the reason it matched"]
 ```
 
 - **Pre-filters**, all in the SQL `WHERE`: `product_status = 'published'` always (the projection that also excludes suspended merchants' products — Q6 (0004)); `category_id`, `merchant_id`, and `price BETWEEN min_price AND max_price` on the index-time price snapshot when supplied. The composite `(product_status, category_id)` index serves the commonest pair. The source pipeline also names a `merchant_active` pre-filter; `product_chunks` carries no such column, and suspension is enforced through `product_status` (the suspended merchant's products are unpublished and their chunks removed), so no separate predicate exists.
@@ -435,51 +431,25 @@ ops/prompts/                   template sources seeded into prompt_templates
 
 **The customer graph.**
 
-```
-                        ┌──────────────┐
-   user message ───────▶│    guard     │  length, rate, token budget,
-                        └──────┬───────┘  input sanitisation, injection scan
-                               │
-                    blocked ◀──┤──▶ ok
-                               ▼
-                        ┌──────────────┐
-                        │  load_memory │  last 6 turns + rolling summary (E9)
-                        └──────┬───────┘
-                               ▼
-                        ┌──────────────┐
-                        │  classify    │  one cheap structured call:
-                        └──────┬───────┘  intent + is_specific_enough
-                               │          + extracted filters + refers_to_prior
-             ┌─────────────┬───┴────┬──────────────┬─────────────┐
-             ▼             ▼        ▼              ▼             ▼
-      product_search   compare   too_vague   out_of_scope   follow_up
-             │             │        │              │             │
-             ▼             ▼        ▼              ▼             ▼
-        ┌────────┐   ┌─────────┐ ┌────────┐  ┌─────────┐  ┌──────────┐
-        │retrieve│   │retrieve │ │clarify │  │ refuse  │  │ resolve  │
-        │        │   │ ×N      │ │        │  │         │  │ against  │
-        └───┬────┘   └────┬────┘ └───┬────┘  └────┬────┘  │ prior    │
-            │             │          │            │       │ results  │
-            ▼             ▼          │            │       └────┬─────┘
-        ┌─────────────────────┐      │            │            │
-        │  hydrate live       │      │            │            │
-        │  price + stock      │◀─────┼────────────┼────────────┘
-        └──────────┬──────────┘      │            │
-                   ▼                 │            │
-        ┌─────────────────────┐      │            │
-        │  assemble_context   │      │            │
-        │  delimited, labelled│      │            │
-        │  token-bounded (E8) │      │            │
-        └──────────┬──────────┘      │            │
-                   ▼                 ▼            ▼
-              ┌────────────────────────────────────┐
-              │        generate (streaming)        │
-              └──────────────────┬─────────────────┘
-                                 ▼
-              ┌────────────────────────────────────┐
-              │ persist message · update summary   │
-              │ emit assistant.interaction (E13)   │
-              └────────────────────────────────────┘
+```mermaid
+flowchart TB
+    msg(["user message"]) --> guard["guard<br/>length, rate, token budget,<br/>input sanitisation, injection scan"]
+    guard -->|blocked| blocked(["blocked"])
+    guard -->|ok| mem["load_memory<br/>last 6 turns + rolling summary (E9)"]
+    mem --> cls{"classify<br/>one cheap structured call:<br/>intent + is_specific_enough<br/>+ extracted filters + refers_to_prior"}
+    cls -->|product_search| ret["retrieve"]
+    cls -->|compare| retn["retrieve ×N"]
+    cls -->|too_vague| clar["clarify"]
+    cls -->|out_of_scope| ref["refuse"]
+    cls -->|follow_up| res["resolve against prior results"]
+    ret --> hyd["hydrate live price + stock"]
+    retn --> hyd
+    res --> hyd
+    hyd --> asm["assemble_context<br/>delimited, labelled,<br/>token-bounded (E8)"]
+    asm --> gen["generate (streaming)"]
+    clar --> gen
+    ref --> gen
+    gen --> per["persist message · update summary<br/>emit assistant.interaction (E13)"]
 ```
 
 **Nodes.**
@@ -509,6 +479,14 @@ ops/prompts/                   template sources seeded into prompt_templates
 - **If no reasonable interpretation exists**, ask at most two targeted questions and offer categories to choose from.
 - **Never** return an empty result set with no explanation, and never ask more than two questions at once.
 
+```mermaid
+flowchart TB
+    c{"classifier: is_specific_enough?"} -->|yes| route["normal routing by intent"]
+    c -->|no| interp{"does a reasonable<br/>interpretation exist?"}
+    interp -->|yes| assume["take it and state the assumption,<br/>then retrieve and answer"]
+    interp -->|no| ask["ask at most two targeted questions<br/>and offer categories to choose from"]
+```
+
 The `too_vague` branch is the direct answer to Part B's requirement that vague queries be handled rather than failing. "Something for my mum" retrieves nothing useful; the honest response is a question about budget, interest, or occasion — and that is a designed path, not an apology in a prompt.
 
 **When retrieval returns nothing** (Q4 (0005), decided): say so and offer the nearest categories. Never generate a plausible product (G7 (0005)).
@@ -523,16 +501,16 @@ The `too_vague` branch is the direct answer to Part B's requirement that vague q
 
 **The merchant generation graph** is simpler and shares the guard, budget, and streaming machinery.
 
-```
-  merchant request (product_id, content_type, tone?, max_length?, keywords?)
-        │
-        ▼  guard: ownership check — the product must belong to the caller
-        ▼  load product + variants + category + top reviews-equivalent data
-        ▼  load sibling products for cross-sell, same merchant and category
-        ▼  select prompt template by content_type (active version)
-        ▼  generate (streaming)
-        ▼  output filter; persist as a generation record, emit assistant.interaction
-        ▼  return draft — the merchant applies it via catalog explicitly
+```mermaid
+flowchart TB
+    req(["merchant request<br/>product_id, content_type, tone?, max_length?, keywords?"]) --> own{"guard: ownership check<br/>does the product belong to the caller?"}
+    own -->|no| f403(["403"])
+    own -->|yes| load["load product + variants + category<br/>+ top reviews-equivalent data"]
+    load --> sib["load sibling products for cross-sell<br/>same merchant and category"]
+    sib --> tpl["select prompt template by content_type<br/>(active version)"]
+    tpl --> gen["generate (streaming)"]
+    gen --> filt["output filter, persist as a generation record,<br/>emit assistant.interaction"]
+    filt --> draft(["return draft: the merchant applies it via catalog explicitly"])
 ```
 
 - **Content types** (`ContentType`, [Part B](../part-b.md) §2B): `description`, `seo_title`, `faq`, `promotional`, `benefits_summary`, `cross_sell`.
@@ -544,7 +522,7 @@ The `too_vague` branch is the direct answer to Part B's requirement that vague q
 
 **Cost tracking and the cached-response path.** Every LLM call records `prompt_tokens`, `completion_tokens`, `model`, and `cost_usd` (from a configured per-model price table) on its `messages` / `generations` row and accumulates into `token_budgets` and `conversations.total_tokens`. The cached-response path from Q6 (0000) is **exact-match only** (Q7 (0005)): see AST-10.
 
-**Vocabularies** ([RFC 0000 S4](0000-architecture.md#3131-schema-conventions-s1s15)), every value, in `app/models/enums.py`:
+**Vocabularies** ([RFC 0000 S4](0000-architecture.md#3131-schema-conventions-s1s15)), every value, each in the `enums.py` of the entity that owns it: `app/search/enums.py` (`ChunkType`, `IndexStatus`, `SearchMode`), `app/chat/enums.py` (`MessageRole`, `Intent`, `FinishReason`), `app/generations/enums.py` (`BulkJobStatus`); `ContentType`, shared by `generations/` and `prompts/`, is in `app/core/enums.py`:
 
 | Enum | Values | Column(s) | Read policy |
 | --- | --- | --- | --- |
@@ -561,7 +539,7 @@ The `too_vague` branch is the direct answer to Part B's requirement that vague q
 
 ##### 3.1.1.3. State machines
 
-Three machines. Each is enforced by an explicit transition table in the service layer (S4); the column is `text`, and the type decorator is a backstop, not the gate. The sources fix the *values* of `IndexStatus` and the *transitions* of `BulkJobStatus`; the `index_state` transition table and the generation lifecycle below are **AST-7**, derived from the indexing pipeline and the SSE contract.
+Three machines. Each persisted machine is enforced by an explicit transition table in its entity's `utils.py` (`app/search/utils.py`, `app/generations/utils.py`), applied by that entity's repo (S4); the column is `text`, and the type decorator is a backstop, not the gate. The sources fix the *values* of `IndexStatus` and the *transitions* of `BulkJobStatus`; the `index_state` transition table and the generation lifecycle below are **AST-7**, derived from the indexing pipeline and the SSE contract.
 
 **1. `index_state.status` (`IndexStatus`)** — per product. `(new)` means no row exists.
 
@@ -579,6 +557,19 @@ Three machines. Each is enforced by an explicit transition table in the service 
 
 `removed` is not terminal: the row is kept so a late, older event is recognised as stale. `indexed` → `indexed` (a same-version redelivery) is a no-op absorbed by dedupe or the version check.
 
+```mermaid
+stateDiagram-v2
+    [*] --> pending: first published or updated for an unknown product, or a reindex batch
+    pending --> indexed: upsert-and-prune commits (version ≥ catalog_version, ≤ 12 chunks)
+    pending --> failed: retries exhausted, then DLQ
+    pending --> removed: unpublished while pending
+    indexed --> pending: newer updated version, embedding_model mismatch, admin reindex
+    indexed --> removed: unpublished, or updated with a non-published status (AST-5)
+    failed --> pending: DLQ replay, later event, or reindex
+    failed --> removed: unpublished
+    removed --> pending: republished with a newer version
+```
+
 **2. Generation / interaction lifecycle** — per chat message or merchant generation request. In memory, surfaced through `status` SSE events, persisted as `messages.finish_reason` (chat) or row presence (generation).
 
 | From | To | Trigger | Guard / persisted as |
@@ -595,6 +586,28 @@ Three machines. Each is enforced by an explicit transition table in the service 
 
 Terminal: `completed`, `refused`, `failed`, `cancelled`, `blocked`, `budget_exceeded`. **`generations.applied`** moves only `false → true`.
 
+```mermaid
+stateDiagram-v2
+    [*] --> received
+    received --> blocked: guard rejects (length, injection, rate)
+    received --> budget_exceeded: daily budget exhausted
+    received --> retrieving: classify routes to a retrieving intent
+    received --> generating: non-retrieving branch (clarify, refuse)
+    retrieving --> generating: sources emitted
+    generating --> completed: stream ends (stop or length)
+    generating --> refused: refuse branch or output filter blocks
+    retrieving --> failed: provider error, timeout, internal error
+    generating --> failed: provider error, timeout, internal error
+    retrieving --> cancelled: client disconnect
+    generating --> cancelled: client disconnect
+    completed --> [*]
+    refused --> [*]
+    failed --> [*]
+    cancelled --> [*]
+    blocked --> [*]
+    budget_exceeded --> [*]
+```
+
 **3. `bulk_generation_jobs.status` (`BulkJobStatus`)** — from [archive/0005 §3.1.3](archive/0005-ai-assistant-and-streaming.md#313-dataschema-changes).
 
 | From | To | Trigger | Who | Guard |
@@ -608,37 +621,73 @@ Terminal: `completed`, `refused`, `failed`, `cancelled`, `blocked`, `budget_exce
 
 `completed`, `partially_failed`, `failed`, `cancelled` are terminal; `finished_at` is set on entering any of them. `partially_failed` earns its place because the table carries both a `completed` and a `failed` counter — a job where some products generated and others did not is a state the schema anticipates, and collapsing it into `failed` would make the counters unreadable.
 
+```mermaid
+stateDiagram-v2
+    [*] --> queued: POST /assistant/generate/bulk
+    queued --> running: Celery task picks the job up
+    queued --> cancelled: owner cancels before start
+    running --> completed: all items processed, failed = 0
+    running --> partially_failed: all items processed, completed > 0 and failed > 0
+    running --> failed: all items failed, or the job aborts
+    running --> cancelled: owner cancels mid-run
+    completed --> [*]
+    partially_failed --> [*]
+    failed --> [*]
+    cancelled --> [*]
+```
+
 ##### 3.1.1.4. Workflows and async jobs
 
 No Temporal workflow runs in this service. Work off the request path is a Kafka consumer (the indexer) and Celery tasks.
 
 **Indexing logic — run by `indexer-worker`.** The worker's process model, consumer base class (dedupe on `event_id`, three in-process retries with exponential backoff, then `<topic>.dlq`), scaling to partition count, and Compose wiring are in [RFC 0001](0001-platform-and-shared-infrastructure.md). The handler logic, owned by this service:
 
+```mermaid
+flowchart TB
+    ev(["catalog.product.published / .updated"]) --> base["consumer base class:<br/>dedupe on event_id, retry, DLQ"]
+    base --> ver{"step 0: event version below<br/>index_state.catalog_version?"}
+    ver -->|"yes (AST-3)"| skip(["ack, skip"])
+    ver -->|no| st{"payload status = published?"}
+    st -->|"no: treat as unpublished (AST-5)"| rm
+    st -->|yes| load["step 1: load search_document from the event payload"]
+    load --> chunk["step 2: render → chunk → normalise (D5, chunking)"]
+    chunk --> hash["step 3: for each chunk sha256(model, text)"]
+    hash --> hit{"cache hit?"}
+    hit -->|"hit (D6)"| reuse["reuse vector, no API call"]
+    hit -->|miss| batch["step 4: embed misses in one batched call (≤ 96 per call)<br/>insert into embedding_cache"]
+    reuse --> tx
+    batch --> tx["step 5: one transaction<br/>insert processed_events (consumer_group, event_id) (S13)<br/>delete chunks for this product whose hash is no longer present<br/>upsert chunks with vectors + metadata<br/>update index_state: catalog_version, chunk_count, embedding_model,<br/>status = indexed, indexed_at<br/>commit"]
+    tx --> met["step 6: emit metrics<br/>chunks indexed, cache hit rate, tokens spent, index lag"]
+    un(["catalog.product.unpublished (and archival)"]) --> rm["one transaction: processed_events row,<br/>delete every chunk for that product,<br/>index_state.status = removed (G2 (0004))"]
 ```
-  catalog.product.published / .updated
-        │
-        │ consumer base class: dedupe on event_id, retry, DLQ
-        ▼
-  0. version check: if event version < index_state.catalog_version → ack, skip (AST-3)
-     status check: payload status ≠ published → treat as unpublished (AST-5)
-  1. load search_document from the event payload
-  2. render → chunk → normalise                        (D5, chunking)
-  3. for each chunk: sha256(model, text)
-        cache hit  → reuse vector, no API call         (D6)
-        cache miss → collect for batching
-  4. embed misses in one batched call (≤ 96 per call); insert into embedding_cache
-  5. transaction:
-        insert processed_events (consumer_group, event_id)   (S13)
-        delete chunks for this product whose hash is no longer present
-        upsert chunks with vectors + metadata
-        update index_state (catalog_version, chunk_count, embedding_model,
-                            status = indexed, indexed_at)
-     commit
-  6. emit metrics: chunks indexed, cache hit rate, tokens spent, index lag
 
-  catalog.product.unpublished (and archival)
-        → one transaction: processed_events row, delete every chunk for that
-          product, index_state.status = removed                 (G2 (0004))
+The same handler as a sequence, with the failure path:
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka
+    participant W as indexer-worker
+    participant DB as assistant_db
+    participant P as embedding provider
+    K->>W: catalog.product.published / .updated
+    W->>DB: dedupe check (processed_events) and index_state version check
+    alt duplicate or stale (AST-3)
+        W-->>K: ack, skip
+    else current
+        W->>W: render → chunk → sha256 per chunk
+        W->>DB: embedding_cache lookup by content_hash
+        DB-->>W: hits
+        W->>P: embed misses (batched, ≤ 96 per call)
+        alt provider down
+            P--xW: error
+            Note over W,K: handler raises, base class retries 3 times with backoff, then the topic's .dlq
+        else vectors returned
+            P-->>W: vectors
+            W->>DB: insert embedding_cache rows
+            W->>DB: transaction: processed_events, prune, upsert chunks, index_state = indexed
+            W-->>K: commit offset
+        end
+    end
 ```
 
 - Provider unavailable → the handler raises; the base class retries with backoff and the event waits in Kafka, then DLQ. A failed index leaves the product published and keyword-browsable in `catalog` — a degradation, not an outage.
@@ -646,6 +695,41 @@ No Temporal workflow runs in this service. Work off the request path is a Kafka 
 - Every indexing trace is linked to the publishing trace through the envelope's `traceparent`.
 
 **Reindex / backfill.** `make reindex` and `POST /api/v1/search/index/reindex` (full or scoped) run the same `index_product` logic in batches with a cursor, **resumable and idempotent**, safe to interrupt and restart. It is the only batch path, for products published before the indexer existed and for model changes (G8 (0004)). Because R1 forbids reading `catalog_db`, the batch source is `catalog`'s API (AST-4, AST-Q1). On a large corpus the HNSW build is the slow step and is run after the backfill rather than before, an order the reindex task enforces (drop the HNSW index, backfill, `CREATE INDEX CONCURRENTLY`). Reindex is asynchronous: `202` with a job id; progress is reported by `/search/index/status`.
+
+```mermaid
+sequenceDiagram
+    participant Adm as admin
+    participant A as assistant API
+    participant T as assistant.run_reindex (celery-worker)
+    participant Cat as catalog API
+    participant DB as assistant_db
+    Adm->>A: POST /api/v1/search/index/reindex (scope)
+    alt full reindex already running
+        A-->>Adm: 409
+    else accepted
+        A->>T: enqueue run_reindex(job_id, scope) on assistant_bulk
+        A-->>Adm: 202 + job_id and status URL
+        opt large corpus
+            T->>DB: drop the HNSW index
+        end
+        loop each batch, from the saved cursor
+            T->>Cat: paged listing of published products with search_document (AST-4, AST-Q1)
+            alt catalog down
+                Note over T,Cat: pause, resume later from the cursor
+            else batch returned
+                Cat-->>T: products
+                T->>DB: index_product per item (same logic as the indexer), save cursor
+            end
+        end
+        opt large corpus
+            T->>DB: CREATE INDEX CONCURRENTLY (HNSW)
+        end
+    end
+    Adm->>A: GET /api/v1/search/index/status
+    A-->>Adm: counts by IndexStatus, lag, active reindex job
+```
+
+`make reindex` runs the same task as a one-shot command, without the HTTP step.
 
 **Celery tasks** (hosted by `celery-worker`, [RFC 0001](0001-platform-and-shared-infrastructure.md)). Bulk generation has its own queue so a 200-product job cannot starve interactive chat. Task and queue names are **AST-11**.
 
@@ -661,22 +745,59 @@ No Temporal workflow runs in this service. Work off the request path is a Kafka 
 | `assistant.sweep_published_outbox` | `maintenance` | Celery Beat, daily | Covered by the platform outbox sweep ([RFC 0001](0001-platform-and-shared-infrastructure.md)); listed so the table is not forgotten |
 | `assistant.check_index_model` | startup | Service and worker start | Validates `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` against `index_state`; a mismatch logs a loud warning and marks the affected products stale (`indexed → pending`) rather than silently producing garbage similarity |
 
+**Bulk generation — the workflow (E12).**
+
+```mermaid
+sequenceDiagram
+    participant M as merchant
+    participant A as assistant API
+    participant R as Redis
+    participant DB as assistant_db
+    participant W as run_bulk_generation (celery-worker)
+    participant Cat as catalog
+    participant L as LLM provider
+    M->>A: POST /api/v1/assistant/generate/bulk + Idempotency-Key
+    A->>R: idempotency fast path lookup (AST-17)
+    alt key already used
+        A-->>M: 202 with the same job_id
+    else new key
+        A->>Cat: ownership check per product (merchant's token)
+        alt any product not owned
+            A-->>M: 403
+        else all owned
+            A->>DB: insert bulk_generation_jobs (status queued)
+            A->>W: enqueue on assistant_bulk
+            A-->>M: 202 + job_id, Location /api/v1/assistant/generate/jobs/id
+        end
+    end
+    W->>DB: queued → running
+    loop each product_id
+        W->>Cat: ownership re-check
+        W->>R: budget check (merchant user scope and global)
+        W->>L: generate (non-streaming)
+        L-->>W: content
+        W->>DB: output filter, insert generations row (bulk_job_id), completed or failed + 1, outbox row
+        W->>DB: cancelled? checked between items
+    end
+    W->>DB: terminal status + finished_at
+    M->>A: GET /api/v1/assistant/generate/jobs/id
+    A-->>M: status, completed, failed, total, generations
+```
+
 **Token budgets — the flow (E10, Q6 (0000)).**
 
+```mermaid
+flowchart TB
+    req(["request"]) --> guard["guard"]
+    guard --> per["per-request: context assembly bounded to LLM_CONTEXT_TOKEN_BUDGET,<br/>completion bounded to LLM_MAX_TOKENS"]
+    per --> fast{"Redis fast path: read ast:budget:scope:date<br/>for user:uuid (or ip:hash when anonymous) and global<br/>over limit?"}
+    fast -->|yes| r429(["429, Retry-After + reset time (next UTC midnight)"])
+    fast -->|no| llm["LLM call → actual prompt/completion tokens + cost"]
+    llm --> incr["INCRBY on both scopes (tokens, requests, cost)"]
+    incr --> beat["Beat task reconciles Redis → token_budgets every minute"]
 ```
-  request ─▶ guard
-             ├─ per-request: context assembly bounded to LLM_CONTEXT_TOKEN_BUDGET,
-             │               completion bounded to LLM_MAX_TOKENS
-             ├─ Redis fast path: read ast:budget:{scope}:{date} for
-             │     user:<uuid> (or ip:<hash> when anonymous) and global
-             │     over limit → 429, Retry-After + reset time (next UTC midnight)
-             ▼
-           LLM call ─▶ actual prompt/completion tokens + cost
-             ▼
-           INCRBY on both scopes (tokens, requests, cost)
-             ▼
-           Beat task reconciles Redis → token_budgets every minute
-```
+
+Keys are `ast:budget:{scope}:{date}` with `scope` one of `user:<uuid>`, `ip:<hash>` or `global` (AST-9).
 
 Redis loss degrades to Postgres: on a cache miss the counter is seeded from `token_budgets` for the day. Bulk generation draws on the merchant's `user:<uuid>` scope and the global scope item by item.
 
@@ -806,6 +927,46 @@ All routes are under `/api/v1`, reached through the gateway at `:8000` ([RFC 000
 
 Search is not idempotency-keyed — it creates no business state (the `query_log` row is a log). `POST` is used because the body carries filters.
 
+**`POST /api/v1/search/semantic` — the sequence.**
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant G as gateway
+    participant A as assistant
+    participant DB as assistant_db
+    participant P as embedding provider
+    participant Cat as catalog
+    participant Inv as inventory
+    C->>G: POST /api/v1/search/semantic
+    G->>A: forward (rate limited at the gateway)
+    A->>DB: embedding_cache lookup by query hash
+    opt cache miss
+        A->>P: embed query
+        P-->>A: vector, or error when the provider is down
+    end
+    alt query vector available
+        par dense leg
+            A->>DB: pgvector cosine (HNSW), pre-filtered WHERE, top 50 chunks
+        and keyword leg
+            A->>DB: full-text over search_vector, same WHERE, top 50 chunks
+        end
+        Note over A: RRF fusion, group by product, best chunk per product
+    else provider down (Q9 (0004))
+        A->>DB: keyword leg only
+        Note over A: degraded = keyword_only
+    end
+    par live price
+        A->>Cat: product read per result (bounded concurrency, AST-Q5)
+    and live availability
+        A->>Inv: GET /api/v1/inventory/variant_id
+    end
+    Note over A: on hydration failure price and in_stock are null, hydrated = false (AST-2)
+    A->>DB: insert query_log row
+    A-->>G: 200 items, mode, degraded
+    G-->>C: 200
+```
+
 **Customer — `/api/v1/assistant/*`**
 
 | Method | Path | Request | Response | Status codes |
@@ -832,6 +993,37 @@ Anonymous chat is allowed with a stricter rate limit and no persisted conversati
 | `POST` | `/api/v1/assistant/generations/{id}/applied` | — | `204`; sets `applied = true`. An acknowledgement only — it writes nothing to `catalog` (AST-12, proposed; AST-Q2) | `204`; `404` |
 
 Bulk generation is the one endpoint here that creates business state asynchronously, so it takes an `Idempotency-Key` ([RFC 0000 API conventions](0000-architecture.md#3122-api-conventions)) and returns `202` with a resource to poll, never a blocking wait.
+
+**`POST /api/v1/assistant/generate` — the sequence.**
+
+```mermaid
+sequenceDiagram
+    participant M as merchant
+    participant A as assistant
+    participant Cat as catalog
+    participant DB as assistant_db
+    participant L as LLM provider
+    M->>A: POST /api/v1/assistant/generate (via gateway)
+    A->>A: verify JWT, guard, budget check
+    A->>Cat: read product with the merchant's own token
+    alt catalog down
+        A-->>M: 503 problem detail (ownership cannot be verified)
+    else product merchant_id differs from the token's merchant claim
+        A-->>M: 403
+    else owner
+        A->>DB: sibling products via similar(product_id), same merchant and category
+        A->>DB: active prompt_templates row for content_type
+        A-->>M: 200 text/event-stream, status generating
+        A->>L: stream completion
+        loop per delta
+            L-->>A: delta
+            A-->>M: event token
+        end
+        A->>A: output filter
+        A->>DB: insert generations row + outbox row (one transaction)
+        A-->>M: event usage, then event done with generation_id
+    end
+```
 
 **Operational — `/api/v1/assistant/*`**
 
@@ -884,6 +1076,48 @@ data: {"message_id": "...", "conversation_id": "..."}
 - **Auth.** These are `POST` streams consumed with `fetch` streaming, not `EventSource`, so the bearer header works directly and the notification stream-ticket mechanism is not needed (AST-8). There is no `Last-Event-ID` resume: a dropped answer is re-asked; a completed answer is readable from `/conversations/{id}`.
 - **Bounds.** Per-request generation timeout, maximum completion tokens, concurrent-stream cap per instance (`503` + `Retry-After`).
 - `chat/sync` and `chat` produce equivalent content for the same input and seed.
+
+**`POST /api/v1/assistant/chat` — event order and failure paths.** Every response passes through the gateway, which must not buffer it; the gateway hop is omitted from the responses for readability.
+
+```mermaid
+sequenceDiagram
+    participant C as client (fetch streaming)
+    participant G as gateway
+    participant A as assistant
+    participant R as Redis
+    participant DB as assistant_db
+    participant L as LLM provider
+    C->>G: POST /api/v1/assistant/chat + bearer
+    G->>A: forward (no buffering, no compression)
+    A->>A: verify JWT (A4 / A5), guard
+    A->>R: rate and budget check
+    alt blocked or over budget
+        A-->>C: 422 or 429 problem detail, no stream opened
+    else stream cap reached
+        A-->>C: 503 + Retry-After
+    else accepted
+        A-->>C: 200 text/event-stream
+        A-->>C: event status retrieving
+        Note over A,DB: load_memory, classify, retrieve, hydrate, assemble_context
+        A-->>C: event status generating
+        A-->>C: event sources (before the first token)
+        A->>L: stream completion
+        loop per delta
+            L-->>A: delta
+            A-->>C: event token
+        end
+        A->>DB: messages row + outbox row (one transaction)
+        A-->>C: event usage
+        A-->>C: event done (message_id, conversation_id)
+    end
+    opt provider error after the stream opened
+        A-->>C: event error (RFC 9457 body), then clean close
+    end
+    opt client disconnects
+        A->>L: cancel the provider stream
+        A->>DB: partial message, finish_reason = error (AST-Q3)
+    end
+```
 
 **Rate limits** (enforced by `gateway`, [RFC 0002](0002-gateway-service.md), on top of token budgets): search — 20 per minute per IP, 60 per authenticated user; assistant messages — 10/min authenticated, 3/min anonymous; merchant generation — 20 generations/hour per merchant. The gateway must not buffer `text/event-stream` responses: proxy streaming, no response compression, and an extended read timeout for assistant routes.
 
@@ -977,6 +1211,140 @@ Owned by `assistant` · **PostgreSQL 16 with the `vector` extension** (pgvector 
 | [`bulk_generation_jobs`](#bulk_generation_jobs) | Batch generation |
 | [`prompt_templates`](#prompt_templates) | Versioned prompts |
 | `outbox` `‡` · `processed_events` | S12 / S13 — shared DDL, see below |
+
+**Entity relationships.** Solid lines are in-database foreign keys; dotted lines are logical links with no FK (same key, enforced by the indexer). The shared `outbox` and `processed_events` tables are omitted (DDL in RFC 0000). Column lists are summarised; the tables below are authoritative.
+
+```mermaid
+erDiagram
+    index_state ||..o{ product_chunks : "product_id (logical, no FK)"
+    embedding_cache ||..o{ product_chunks : "content_hash (logical)"
+    conversations ||--o{ messages : "conversation_id, ON DELETE CASCADE"
+    bulk_generation_jobs |o--o{ generations : "bulk_job_id (nullable)"
+
+    product_chunks {
+        uuid id PK
+        uuid product_id "indexed, no FK (catalog)"
+        uuid merchant_id "snapshot, pre-filter"
+        uuid category_id "snapshot, pre-filter"
+        int chunk_index
+        text chunk_type "ChunkType"
+        text content "includes identity prefix"
+        text content_hash "unique with product_id"
+        vector embedding "vector(1536), HNSW cosine"
+        int token_count
+        tsvector search_vector "generated from content, GIN"
+        text product_status "projection"
+        numeric price "numeric(12,2) snapshot, range pre-filter only"
+        text currency "char(3)"
+        jsonb metadata
+        timestamptz indexed_at
+    }
+    embedding_cache {
+        text content_hash PK "sha256(model, normalised text)"
+        text model
+        vector embedding "vector(1536)"
+        int token_count
+        int hit_count
+        timestamptz created_at
+        timestamptz last_used_at "LRU eviction input"
+    }
+    index_state {
+        uuid product_id PK
+        int catalog_version "products.version indexed"
+        int chunk_count
+        text embedding_model
+        text status "IndexStatus"
+        text error "nullable"
+        timestamptz indexed_at
+        timestamptz updated_at
+    }
+    query_log {
+        uuid id PK
+        text query_text
+        jsonb filters
+        text mode "SearchMode"
+        uuid_array result_product_ids "uuid[]"
+        int result_count
+        int latency_ms
+        bool embedding_cached
+        uuid user_id "nullable, anonymised after 90 days"
+        text correlation_id
+        timestamptz created_at
+    }
+    conversations {
+        uuid id PK
+        uuid user_id "nullable for anonymous"
+        text session_id
+        text title
+        text summary "rolling summary"
+        int message_count
+        int total_tokens
+        timestamptz last_message_at
+        timestamptz created_at
+    }
+    messages {
+        uuid id PK
+        uuid conversation_id FK
+        text role "MessageRole"
+        text content
+        text intent "Intent"
+        jsonb sources "grounding record"
+        int prompt_tokens
+        int completion_tokens
+        text model
+        numeric cost_usd "numeric(10,6)"
+        int latency_ms
+        int time_to_first_token_ms
+        text finish_reason "FinishReason"
+        bool feedback_helpful
+        text feedback_comment
+        text correlation_id
+        timestamptz created_at
+    }
+    generations {
+        uuid id PK
+        uuid merchant_id
+        uuid product_id "no FK (catalog)"
+        text content_type "ContentType"
+        jsonb parameters
+        text content
+        int prompt_tokens
+        int completion_tokens
+        numeric cost_usd "numeric(10,6)"
+        text model
+        bool applied "false then true only"
+        uuid bulk_job_id FK "nullable"
+        timestamptz created_at
+    }
+    token_budgets {
+        text scope PK "user:uuid, ip:hash or global"
+        date date PK "UTC day"
+        int tokens_used
+        int requests
+        numeric cost_usd "numeric(10,6)"
+        timestamptz updated_at
+    }
+    bulk_generation_jobs {
+        uuid id PK
+        uuid merchant_id
+        text content_type "ContentType"
+        uuid_array product_ids "uuid[]"
+        text status "BulkJobStatus"
+        int completed
+        int failed
+        timestamptz created_at
+        timestamptz finished_at "nullable until terminal"
+    }
+    prompt_templates {
+        uuid id PK
+        text content_type "ContentType, null for the system prompt"
+        text name
+        int version "unique with content_type, name"
+        text body
+        bool is_active "one active per content_type, name"
+        timestamptz created_at
+    }
+```
 
 **Markers** (from [archive/0006](archive/0006-service-decomposition-and-data-model.md#313-dataschema-changes)). Both are **proposals for review**, not decisions already taken — a reviewer who disagrees with a marked cell is disagreeing with the consolidation, not with the design RFC it came from.
 
@@ -1278,6 +1646,43 @@ Ordered so retrieval quality is measurable before it is optimised (the evaluatio
 | Review of the retrieval and generation halves | M7 — Part B Review |
 
 ### 3.2. Rationale
+
+#### 3.2.1. Decision register
+
+This RFC already carries ID'd decisions (D1–D12, E1–E14, AST-1–AST-18). They keep their IDs; the register gives one row per significant design decision, and the Decision cell names the existing IDs it covers (“= D1”). Register IDs are `AST-Dn`, distinct from the consolidation decisions `AST-n` in [§3.2.2](#322-consolidation-decisions-and-rationale).
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| AST-D1 | `assistant` is one service with two routers, retrieval and generation (= D12) | Both halves share the chunk store, the embedding client and the conversation store. Neither passes the ownership test alone ([§3.1.1.1](#3111-responsibility-and-boundaries), [§3.2.2](#322-consolidation-decisions-and-rationale)) | Separate `retrieval` and `generation` services: a network hop per query for no ownership gain ([§5](#5-alternate-solutions) Alt 15) | One half gains state or a consumer the other does not need |
+| AST-D2 | Vectors in pgvector inside `assistant_db`, owned by `assistant` (= D1, D2) | Metadata filters and similarity run in one query with one consistency model. The corpus is tens of thousands of chunks. No new container ([§3.2.2](#322-consolidation-decisions-and-rationale)) | Qdrant / Weaviate / Milvus: post-filtering or replicating catalog metadata. Elasticsearch: JVM footprint, second copy of product text. Managed vector service: external account ([§5](#5-alternate-solutions) Alt 1, 2, 7) | Corpus grows by two orders of magnitude, or recall or latency disappoints against the evaluation set |
+| AST-D3 | Indexing is a Kafka consumer of `catalog.product.*`, run by `indexer-worker` (= D3) | `catalog` must not know a retrieval layer exists. The event and the dedupe/DLQ base class already exist, and a failed index is a degradation, not an outage ([§3.1.1.4](#3114-workflows-and-async-jobs)) | Polling `catalog_db`: violates R1, minutes of staleness. Synchronous call from `catalog`: couples publish latency and availability to the assistant ([§5](#5-alternate-solutions) Alt 6) | `catalog` stops publishing product lifecycle events |
+| AST-D4 | Index freshness is a per-product state machine with a version check. A stale event is skipped, and an `.updated` event that is not `published` removes the product's chunks (= AST-3, AST-5, AST-7) | A DLQ redrive or replay must not overwrite a newer index. Visibility must fail closed (G7 (0004)) ([§3.1.1.3](#3113-state-machines)) | Last-write-wins upserts: an old event can bring back stale or unpublished content | `catalog` adds a dedicated archived topic |
+| AST-D5 | The chunk is the indexed unit and the product is the retrieved unit. Typed chunks with an identity prefix, target 256 / max 512 / overlap 80 tokens, at most 12 per product (= D4) | Customers ask about products. A bare-attribute chunk is unretrievable and invites cross-product attribution. The bound stops one merchant dominating the index ([§3.1.1.2](#3112-domain-model)) | One vector per product: diffuse, and no matched passage to cite ([§5](#5-alternate-solutions) Alt 5) | The tuning pass shows other sizes score better (Q8 (0004)) |
+| AST-D6 | Structured fields are rendered to prose before embedding (= D5) | Embedding models are trained on natural language. The cheapest large gain in the pipeline ([§3.2.2](#322-consolidation-decisions-and-rationale)) | Embedding the raw JSON record: lands nowhere useful in the vector space | The evaluation shows no gain from rendering |
+| AST-D7 | Embedding cache keyed by `sha256(model, normalised text)`, also used for query embeddings (= D6, Q7 (0004)) | An edit re-embeds only the changed chunks, an unchanged reindex costs nothing, and repeated queries skip the provider (G4 (0004)) | Cache keyed by product id: any edit invalidates everything | Cache growth outpaces LRU eviction |
+| AST-D8 | `text-embedding-3-small` (1536 dims) with HNSW (`m = 16`, `ef_construction = 64`). Model and dimension recorded in `index_state` and checked at startup (Q1, Q2 (0004)) | Cheap, strong and widely benchmarked. HNSW gives better recall at this size, needs no training step and no rebuild as the corpus grows. A mismatch marks the index stale instead of silently returning garbage ([§3.1.1.2](#3112-domain-model)) | IVFFlat: list count keeps needing revision during reindexing. Local sentence-transformers by default: a container, ~400 MB, CPU latency (Q3 (0004)) | Provider access fails, or the evaluation favours another model |
+| AST-D9 | Hybrid retrieval: dense + Postgres full-text, fused with RRF, `k = 60` (= D7) | Dense is weak on SKUs and brand names. Keyword is weak on vague intent. RRF fuses ranks, so the two scores never need normalising ([§3.2.2](#322-consolidation-decisions-and-rationale)) | Dense only: misses exact identifiers. Keyword + LLM query expansion: an LLM call on every search. A reranker: deferred until measured (Q5 (0004), [§5](#5-alternate-solutions) Alt 3, 4) | Hybrid stops beating both single modes (drop it), or Recall@20 is high but Recall@5 low (add a reranker) |
+| AST-D10 | Filters are applied in the SQL `WHERE` before the vector scan, and `product_status = 'published'` is always one of them (= D8) | Post-filtering shrinks top-k below k and can return nothing when matches exist. Visibility is enforced in the query ([§6.2](#62-security-considerations)) | Post-filtering after retrieval | A vector store swap that cannot pre-filter |
+| AST-D11 | Price and stock are hydrated live at read time and never embedded. Hydration degrades to `hydrated: false` rather than blocking (= D9, AST-2) | Volatile facts would make the index wrong within minutes and force a reindex on every price edit. A stale price must never be shown as current ([§3.1.1.5](#3115-dependencies-and-degradation)) | Embedding price and stock. Failing the request when `catalog` or `inventory` is down | One call per product proves too slow (AST-Q5, batch read) |
+| AST-D12 | Embedding and LLM providers sit behind interfaces with real, cached/cassette and deterministic fake implementations (= D10, E11) | No test makes a network call or costs money, and every graph branch can be reached on demand | Tests against the live provider: cost and flakiness | — |
+| AST-D13 | Quality is measured: a 30-query retrieval set (`make evaluate`) and a 25-conversation rubric plus adversarial and injection sets (`make evaluate-answers`) (= D11, E14) | A confident answer about the wrong product is not an error and is invisible from generation. The numbers say which half failed ([§3.2.2](#322-consolidation-decisions-and-rationale)) | Judging by demos and impressions | The sets prove too small to separate options (Q4 (0004)) |
+| AST-D14 | The customer path is an explicit LangGraph graph with pure-function nodes. Retrieval is a node the classifier routes to (= E1, E2, E6) | The path really branches (vague, compare, refuse, follow-up). Each branch becomes a testable edge, and the route is stored on every message ([§3.2.2](#322-consolidation-decisions-and-rationale)) | Linear chain or direct calls: branches hidden in prompt conditionals. Model-driven tool calling: non-deterministic, more round trips, wider injection surface ([§5](#5-alternate-solutions) Alt 8, 9) | The graph's branches are proven and unanticipated queries dominate. Tool calling is the next step |
+| AST-D15 | Vague queries get a designed `too_vague` branch: state an assumption, or ask at most two questions. Empty retrieval says so and offers categories (G2, Q4 (0005)) | Part B names vague queries. Weak context produces confident wrong answers ([§3.2.2](#322-consolidation-decisions-and-rationale)) | Retrieving anyway on low-scoring chunks. Returning an unexplained empty result | Classifier intent accuracy falls below 90% |
+| AST-D16 | Grounding is structural: only provided context, labelled by product id, citations required, sources returned (= E7) | A "do not hallucinate" instruction is not a control. A citation check is mechanical (G1 (0005)) | A prompt instruction alone. Generating without retrieval ([§5](#5-alternate-solutions) Alt 12) | — |
+| AST-D17 | Merchant text is fenced as data, with layered injection defences: sanitise and scan at index time, delimit and preamble at assembly, scan at guard, filter output (= E8) | Any merchant can plant instructions that reach other customers' prompts. No single layer is enough ([§6.2](#62-security-considerations)) | A single defence such as a system-prompt warning | The injection set finds a technique that passes every layer |
+| AST-D18 | The assistant is read-only and never reads orders or PII (Q2 (0005)) | Write access would turn every injection bug into a business-integrity bug. Purchase history in a public assistant is a privacy decision nothing asks for ([§3.2.2](#322-consolidation-decisions-and-rationale)) | Agentic actions (placing orders, editing products). Personalisation from order history | A requirement for actions or personalisation appears |
+| AST-D19 | Streaming is end to end over SSE, `POST` + `fetch` with bearer auth, typed events, `sources` before the first token, no resume (= E3, E4, E5, AST-8) | Traffic is one-way and request-scoped. SSE reuses the gateway, auth and tracing. Sources first means a mid-stream failure still delivers products ([§3.2.2](#322-consolidation-decisions-and-rationale)) | WebSockets: stateful gateway path and own handshake ([§5](#5-alternate-solutions) Alt 11). `EventSource` + stream ticket: cannot `POST`. Buffer and replay: no latency gain | A client→server message mid-stream becomes a need |
+| AST-D20 | Memory is the last 6 turns verbatim plus a rolling summary plus the current retrieval (= E9) | Unbounded history is a cost and latency problem and eventually a context-window failure | Full history every turn | The conversation set shows 6 turns is wrong (Q6 (0005)) |
+| AST-D21 | Token budgets at three levels (per request, per user/IP per day, global per day). Redis is the fast path and `token_budgets` the durable record, reconciled every minute (= E10, AST-9) | A public endpoint that calls a paid API is a denial-of-wallet target. The worst case becomes a `429` with a reset time, not a bill ([§3.1.1.4](#3114-workflows-and-async-jobs)) | No budgets. Postgres-only counting on the hot path | Spend patterns show the daily limits are wrong (they are configuration) |
+| AST-D22 | Response cache is exact-match only, first-turn only, with sources re-hydrated live (AST-10, Q7 (0005)) | Bounds cost for repeated questions without serving an answer about the wrong product or ignoring history | Semantic caching: may return an answer about a different product | Volume makes the saving from semantic caching material |
+| AST-D23 | Interactive generation streams. Bulk generation is a Celery job on its own `assistant_bulk` queue, `Idempotency-Key`ed, returning `202` + a job to poll (= E12, AST-11, AST-17) | Part B's "streaming or asynchronous", each where it fits. A 200-product job cannot starve interactive chat | Polling for customer answers ([§5](#5-alternate-solutions) Alt 10). Blocking bulk requests | A durable idempotency claim is needed (AST-Q4) |
+| AST-D24 | Generated merchant content is a draft. `catalog` applies it in a separate, deliberate call (Q8 (0005), AST-12) | AI-authored copy published automatically to a live listing is not a defensible default | One-call generate-and-apply | — |
+| AST-D25 | Every interaction emits `assistant.interaction` through the outbox; `analytics` computes the Part B metrics (= E13, AST-6) | Reuses the existing analytics pipeline rather than building a second one. The event is written in the same transaction as the row ([§3.1.2.3](#3123-events-produced)) | Metrics computed inside `assistant` | — |
+| AST-D26 | Prompts are versioned rows in `prompt_templates`, seeded from `ops/prompts/`, with one active row per `(content_type, name)` enforced by a constraint (AST-16) | A prompt change alters behaviour like code and must be attributable to a version and reviewable in a diff | Prompts hard-coded in the service | Q4 (0006) resolves how the version is recorded per message |
+| AST-D27 | Anonymous chat is allowed: session-scoped by `session_id`, 24-hour TTL, stricter rate limits (Q5 (0005), AST-13) | A shopping assistant that requires login is not used | Login-gated chat. Persistent anonymous profiles | Abuse exceeds what rate limits and IP budgets contain |
+| AST-D28 | Entity-first module layout: `search/`, `chat/`, `generations/`, `prompts/`, each HTTP contract in `<entity>/v1/` ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Binding platform layout. A table has one shape, so only the HTTP contract is versioned ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)) | Version-first `app/v1/<entity>/`. Split `app/<entity>/` + `app/api/v1/` (see RFC 0000) | A v2 contract needs to change a table shape |
+
+#### 3.2.2. Consolidation decisions and rationale
 
 **Consolidation decisions (AST-\*).** Added where the sources were silent, ambiguous, or in tension with a cross-cutting rule. Each is a proposal for review.
 
@@ -1793,7 +2198,7 @@ Layers per [RFC 0000](0000-architecture.md): unit (no I/O), integration (real Po
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against the numbered decisions (D1–D12, E1–E14, AST-1–AST-18), the open questions in §3.3.1, the chunking strategy and graph design in §3.1.1.2, the `‡`/`†` schema cells in §3.1.3, or the rejected alternatives in §5, so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against the numbered decisions (the register rows AST-D1–AST-D28 in §3.2.1, and D1–D12, E1–E14, AST-1–AST-18), the open questions in §3.3.1, the chunking strategy and graph design in §3.1.1.2, the `‡`/`†` schema cells in §3.1.3, or the rejected alternatives in §5, so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

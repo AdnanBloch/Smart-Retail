@@ -38,6 +38,8 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
+     - 3.2.2. [Reasoning](#322-reasoning)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -155,7 +157,7 @@ Candidates rejected *into* `catalog` or away from it: `pricing` (price is a prod
 | R5 / A13 | `catalog` **serves** the platform's one synchronous cross-service call (`order → catalog` at creation) and makes none on a request path itself |
 | R6 / A14 | Consumers snapshot or project `catalog` data; nothing references it live except the order-creation lookup |
 | R7 | Browse and product reads work with `identity`, `inventory`, Kafka and Temporal all down (§3.1.1.5) |
-| R8 | `ProductStatus`, `MediaProcessingStatus` and every other vocabulary live in `services/catalog/app/models/enums.py`, never in `common` |
+| R8 | `ProductStatus`, `MediaProcessingStatus` and every other vocabulary live in the owning entity's `enums.py` (`services/catalog/app/products/enums.py`; `app/media/enums.py` when media processing lands), never in `common` |
 | A4 / A5 | `catalog` re-verifies every token locally against the RS256 public key; the gateway's check is not trusted |
 | A6 | Async FastAPI, SQLAlchemy 2.0 async, `asyncpg` |
 | A7 | RFC 9457 problem details for every error |
@@ -171,42 +173,76 @@ Candidates rejected *into* `catalog` or away from it: `pricing` (price is a prod
 | D2 | No vector column in `catalog_db`; `assistant` never reads `catalog_db` |
 | E8 | Merchant-authored text is stored verbatim; `assistant` treats it as data, never instruction |
 
-**Internal module layout** ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)):
+**Internal module layout** ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service), [file-structure §4–§5](../file-structure.md#4-service-layout-every-service)). Entity-first: everything about an entity sits in `app/<entity>/`; only the HTTP contract is versioned, in `app/<entity>/v1/`. Entries marked *(planned)* arrive with publishing, media processing and events (M2–M3).
 
-```
+```text
 services/catalog/
+├── main.py                       # create_application(): settings, logging, DB, JWT verifier, router, /health
+├── alembic.ini
 ├── alembic/                      # per-service history (A8, S14); env.py carries the render_item hook (S4)
 ├── app/
-│   ├── main.py                   # app factory, routers, problem-detail handlers, /health, /health/ready, /metrics
-│   ├── api/v1/                   # HTTP only — parse, validate, call, serialise. No rules
-│   │   ├── router.py             # every route: /categories, /products, /variants, /media, internal
-│   │   ├── categories.py         # handlers
-│   │   ├── products.py           # handlers; includes /status, /history, /publish-status, /me
-│   │   ├── variants.py           # handlers for /variants and /media delete
-│   │   ├── media.py              # handlers: URL attach, multipart upload, delete
-│   │   └── internal.py           # handlers for service-token routes called by publishing activities (CAT-3)
-│   ├── services/                 # the only layer with rules — called by routers, activities, the consumer, the seed CLI
-│   │   ├── products.py           # create/update/archive, ownership, visibility, version check, audit + outbox
-│   │   ├── status.py             # transition(), publish accept/start, unpublish
-│   │   ├── publishing.py         # validate, build_search_document, mark_published, record_publish_failure
-│   │   ├── media.py              # upload validation, storage, derived-map recording
-│   │   ├── categories.py
-│   │   ├── listing.py            # filters, sort, pagination, browse cache
-│   │   └── merchants.py          # reaction to merchant status changes
-│   ├── domain/
-│   │   ├── enums.py              # ProductStatus, MediaProcessingStatus, ProductAuditAction, PublishStep, UnpublishReason
-│   │   └── state_machine.py      # PRODUCT_TRANSITIONS
-│   ├── workflows/                # ProductPublishingWorkflow + activity adapters — imported by temporal-worker
-│   ├── tasks/                    # process_media Celery task — imported by celery-worker
-│   ├── consumers/                # identity.merchant.status_changed + cache invalidation — thin, like routers
-│   ├── models/                   # SQLAlchemy ORM; no behaviour beyond persistence
-│   ├── schemas/                  # Pydantic request/response models — the contract, never the ORM model
-│   ├── core/                     # settings, security dependencies (require_roles, require_scope), MinIO + Temporal clients
-│   └── db/                       # session, base, seed
-└── tests/
+│   ├── router.py                 # includes only: owns /api/v1 and the /categories, /products, /variants, /media prefixes
+│   ├── models.py                 # imports every entity's ORM models onto one metadata (Alembic, seed)
+│   ├── seed.py                   # idempotent seed (`python -m app.seed`)
+│   ├── core/                     # cross-entity infrastructure, no business rules
+│   │   ├── config.py             # Settings (pydantic-settings)
+│   │   ├── db.py                 # Database factory, get_db session dependency
+│   │   ├── logger.py             # JSON logging
+│   │   ├── dependencies.py       # principal, role guards (require_admin, …); (planned) service-token scope check
+│   │   ├── errors.py             # catalog problem types (ProductNotFound, VersionConflict, …)
+│   │   ├── enums.py              # CallerRole — value sets shared by several entities
+│   │   ├── schemas.py            # Pydantic bases for the versioned schemas
+│   │   └── utils.py              # small pure helpers
+│   ├── health/routes.py          # /health, /health/ready
+│   ├── products/
+│   │   ├── models.py             # Product, ProductAuditLog; (planned) ProductPublishFailure
+│   │   ├── enums.py              # ProductStatus, ProductAuditAction; (planned) PublishStep, UnpublishReason
+│   │   ├── state_machine.py      # PRODUCT_TRANSITIONS, transition(), IllegalTransition
+│   │   ├── access.py             # ownership and visibility (I4)
+│   │   ├── repo.py               # ProductRepo: create/update/archive, status, version check, audit (+ outbox, publish accept, suspension)
+│   │   ├── listing_repo.py       # filters, sort, pagination, visibility; (planned) browse cache
+│   │   ├── audit_repo.py         # product_audit_log writes (S7, CAT-5)
+│   │   ├── dependencies.py
+│   │   └── v1/{routes,schemas}.py  # /products, /products/me, /{id}, /status, /history, nested /variants and /media adds
+│   ├── variants/                 # models.py, repo.py (VariantRepo), dependencies.py, v1/{routes,schemas}.py — PATCH/DELETE /variants/{id}
+│   ├── categories/               # models.py, repo.py, dependencies.py, v1/{routes,schemas}.py — /categories
+│   ├── media/                    # models.py, repo.py (MediaRepo), dependencies.py, v1/{routes,schemas}.py — DELETE /media/{id};
+│   │                             #   (planned) enums.py (MediaProcessingStatus), MinIO storage, upload validation
+│   ├── internal/                 # (planned) /internal/v1 routes for publishing activities (CAT-3), included by app/router.py
+│   ├── workflows/                # (planned) ProductPublishingWorkflow + activity adapters — imported by temporal-worker
+│   ├── tasks/                    # (planned) process_media Celery task — imported by celery-worker
+│   └── consumers/                # (planned) identity.merchant.status_changed + cache invalidation — thin, like routes
+└── tests/                        # unit/<entity>/…, integration/<entity>/…, test_schema_conventions.py
 ```
 
-Handlers do not touch the ORM and the service layer does not construct HTTP responses. That seam is why a publishing activity, the consumer and a route share one implementation of each rule (B1).
+Routes do not touch the ORM and repos do not construct HTTP responses. That seam is why a publishing activity, the consumer and a route share one implementation of each rule (B1). Where the internal routes live (`app/internal/` versus an `internal/` folder per entity) is not fixed by [file-structure §5](../file-structure.md#5-per-service-differences); the folder above is a proposal.
+
+**Components.**
+
+```mermaid
+flowchart LR
+    client["Clients"] --> gw["gateway :8000"]
+    gw -->|"/api/v1/products, categories, variants, media"| api["catalog API :8002<br/>app/router.py + entity v1 routes"]
+    order["order"] -->|"GET /api/v1/products/{id}<br/>validate/snapshot (A13)"| api
+    asst["assistant"] -->|"GET /api/v1/products"| api
+    api --> repos["Entity repos<br/>products, variants, categories, media"]
+    repos --> db[("catalog_db<br/>Postgres")]
+    repos --> redis[("Redis<br/>browse cache")]
+    repos --> minio[("MinIO<br/>product-media")]
+    repos -->|"start workflow"| temporal["Temporal"]
+    temporal --> tw["temporal-worker<br/>ProductPublishingWorkflow"]
+    tw -->|"/internal/v1/* service token"| internal["catalog internal routes"]
+    internal --> repos
+    tw -->|"enqueue process_media"| celery["celery-worker<br/>queue media"]
+    celery --> minio
+    tw -->|"stock initialisation"| inv["inventory"]
+    db -->|"outbox"| relay["outbox-relay"]
+    relay --> kafka{{"Kafka<br/>catalog.product.*"}}
+    kafka --> consumers["catalog consumer<br/>group catalog"]
+    idk{{"identity.merchant.status_changed"}} --> consumers
+    consumers --> repos
+    kafka --> downstream["inventory, analytics, indexer-worker"]
+```
 
 ##### 3.1.1.2. Domain model
 
@@ -237,7 +273,7 @@ Handlers do not touch the ORM and the service layer does not construct HTTP resp
 
 **`attributes` and `options`.** Both are `jsonb` because variant dimensions differ per category and are merchant-defined — a rigid schema would be wrong within a week (S8). They are validated at the Pydantic layer (object of string keys; scalar or array-of-scalar values; bounded key count and length) and are never used for joins or cross-row constraints. The GIN index on `attributes` exists in the schema; no public filter is exposed on it yet (§3.3.1).
 
-**Vocabularies (S4)** — each a `DomainEnum` in `services/catalog/app/models/enums.py`, enforced on write by `DomainEnumText`, published into OpenAPI by Pydantic.
+**Vocabularies (S4)** — each a `DomainEnum` in its entity's `enums.py` (`ProductStatus`, `ProductAuditAction`, `PublishStep`, `UnpublishReason` in `services/catalog/app/products/enums.py`; `MediaProcessingStatus` in `services/catalog/app/media/enums.py`, created with the media pipeline in M2 — today only `ProductStatus` and `ProductAuditAction` exist), enforced on write by `DomainEnumText`, published into OpenAPI by Pydantic.
 
 | Enum | Column | Values | Read policy |
 | --- | --- | --- | --- |
@@ -257,28 +293,25 @@ archive/0006 lists `action` values ending in "…" and names `failed_step` value
 
 **Product status.**
 
-```
-   create
-     │
-     ▼
-  ┌───────┐  publish (202) ┌────────────┐ mark_published ┌───────────┐
-  │ draft │ ─────────────▶ │ publishing │ ─────────────▶ │ published │
-  └───┬───┘ ◀───────────── └────────────┘                └─────┬─────┘
-      │ ▲    compensation        ▲                              │
-      │ │                        │ publish (202)                │ unpublish
-      │ └────────────────────────┼──────────────────────────────┘ (→ draft)
-      ▼ ▲                        │
-  ┌──────────┐ ──────────────────┘                  merchant suspended
-  │ inactive │ ◀─────────────────────────────────────── (published → inactive)
-  └────┬─────┘
-       │           archive (from draft, inactive, published)
-       ▼
-  ┌──────────┐
-  │ archived │  terminal
-  └──────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> draft: T0 create
+    draft --> inactive: T1
+    inactive --> draft: T2
+    draft --> publishing: T3 publish (202)
+    inactive --> publishing: T4 publish (202)
+    publishing --> published: T5 mark_published
+    publishing --> draft: T6 compensation
+    published --> draft: T7 unpublish
+    published --> inactive: T8 merchant suspended
+    draft --> archived: T9 archive
+    inactive --> archived: T10 archive
+    published --> archived: T11 archive
+    archived --> [*]
+    note right of archived: terminal
 ```
 
-**Transition table** — `services/catalog/app/utils/state_machine.py`:
+**Transition table** — `services/catalog/app/products/state_machine.py` (target shape; the implemented M1 table has no `publishing` row or edges yet):
 
 ```python
 PRODUCT_TRANSITIONS: Mapping[ProductStatus, frozenset[ProductStatus]] = {
@@ -320,6 +353,16 @@ The API accepts `draft`, `inactive`, `published` and `archived` as targets; `pub
 | `failed` | `pending` | The next publish run retries failed media | internal |
 | `ready` | — | Delete removes the row and its objects | owner `merchant`, `admin` |
 
+```mermaid
+stateDiagram-v2
+    [*] --> pending: multipart upload
+    [*] --> ready: URL attach
+    pending --> ready: process_media recorded
+    pending --> failed: retries exhausted or undecodable
+    failed --> pending: next publish run retries
+    ready --> [*]: delete
+```
+
 Public responses list only `ready` media. The owner and admins see every row with its `processing_status`.
 
 ##### 3.1.1.4. Workflows and async jobs
@@ -328,34 +371,38 @@ Public responses list only `ready` media. The owner and admins see every row wit
 
 The direct implementation of [Part A](../part-a.md) §2, hosted by `temporal-worker` ([RFC 0001](0001-platform-and-shared-infrastructure.md)) on the task queue `catalog-publishing`. The workflow code and its activities are `catalog` code (`services/catalog/app/workflows/`); the platform RFC covers only the host.
 
-```
-  POST /products/{id}/status {"status": "published"}
-        │
-        │ catalog (one transaction): guard (owner? draft or inactive? no live workflow?)
-        │   status = publishing, publish_workflow_id = product-publish-{id}-v{version}, audit row
-        │ COMMIT, then start workflow → 202 {workflow_id, status: "publishing"}
-        ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │ ProductPublishingWorkflow(product_id, workflow_id, actor_id,     │
-  │                           correlation_id)                        │
-  │                                                                  │
-  │  1. validate_product      → name, description, price, ≥1 active  │
-  │                             variant, ≥1 media, category set      │
-  │       fail → NonRetryable → compensate                           │
-  │  2. process_media         → enqueue Celery process_media per     │
-  │                             pending/failed media, await, record  │
-  │                             derived map, mark ready  (retry 3×)  │
-  │  3. build_search_document → flatten product + variants + category│
-  │                             path into products.search_document   │
-  │  4. sync_downstream       → initialise inventory rows for every  │
-  │                             active variant (idempotent)          │
-  │  5. mark_published        → status=published, published_at,      │
-  │                             audit row, OUTBOX row                │
-  │                             ── single transaction ──             │
-  │                                                                  │
-  │  compensate: status → draft, product_publish_failures row with   │
-  │              the failing step and reason, media left as-is       │
-  └──────────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as Merchant
+    participant C as catalog API
+    participant DB as catalog_db
+    participant T as Temporal
+    participant W as temporal-worker
+    participant Q as celery-worker (media)
+    participant I as inventory
+    M->>C: POST /products/{id}/status {"status": "published"}
+    C->>DB: guard (owner, draft or inactive, no live workflow)<br/>status = publishing, publish_workflow_id = product-publish-{id}-v{version}, audit row
+    C->>DB: COMMIT
+    C->>T: start ProductPublishingWorkflow(product_id, workflow_id, actor_id, correlation_id)
+    C-->>M: 202 {workflow_id, status: "publishing"}
+    T->>W: run workflow
+    W->>C: 1. validate_product (/internal/v1)
+    C-->>W: media_to_process, or NonRetryable ProductIncomplete
+    loop each pending or failed media (retry 3x)
+        W->>Q: 2. process_media task
+        Q-->>W: derived map
+        W->>C: record derived, processing_status = ready
+    end
+    W->>C: 3. build_search_document
+    C->>DB: persist products.search_document
+    W->>I: 4. sync_downstream - initialise stock rows per active variant (idempotent)
+    W->>C: 5. mark_published
+    C->>DB: one transaction: status = published, published_at, audit row, OUTBOX row
+    alt any step fails after retries, times out or is cancelled
+        W->>C: record_publish_failure (compensate)
+        C->>DB: status = draft, product_publish_failures row (step, reason), media left as-is
+    end
 ```
 
 Step 5 is the only step that makes the product publicly visible, and it is a single transaction. Steps 2 and 3 write to `catalog_db` (the `derived` map, `processing_status`, `search_document`) but none of those writes changes visibility: they are idempotent projections overwritten on every run. That is how "step 5 is the only state write" (archive/0000 Flow 1) and "the projection is built by the publishing workflow and persisted" (archive/0003) are both true, while B2 holds — the search document never travels through Temporal history. There is no interleaving in which a customer can see a product whose media or inventory is not ready.
@@ -397,13 +444,30 @@ Nothing needs reversing because nothing before step 5 is visible. That is the de
 
 **Failure recording and how a merchant sees it.** A failed publish is a record, not a log line: `product_publish_failures` keeps one row per failed workflow (`workflow_id`, `failed_step`, `reason`, `created_at`) and survives the product being archived. `GET /api/v1/products/{id}/publish-status` returns `{state, step, started_at, failure_reason?}` (Q8 (0002)) so a merchant sees why a publish failed without a Temporal login. The Part A §6 diagnosis path — "a product never published" → `publish-status` → workflow id → Temporal UI → failing activity → its trace → the exception — starts here.
 
-**Accepting a publish** (T3/T4 guard, in `services/status.py`):
+**Accepting a publish** (T3/T4 guard, in `ProductRepo.change_status`, `services/catalog/app/products/repo.py`):
 
 1. Load the product `FOR UPDATE`; check ownership and `version`.
 2. If `status = publishing`: if `publish_workflow_id` is running in Temporal → `409` ("a publish is already running", with the `workflow_id`). If Temporal reports it closed or not found (a stuck row, below) → proceed as a fresh accept.
 3. Transition to `publishing`, bump `version`, set `publish_workflow_id` (CAT-7), write the audit row, commit.
 4. Start the workflow with that id. On success → `202`.
 5. **CAT-9 — start failure.** If the start call fails after the commit (Temporal unreachable), a second transaction runs the same logic as `record_publish_failure` with `failed_step = start`, and the endpoint returns `503` with a problem detail. If that transaction also fails, the row remains `publishing` with a `publish_workflow_id` Temporal does not know; step 2 of the next publish request detects exactly that and recovers. Committing before starting (rather than starting first) means a workflow can never run against a product that is not `publishing`; `validate_product`'s guard covers the reverse race anyway.
+
+```mermaid
+flowchart TD
+    A["POST /products/{id}/status published"] --> B["Load product FOR UPDATE"]
+    B --> C{"Owner or admin,<br/>version matches?"}
+    C -- no --> X1["403 / 409"]
+    C -- yes --> D{"status?"}
+    D -- "draft or inactive" --> G["Transition to publishing, version + 1,<br/>set publish_workflow_id (CAT-7), audit, COMMIT"]
+    D -- publishing --> E{"publish_workflow_id<br/>running in Temporal?"}
+    E -- yes --> X2["409 a publish is already running"]
+    E -- "closed or not found" --> G
+    D -- "published or archived" --> X3["409 IllegalTransition"]
+    G --> H{"Workflow start succeeds?"}
+    H -- yes --> OK["202 {workflow_id}"]
+    H -- no --> F["record failure: failed_step = start,<br/>status = draft (CAT-9)"]
+    F --> X4["503 problem detail"]
+```
 
 **Cancellation.** The workflow accepts Temporal cancellation. `catalog`'s consumer cancels a running publish when the product's merchant is suspended (§3.1.2.4); cancellation runs the compensation with `failed_step` set to the step in flight and `reason = "merchant_suspended"`. There is no merchant-facing cancel endpoint.
 
@@ -442,6 +506,27 @@ One consumer process for the service (Q2 (0003)), consumer group `catalog`, on t
 | `assistant` (merchant generation) | `GET /api/v1/products/{id}` and `GET /api/v1/products?merchant_id=&category_id=` for siblings | the merchant's token | loads product, variants, category and sibling products for generation; ownership checked by `assistant` and again by `catalog` for non-published products ([RFC 0009](0009-assistant-service.md)) |
 
 **The order validate/snapshot call.** `order` calls `GET /api/v1/products/{product_id}` for each line before it writes anything ([RFC 0005](0005-order-service.md#3121-endpoints)). `catalog` serves it with the caller's customer token, so visibility rules apply unchanged: a product that is not `published` is `404` to a customer, which `order` maps to `422` naming the line. The response carries everything `order_items` snapshots (B8, A14): `id`, `merchant_id`, `name`, `sku`, `status`, `base_price`, `currency`, `version`, and per variant `id`, `sku`, `options`, `price_override`, `is_active`. `order` computes `unit_price = price_override ?? base_price`, rejects an inactive variant, and checks currency consistency across lines. The call is served from the primary database, never from the browse cache, because this is the one read whose staleness is a wrong charge. If `catalog` is down, order creation is blocked — the accepted cost of Q1 (0002) / Q2 (0006).
+
+```mermaid
+sequenceDiagram
+    participant Cu as Customer
+    participant O as order
+    participant C as catalog
+    participant DB as catalog_db (primary)
+    Cu->>O: POST /api/v1/orders
+    loop each order line
+        O->>C: GET /api/v1/products/{product_id} (customer token)
+        C->>C: verify token locally, apply visibility
+        C->>DB: read product + variants (never the browse cache)
+        alt published
+            C-->>O: 200 id, merchant_id, name, sku, status, base_price, currency, version, variants[]
+        else not published or missing
+            C-->>O: 404
+            O-->>Cu: 422 naming the line
+        end
+    end
+    O->>O: unit_price = price_override ?? base_price, reject inactive variant, check currency
+```
 
 **Synchronous calls out.** None on any request path. The publishing activity `sync_downstream` calls `inventory` from `temporal-worker`, off the request path, with its own retry policy.
 
@@ -554,7 +639,7 @@ All public routes are under `/api/v1`, reached through the gateway at `:8000` pe
 | Method | Path | Request | Success | Other codes | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `GET` | `/products` | Filters `category_id`, `merchant_id`, `q`, `min_price`, `max_price`, `status` (privileged); sort `created_at`, `price`, `name` with `-` prefix for descending (default `-created_at`); `limit`, `offset` | `200` page of product summaries `{id, merchant_id, sku, name, base_price, currency, status, category_id, primary_media_url, published_at}` | `422` bad filter | Browse. Only `published` for anonymous and `customer` callers. `status` is honoured for `admin` (any product) and for a `merchant` filtering with their own `merchant_id`; otherwise ignored. `q` is a case-insensitive keyword match over `name`, `sku` and `description`. Anonymous/customer results cached (below) |
-| `GET` | `/products/me` | same filters, `status` honoured | `200` page | `403` non-merchant | The caller's own products, any status. Registered before `/products/{id}` in `api/router.py` so `me` is not parsed as an id |
+| `GET` | `/products/me` | same filters, `status` honoured | `200` page | `403` non-merchant | The caller's own products, any status. Declared before `/{product_id}` in `app/products/v1/routes.py` so `me` is not parsed as an id |
 | `GET` | `/products/{id}` | — | `200` full product: fields + `variants[]` + `media[]` + `category` + `_links.availability` per variant | `404` | Non-published visible only to the owning merchant or an admin. Public media only `ready`. **Also the order validate/snapshot call** (§3.1.1.5) — served uncached |
 | `POST` | `/products` | `{sku, name, description?, category_id?, base_price, currency?, attributes?}`; admins additionally `merchant_id` | `201` + `Location`, body = full product, `status: draft`, `version: 1` | `403` customer; `409` duplicate `(merchant_id, sku)`; `422` | Create in `draft`. `merchant_id` from the token for merchants (a body value is ignored, not obeyed); required in the body for admins acting on a merchant's behalf |
 | `PATCH` | `/products/{id}` | any of `{name, description, category_id, base_price, currency, attributes, sku}` + `version` | `200` full product | `403` other merchant; `404`; `409` version / `publishing` / duplicate SKU; `422` | Partial update. On a `published` product the change is applied directly, `search_document` is rebuilt in the same transaction and `catalog.product.updated` is written (CAT-13); a change that would break publish completeness (e.g. clearing `category_id`) → `409` |
@@ -578,6 +663,27 @@ All public routes are under `/api/v1`, reached through the gateway at `:8000` pe
 | `POST` | `/products/{id}/media` | `{url, alt_text?, position?, version}` | `201`, `processing_status: ready`, `derived: null` | `403`, `404`, `409`, `422` non-https or malformed url | Attach an external media **URL** with `position` and `alt_text`. Kept for seeding and external images |
 | `POST` | `/products/{id}/media/upload` | `multipart/form-data`: `file`, `alt_text?`, `position?`, `version` | `201 {id, url, processing_status: "pending", …}` | `403`, `404`, `409`; `413` over `MEDIA_MAX_BYTES`; `415` type not allowed or magic bytes disagree; `503` MinIO down | Binary upload to MinIO (B12). Sequence: validate size, type, extension, magic bytes → write original to `products/{product_id}/{random}/original.{ext}` → insert row `pending` with `storage_key`, `content_type`, `size_bytes` + audit `media_added`, commit. Processing happens in the next publish run (§3.3.1) |
 | `DELETE` | `/media/{media_id}` | `?version=` | `204` | `403`, `404`, `409` last media of a `published` product / version | Remove the row (media is not referenced across a boundary) and, after commit, delete the original and derived objects best-effort |
+
+**Upload sequence** (`POST /products/{id}/media/upload`):
+
+```mermaid
+sequenceDiagram
+    participant M as Merchant
+    participant C as catalog
+    participant S as MinIO
+    participant DB as catalog_db
+    M->>C: multipart file, alt_text, position, version
+    C->>C: ownership, version, not publishing
+    C->>C: validate size (413), type, extension, magic bytes (415)
+    C->>S: put products/{product_id}/{random}/original.{ext}
+    alt MinIO down
+        C-->>M: 503, nothing recorded
+    else stored
+        C->>DB: insert product_media pending (storage_key, content_type, size_bytes)<br/>audit media_added, version + 1, COMMIT
+        C-->>M: 201 {id, url, processing_status: "pending"}
+    end
+    Note over C,DB: processing happens in the next publish run
+```
 
 **Internal (service token, scope `catalog:internal`, CAT-3).** Not routed by the gateway; reachable only on the Compose network. Each route is a thin router over the service function named in §3.1.1.4; user tokens are rejected (`403`) and service tokens are rejected on every public write route.
 
@@ -620,6 +726,20 @@ Legend: ✓ allowed · **own** allowed only on products whose `merchant_id` equa
 | `/health*`, `/metrics`, `/docs` | ✓ (not exposed through the gateway except `/docs`) | ✓ | ✓ | ✓ | ✓ |
 
 **Scoping rule.** Ownership is decided in `catalog`'s service layer against the `merchant_id` derived from the verified token (for a `merchant` the claim is the user id, which is also `merchant_profiles.user_id`), never from a request body, query parameter or header. A merchant supplying another merchant's `merchant_id` in a body is ignored, not obeyed; in a query filter it only narrows results to that merchant's *published* products. The gateway's coarse route check is an optimisation, not the boundary ([RFC 0000 §3.1.1.4](0000-architecture.md#3114-authentication-and-authorisation-split)). Variant and media routes resolve the parent product first and apply the same rule to it.
+
+```mermaid
+flowchart TD
+    R["Request on a product, variant or media"] --> P["Resolve the parent product"]
+    P --> Q{"Caller is admin?"}
+    Q -- yes --> ALLOW["Allowed"]
+    Q -- no --> O{"Merchant and product.merchant_id<br/>equals token claim?"}
+    O -- yes --> ALLOW
+    O -- no --> W{"Write?"}
+    W -- yes --> F403["403 (401 if anonymous)"]
+    W -- no --> V{"status = published?"}
+    V -- yes --> ALLOW
+    V -- no --> F404["404 (existence not confirmed)"]
+```
 
 ##### 3.1.2.3. Events produced
 
@@ -694,9 +814,9 @@ It carries descriptive fields only. Live facts — stock, and the displayed pric
 
 Consumer mechanics are the platform base class: dedupe check, three in-process retries with exponential backoff, then `<topic>.dlq` with the error and an offset commit so a poison message never stops a partition (C6); trace context restored from the envelope (C11). `identity.merchant.status_changed` is keyed by `user_id` and compacted, so a new `catalog` consumer converges on the latest status per merchant.
 
-**`identity.merchant.status_changed` handler** (`services/catalog/app/services/merchants.py`, called by the thin consumer). Payload fields used: `user_id` (= `merchant_id`), `previous_status`, `new_status` (`MerchantStatus`: `pending` \| `approved` \| `suspended`); envelope `actor_id` and `event_id`.
+**`identity.merchant.status_changed` handler** (a `ProductRepo` method in `services/catalog/app/products/repo.py`, called by the thin consumer in `app/consumers/`). Payload fields used: `user_id` (= `merchant_id`), `previous_status`, `new_status` (`MerchantStatus`: `pending` \| `approved` \| `suspended`); envelope `actor_id` and `event_id`.
 
-```
+```text
   BEGIN
     INSERT processed_events('catalog', event_id, event_type) ON CONFLICT DO NOTHING
       → conflict: COMMIT, skip (duplicate delivery)
@@ -711,6 +831,26 @@ Consumer mechanics are the platform base class: dedupe check, three in-process r
   after commit: request cancellation of each collected publish workflow
                 (its compensation returns the product to draft, failed_step = the step in flight,
                  reason = merchant_suspended)
+```
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka
+    participant H as catalog consumer
+    participant DB as catalog_db
+    participant T as Temporal
+    K->>H: identity.merchant.status_changed (new_status = suspended)
+    H->>DB: BEGIN, INSERT processed_events ON CONFLICT DO NOTHING
+    alt duplicate event_id
+        H->>DB: COMMIT, skip
+    else first delivery
+        loop each published product of merchant_id (FOR UPDATE, batched)
+            H->>DB: published to inactive (T8), version + 1, audit status_changed, outbox catalog.product.unpublished
+        end
+        H->>DB: collect products in publishing, COMMIT
+        H->>T: cancel each collected publish workflow
+        Note over T: compensation returns each to draft, reason = merchant_suspended
+    end
 ```
 
 This closes Q2 (0001) — *how does `catalog` learn that a merchant was suspended?* — as Q6 (0003) decided: both. `identity` refuses to issue tokens, and `catalog` hides the merchant's products. The downstream effect follows by construction: each `catalog.product.unpublished` removes the product's chunks from the assistant's index, so a suspended merchant's products never surface in semantic search either (archive/0004 G7).
@@ -732,6 +872,84 @@ This closes Q2 (0001) — *how does `catalog` learn that a merchant was suspende
 | [`product_audit_log`](#product_audit_log) | Append-only change trail (S7) |
 | [`product_publish_failures`](#product_publish_failures) | Failed publish workflows |
 | `outbox` · `processed_events` `‡` | S12 / S13 — shared DDL, defined once in [RFC 0000 §3.1.3.2](0000-architecture.md#3132-shared-tables--outbox-and-processed_events) |
+
+**Entity relationships.** `outbox` and `processed_events` are omitted (shared DDL, no relationships). Dashed lines are references by `product_id` with no foreign key, so the rows survive the product being archived.
+
+```mermaid
+erDiagram
+    categories |o--o{ categories : "parent_id"
+    categories |o--o{ products : "category_id (restrict)"
+    products ||--o{ product_variants : "product_id (cascade)"
+    products ||--o{ product_media : "product_id (cascade)"
+    products ||..o{ product_audit_log : "product_id, no FK"
+    products ||..o{ product_publish_failures : "product_id, no FK"
+
+    categories {
+        uuid id PK
+        text name
+        text slug "unique"
+        uuid parent_id FK "nullable"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    products {
+        uuid id PK
+        uuid merchant_id "no FK, identity claim"
+        text sku "unique with merchant_id"
+        text name
+        text description "nullable"
+        uuid category_id FK "nullable"
+        numeric base_price "numeric(12,2), >= 0"
+        text currency "char(3) ISO 4217"
+        text status "ProductStatus"
+        jsonb attributes
+        timestamptz published_at "nullable"
+        int version "S6 token"
+        timestamptz created_at
+        timestamptz updated_at
+        text publish_workflow_id "nullable"
+        jsonb search_document
+    }
+    product_variants {
+        uuid id PK
+        uuid product_id FK
+        text sku "unique within product"
+        jsonb options
+        numeric price_override "nullable, numeric(12,2)"
+        bool is_active
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    product_media {
+        uuid id PK
+        uuid product_id FK
+        text url
+        text alt_text "nullable"
+        int position
+        timestamptz created_at
+        text storage_key
+        text content_type
+        int size_bytes "bigint"
+        text processing_status "MediaProcessingStatus"
+        jsonb derived
+    }
+    product_audit_log {
+        int id PK "bigserial"
+        uuid product_id
+        uuid actor_id
+        text action "ProductAuditAction"
+        jsonb changes
+        timestamptz created_at
+    }
+    product_publish_failures {
+        uuid id PK
+        uuid product_id
+        text workflow_id
+        text failed_step "PublishStep"
+        text reason
+        timestamptz created_at
+    }
+```
 
 **Non-database state.** MinIO bucket `product-media` holds originals and derivatives keyed by `product_media.storage_key` and the values of `product_media.derived`; Temporal holds workflow execution state, referenced by `products.publish_workflow_id`; Redis holds `cache:products:{hash}` (60 s).
 
@@ -859,7 +1077,7 @@ So a failed publish is a record, not a log line. Named in [archive/0002](archive
 | `product_audit_log` | PK `id`; btree `product_id`; btree `created_at` | archive/0006 |
 | `product_publish_failures` | PK `id`; btree `product_id`; btree `created_at` | archive/0006 |
 
-Column comments point at the source of truth rather than duplicating it: `COMMENT ON COLUMN products.status IS 'DomainEnum ProductStatus — see services/catalog/app/models/enums.py; transitions in app/utils/state_machine.py'`, and likewise for `product_media.processing_status`.
+Column comments point at the source of truth rather than duplicating it: `COMMENT ON COLUMN products.status IS 'DomainEnum ProductStatus — see services/catalog/app/products/enums.py; transitions in app/products/state_machine.py'` (set by revision `0003_enum_comments_products`), and likewise for `product_audit_log.action` and, when it lands, `product_media.processing_status` (pointing at `app/media/enums.py`).
 
 ###### Migrations
 
@@ -894,7 +1112,7 @@ Ordered so each step is reviewable alone; the workflow is built on a service lay
 | --- | --- | --- | --- |
 | 1 | `catalog` skeleton on `common` (settings, async session, JSON logging, problem details, pagination, `DomainEnum`/`DomainEnumText`); Alembic with the `render_item` hook | Service boots; `/health`, `/health/ready` | Platform `common`, Postgres init script creating `catalog_db` and its role |
 | 2 | Migration `0001_initial` — five tables, constraints, indexes, comments | `make migrate` to head from empty | 1 |
-| 3 | `enums.py` and `state_machine.py`; `transition()`; unit tests for totality and every illegal pair | Unit suite green | 1 |
+| 3 | `app/products/enums.py` and `app/products/state_machine.py`; `transition()`; unit tests for totality and every illegal pair | Unit suite green | 1 |
 | 4 | Category CRUD (admin-gated), tree and flat views, cycle and in-use guards | Tests green | 2, identity's `require_roles` |
 | 5 | Product CRUD with ownership enforcement, `version` checks and audit-log writes in the same transaction | Tests green, including cross-merchant `403` and stale-version `409` | 4 |
 | 6 | Variants and URL-form media endpoints | Tests green | 5 |
@@ -936,6 +1154,41 @@ Ordered so each step is reviewable alone; the workflow is built on a service lay
 | Part B review | M7 |
 
 ### 3.2. Rationale
+
+#### 3.2.1. Decision register
+
+One row per significant decision in this RFC. Decisions that already carry an ID — this RFC's `CAT-1`…`CAT-14`, and the platform's A\*, B\*, C\*, R\*, S\* — are not renumbered: the row names them (“= CAT-7”) and `CAT-Dn` numbers only the register row. The full reasoning is in [§3.2.2](#322-reasoning); rejected alternatives are listed in [§5](#5-alternate-solutions).
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| CAT-D1 | `catalog` is its own service owning products, variants, categories and media metadata | Passes all four ownership tests; read-heavy, high-cardinality profile ([§3.1.1.1](#3111-responsibility-and-boundaries), [§3.2.2](#322-reasoning)) | Separate `pricing`, `media`, `search`, category-reference services — own no independent state ([§5](#5-alternate-solutions) #6–8, #16); merging `inventory` in — recreates the multi-writer bug | An entity gains an independent writer or a distinct load profile |
+| CAT-D2 | No stock in `catalog_db` (= R3) | Stock has several writers; a column here makes `catalog` a second writer ([§3.2.2](#322-reasoning)) | `quantity` on `product_variants` — the multi-writer inconsistency Part A describes ([§5](#5-alternate-solutions) #1) | Never, while `inventory` exists |
+| CAT-D3 | `catalog` does not call `inventory` to show stock; responses carry `_links.availability` | A13 allows one synchronous call; a product page can render without stock ([§3.1.1.2](#3112-domain-model)) | Server-side call — couples the hottest read path to a second service ([§5](#5-alternate-solutions) #13) | Clients cannot afford the second request |
+| CAT-D4 | `merchant_id` is a token claim: plain indexed `uuid`, no FK, no merchant join (= R2, A3, S15) | A synchronous call to `identity` on a public read is worse than a second client call for names ([§3.2.2](#322-reasoning)) | Cross-database FK — impossible under R1; call `identity` per read — latency and coupling | Listings need merchant names server-side (CAT-Q6) |
+| CAT-D5 | Publishing is a durable Temporal workflow, `ProductPublishingWorkflow` (= A12) | Part A §2: partial failure must never leave a half-published product; Temporal gives state, timeouts and adjacent compensation ([§3.2.2](#322-reasoning)) | Direct `status = published` — violates §2 ([§5](#5-alternate-solutions) #2); Kafka choreography — scattered compensation (#3); Celery chain — no workflow state (#4) | Publishing collapses to a single local transaction |
+| CAT-D6 | `publishing` is a persisted status with no self-edge | Makes "a publish is running" a transactional fact a second request can see ([§3.2.2](#322-reasoning)) | In-memory flag — a race; DB enum — would accept a second `publishing` write | — |
+| CAT-D7 | Step 5 `mark_published` is last and one transaction (status, audit, outbox); compensation returns to `draft` | Nothing before step 5 is visible, so the compensation is one status write plus a record ([§3.1.1.4](#3114-workflows-and-async-jobs)) | Reverse saga undoing each step — nothing to undo; returning to `inactive` — hides that the product needs attention (CAT-Q3) | CAT-Q3 is decided for `inactive` |
+| CAT-D8 | Activities are thin adapters over internal routes under `/internal/v1` with a scoped service token (= B1, CAT-3) | One implementation per rule, testable without Temporal; a separate prefix the gateway cannot expose by accident ([§3.1.2.1](#3121-endpoints)) | Business logic in activities — only testable inside Temporal; internal routes under `/api/v1` — one gateway rule from exposure | — |
+| CAT-D9 | `workflow_id = product-publish-{id}-v{version}` (= CAT-7) | Deterministic, unique per attempt; Temporal rejects a duplicate start behind the status guard ([§3.1.1.4](#3114-workflows-and-async-jobs)) | Random id — loses the second line of duplicate defence | — |
+| CAT-D10 | Commit `→ publishing` before starting the workflow; a start failure records `failed_step = start` and returns `503` (= CAT-9) | A workflow can never run against a product that is not `publishing`; a stuck row is recovered by the next request ([§3.1.1.4](#3114-workflows-and-async-jobs)) | Start first, then commit — a workflow could run against a product whose write rolled back | Temporal start becomes transactional with Postgres |
+| CAT-D11 | Retry policies and timeouts per activity; compensation retries for 24 h (= CAT-8) | Shape fixed by archive/0002; numbers proposed and configurable ([§3.1.1.4](#3114-workflows-and-async-jobs)) | Unbounded retries — a publish could hang; no `schedule_to_close` — nothing guarantees termination | Measured step durations disagree with the numbers |
+| CAT-D12 | Media derivatives in a Celery task on queue `media`, awaited by the `process_media` activity (= C7) | One-shot CPU job with per-task retry is Celery's shape; a separate queue cannot starve notifications ([§3.2.2](#322-reasoning)) | Inline in the activity — CPU work on the workflow worker ([§5](#5-alternate-solutions) #5); separate `media` service — owns no state (#6) | — |
+| CAT-D13 | Uploads pass through `catalog`; MinIO bucket private, presigned GETs in responses | Validation (type, size, magic bytes) happens before anything is stored ([§3.3](#33-tradeoffs), CAT-Q8) | Presigned direct-to-MinIO — *deferred*, validation would follow storage (Q6 (0002), [§5](#5-alternate-solutions) #15) | Upload size or volume loads the API process |
+| CAT-D14 | No edits to a product, its variants or media while `publishing` (= CAT-4) | Keeps step-1 validation true at step 5 ([§3.1.1.2](#3112-domain-model) I13) | Allow edits — the workflow could publish a product it never validated | — |
+| CAT-D15 | Edits to a `published` product apply directly, rebuild `search_document` and emit `catalog.product.updated`; completeness-breaking edits → `409` (= CAT-13) | Price and text changes need no media or inventory step ([§3.3](#33-tradeoffs)) | Re-run the workflow on every edit — unpublish window for a typo | CAT-Q2 (new media or variants on a published product) is decided |
+| CAT-D16 | Events are state-carrying; `catalog.product.published` compacted (= CAT-14) | Consumers act without calling back; a compacted topic needs a complete latest record ([§3.1.2.3](#3123-events-produced)) | Thin "changed" events with call-back — recreates synchronous coupling ([§5](#5-alternate-solutions) #14); `catalog` calling the indexer — couples publish to indexing (#11) | Payload size becomes a problem |
+| CAT-D17 | Every state change that is a fact for others writes an outbox row in the same transaction (= A10, B11, S12) | No lost or phantom events; relay failure mode is duplication, absorbed by dedupe ([§6.1](#61-scalability-and-fault-tolerance)) | Publishing to Kafka after commit — loses events on crash; indexer polling `catalog_db` — violates R1 ([§5](#5-alternate-solutions) #12) | — |
+| CAT-D18 | Merchant suspension moves `published → inactive`; reinstatement does not republish (= CAT-6) | No column exists to project approval into; `published` stays reachable only through the workflow ([§3.1.2.4](#3124-events-consumed)) | Merchant-status projection table — not specified yet (CAT-Q1, [§5](#5-alternate-solutions) #19); synchronous call to `identity` on writes | CAT-Q1 adds a projection |
+| CAT-D19 | Audit trail is a table written by the service layer in the same transaction as the change (= S7) | Part A §1 traceability; a trigger cannot see the actor or request id ([§3.2.2](#322-reasoning)) | Trigger (#10), central audit service (#9) ([§5](#5-alternate-solutions)); NoSQL store — not transactional (Q7 (0001)) | Audit volume outgrows Postgres |
+| CAT-D20 | Optimistic concurrency on `products.version`; variant and media writes bump the root (= S6, CAT-1, CAT-12) | Concurrent edits never silently overwrite; the root is the only row with a version and `index_state.catalog_version` must move ([§3.1.1.2](#3112-domain-model)) | Last-writer-wins — silent overwrites; version per child row — the indexer could not detect a variant change | — |
+| CAT-D21 | Products are archived, variants deactivated — never hard-deleted (= S5, CAT-2) | `order_items` and `stock_items` reference these ids across the boundary ([§3.1.1.2](#3112-domain-model) I10) | Hard delete — breaks snapshots no FK protects ([§5](#5-alternate-solutions) #18) | — |
+| CAT-D22 | Status columns are `text` + `DomainEnum` + transition table; `products.status` read `passthrough`, `transition()` freezes unknown values (= S4) | Vocabulary changes need no migration; a rolled-back build still lists rows and refuses to move them ([§3.1.1.2](#3112-domain-model)) | Native enum — no `downgrade`; `CHECK` — a migration per value and no edge constraint ([§5](#5-alternate-solutions) #17) | — |
+| CAT-D23 | `attributes` and `options` are `jsonb`, validated by Pydantic, never filtered or joined (= S8) | Dimensions differ per category and are merchant-defined ([§3.2.2](#322-reasoning)) | Rigid columns — wrong within a week; category-level dimension schemas (Q5 (0001)) | Variant sync needs structure; CAT-Q5 |
+| CAT-D24 | Anonymous/customer browse cached in Redis 60 s, event-invalidated, fail-open; the order snapshot read is never cached (= C13) | Bounded staleness on the hot path; the snapshot read is the one where staleness is a wrong charge ([§3.1.2.1](#3121-endpoints)) | No cache — every browse hits Postgres; caching product detail — stale order snapshots | Staleness complaints or cache cost |
+| CAT-D25 | Tokens re-verified locally; ownership and visibility decided in the service layer from the token claim (= A4, A5) | Only `catalog` knows what owning a product means; the gateway check is an optimisation ([§3.1.2.2](#3122-role-matrix)) | Trusting the gateway — makes it the centre of a distributed monolith | — |
+| CAT-D26 | Entity-first module layout: `app/<entity>/` with `v1/{routes,schemas}.py`, `app/router.py` includes only | A table has one shape, so only the HTTP contract is versioned ([§3.1.1.1](#3111-responsibility-and-boundaries), [review §3](../reviews/2026-10-06-mentor-review.md#3-entity-first-service-layout-with-versions)) | Version-first `app/v1/<entity>/` — duplicates models; hybrid `app/api/v1/` — splits each entity | — |
+
+#### 3.2.2. Reasoning
 
 **Why `catalog` is its own service.** It passes all four ownership tests: it alone writes products, variants, categories and media metadata; it protects SKU uniqueness per merchant and the status machine; its requirements (merchandising, publishing) move independently of orders or stock; and its profile — read-heavy, high cardinality — differs from `order`'s write bursts and `inventory`'s hot-row contention.
 

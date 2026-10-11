@@ -46,6 +46,8 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
+     - 3.2.2. [The arguments](#322-the-arguments)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -142,7 +144,7 @@ The two archived RFCs each had a G1–G7 list; they are merged here. The *Archiv
 
 | Component | Role | Hosting / runtime | Business logic specified in |
 | --- | --- | --- | --- |
-| `temporal-worker` | Hosts `ProductPublishingWorkflow` and `OrderWorkflow`; activities call service-layer functions (B1) | [RFC 0001](0001-platform-and-shared-infrastructure.md) | [RFC 0004](0004-catalog-service.md#3114-workflows-and-async-jobs) (publishing), [RFC 0005](0005-order-service.md#3114-workflows-and-async-jobs) (order) |
+| `temporal-worker` | Hosts `ProductPublishingWorkflow` and `OrderWorkflow`; activities call the entity repos, the service layer (B1) | [RFC 0001](0001-platform-and-shared-infrastructure.md) | [RFC 0004](0004-catalog-service.md#3114-workflows-and-async-jobs) (publishing), [RFC 0005](0005-order-service.md#3114-workflows-and-async-jobs) (order) |
 | `celery-worker` (+ Beat) | Background tasks off RabbitMQ — notification dispatch, media processing, scheduled rollups and sweeps, bulk generation | [RFC 0001](0001-platform-and-shared-infrastructure.md) | Each task's owning service RFC, §3.1.1.4 |
 | `indexer-worker` | Consumes `catalog.product.*`, chunks and embeds product text, writes `assistant_db` | [RFC 0001](0001-platform-and-shared-infrastructure.md) | [RFC 0009](0009-assistant-service.md#3114-workflows-and-async-jobs) |
 | `outbox-relay` | Reads each producing service's transactional outbox and publishes to Kafka (C1, C2) | [RFC 0001](0001-platform-and-shared-infrastructure.md) | — (no business logic; the outbox DDL is §3.1.3.2) |
@@ -150,52 +152,73 @@ The two archived RFCs each had a G1–G7 list; they are merged here. The *Archiv
 
 Infrastructure: one PostgreSQL 16 instance (one logical database and role per service, A2), MongoDB, Redis, Kafka (KRaft) + Schema Registry, RabbitMQ, MinIO, Temporal server + UI, and the OTel Collector → Jaeger / Prometheus → Grafana stack. All are specified in [RFC 0001](0001-platform-and-shared-infrastructure.md).
 
-**Target topology.**
+**System context.** Who uses the platform and what it depends on outside itself. Payments and carriers are simulated inside the platform (A9); the LLM provider is the only external dependency (§4).
 
+```mermaid
+flowchart LR
+    customer(["Customer"])
+    merchant(["Merchant"])
+    admin(["Admin"])
+    subgraph platform["SmartRetail (Docker Compose)"]
+        gw["gateway :8000<br/>the only public entry point"]
+        core["8 services · 4 workers<br/>stores and event backbone"]
+        sim["Simulated payment and<br/>shipping providers (A9)"]
+    end
+    llm["LLM provider API<br/>OpenAI, Groq or Anthropic"]
+    customer -- "browse, order, chat (HTTP / SSE)" --> gw
+    merchant -- "products, media, stock" --> gw
+    admin -- "merchant approval, analytics" --> gw
+    gw --> core
+    core --> sim
+    core -- "embeddings, generation" --> llm
 ```
-                                 ┌──────────────────────────────┐
-     client ─────────────────────▶│  gateway  (:8000)            │
-     HTTP / JSON / SSE            │  JWT verify · routing        │
-                                  │  correlation ID · CORS       │
-                                  │  rate limit                  │
-                                  └──┬────┬────┬────┬────┬───┬───┘
-              ┌──────────────────────┘    │    │    │    │   └──────────────┐
-              ▼                   ┌───────▼┐ ┌─▼────┐ ┌▼──────┐        ┌────▼─────┐
-        ┌───────────┐             │ order  │ │inven-│ │analyt-│        │assistant │
-        │ identity  │             │(:8003) │ │tory  │ │ics    │        │ (:8007)  │
-        │ (:8001)   │             │        │ │(:8004)│ │(:8006)│       │ RAG/SSE  │
-        └─────┬─────┘             └───┬────┘ └──┬───┘ └───┬───┘        └────┬─────┘
-              │      ┌───────────┐    │         │         │                 │
-              │      │ catalog   │    │         │         │            ┌────▼─────┐
-              │      │ (:8002)   │    │         │         │            │  vector  │
-              │      └─────┬─────┘    │         │         │            │  store   │
-              │            │          │         │         │            └────┬─────┘
-       ┌──────▼────────────▼──────────▼─────────▼──┐      │                 │
-       │        PostgreSQL 16 — one instance,      │      │            ┌────▼─────┐
-       │        one logical database per service   │      │            │assistant │
-       └───────────────────────────────────────────┘      │            │   _db    │
-                            │                             │            └──────────┘
-                    ┌───────▼────────┐             ┌──────▼──────┐
-                    │ outbox-relay   │             │  MongoDB    │
-                    └───────┬────────┘             └──────▲──────┘
-                            │                             │
-       ┌────────────────────▼─────────────────────────────┴──────────────┐
-       │   Kafka + Schema Registry   — the event backbone                │
-       └───┬───────────────────┬──────────────────────┬─────────────┬────┘
-           │                   │                      │             │
-   ┌───────▼──────┐   ┌────────▼───────┐    ┌─────────▼──────┐  ┌───▼────────┐
-   │ notification │   │ indexer-worker │    │  analytics     │  │ inventory  │
-   │   (:8005)    │   │                │    │  consumers     │  │ + catalog  │
-   └───────┬──────┘   └────────────────┘    └────────────────┘  │ consumers  │
-           │                                                    └────────────┘
-   ┌───────▼──────┐   ┌────────────────┐   ┌──────────────────────────────────┐
-   │ RabbitMQ +   │   │   Temporal     │   │ OTel Collector → Jaeger          │
-   │ celery-worker│   │   + worker     │   │               → Prometheus/Grafana│
-   └──────────────┘   └────────────────┘   └──────────────────────────────────┘
-        Redis (rate limits · idempotency fast path · caches · notification
-        pub/sub and SSE tickets · Celery results) and MinIO (media binaries)
-        sit beside the services and are specified in RFC 0001.
+
+**Target topology (service map).**
+
+```mermaid
+flowchart TB
+    client(["Client<br/>HTTP / JSON / SSE"])
+    gw["gateway :8000<br/>JWT verify · routing · correlation ID<br/>CORS · rate limit"]
+    client --> gw
+
+    subgraph services["Services"]
+        identity["identity :8001"]
+        catalog["catalog :8002"]
+        order["order :8003"]
+        inventory["inventory :8004"]
+        notification["notification :8005"]
+        analytics["analytics :8006"]
+        assistant["assistant :8007<br/>RAG / SSE"]
+    end
+    gw --> identity & catalog & order & inventory & notification & analytics & assistant
+
+    pg[("PostgreSQL 16<br/>one instance, one logical database per service")]
+    vec[("assistant_db<br/>Postgres + pgvector")]
+    mongo[("MongoDB<br/>analytics_db")]
+    identity & catalog & order & inventory & notification --> pg
+    assistant --> vec
+    analytics --> mongo
+
+    relay["outbox-relay"]
+    kafka{{"Kafka + Schema Registry<br/>the event backbone"}}
+    pg -. "outbox rows" .-> relay
+    vec -. "outbox rows" .-> relay
+    relay --> kafka
+
+    indexer["indexer-worker"]
+    kafka --> notification & analytics & indexer & inventory & catalog
+    indexer --> vec
+
+    temporal["Temporal server<br/>+ temporal-worker"]
+    celery["RabbitMQ<br/>+ celery-worker"]
+    catalog & order -- "start workflow" --> temporal
+    temporal -- "activities, service token" --> inventory & catalog
+    notification --> celery
+
+    otel["OTel Collector → Jaeger<br/>→ Prometheus / Grafana"]
 ```
+
+Every service also exports traces and metrics to the OTel Collector (not drawn, to keep the edges readable). Redis (rate limits · idempotency fast path · caches · notification pub/sub and SSE tickets · Celery results) and MinIO (media binaries) sit beside the services and are specified in RFC 0001.
 
 `notification` additionally holds open SSE connections and fans out over Redis Pub/Sub so any replica can serve any client ([RFC 0007](0007-notification-service.md)). `catalog` consumes `identity.merchant.status_changed` to project merchant approval state ([RFC 0004](0004-catalog-service.md#3124-events-consumed)).
 
@@ -294,6 +317,32 @@ These are two different jobs and they live in two different places, so they are 
 
 Full detail: [RFC 0003](0003-identity-service.md#3121-endpoints).
 
+*Login, then an authenticated call.* The point the sequence makes is the second half: after login, no request touches `identity`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Client
+    participant G as gateway
+    participant I as identity
+    participant DB as identity_db
+    participant S as catalog (any service)
+    U->>G: POST /api/v1/auth/login {email, password}
+    Note over G: login rate limit, 429 + Retry-After
+    G->>I: forward with X-Request-ID
+    I->>DB: load user, verify Argon2id hash
+    I->>DB: insert refresh_sessions row (hashed token)
+    I-->>G: 200 {access_token (RS256, 15 min), refresh_token}
+    G-->>U: 200
+    Note over G,S: Verifiers cache the public keys from GET /api/v1/auth/jwks, off the request path
+    U->>G: GET /api/v1/products/{id} with Bearer access_token
+    G->>G: verify signature and expiry locally
+    G->>S: forward
+    S->>S: re-verify locally (A5), then role, ownership and merchant scope on the row
+    S-->>G: 200
+    G-->>U: 200
+```
+
 *Authorisation is owned by the service that owns the resource.* There is no central policy service and no authorisation call across a service boundary — a service that owns a row is the only component that knows what it means to be allowed to touch it.
 
 | Layer | What it decides | What it must not do |
@@ -385,26 +434,32 @@ These bind every service. Service RFCs may add decisions (with their own prefixe
 
 *Flow 1 — Product publishing.*
 
-```
-merchant          catalog           temporal          workers/consumers
-   │                 │                  │                    │
-   │ POST /products/{id}/status         │                    │
-   │ {"status":"published"}             │                    │
-   ├────────────────▶│                  │                    │
-   │                 │ start workflow   │                    │
-   │                 ├─────────────────▶│                    │
-   │◀────────────────┤ 202 + workflow_id│                    │
-   │                 │                  │ 1 validate fields  │
-   │                 │                  │ 2 process media ───┼──▶ celery
-   │                 │                  │ 3 build search doc │
-   │                 │                  │ 4 sync downstream  │
-   │                 │◀─────────────────┤ 5 mark published   │
-   │                 │   + outbox row   │   (one txn)        │
-   │                 ├──── outbox-relay ┼───▶ Kafka: catalog.product.published
-   │                 │                  │        ├──▶ indexer-worker  → embeddings
-   │                 │                  │        ├──▶ analytics       → products_published
-   │                 │                  │        └──▶ inventory       → create stock row
-   │ GET /products/{id}  status: published                   │
+```mermaid
+sequenceDiagram
+    autonumber
+    actor M as Merchant
+    participant C as catalog
+    participant T as Temporal (temporal-worker)
+    participant W as celery-worker
+    participant R as outbox-relay
+    participant K as Kafka
+    participant X as indexer-worker, analytics, inventory
+    M->>C: POST /products/{id}/status {"status":"published"}
+    C->>C: guard, set publishing, record workflow_id
+    C->>T: start ProductPublishingWorkflow
+    C-->>M: 202 + workflow_id
+    T->>T: 1 validate_product
+    T->>W: 2 process_media
+    W-->>T: media processed
+    T->>T: 3 build_search_document
+    T->>T: 4 sync_downstream
+    T->>C: 5 mark_published
+    C->>C: status, published_at, audit row and outbox row in one transaction
+    R->>C: read unpublished outbox rows
+    R->>K: catalog.product.published
+    K-->>X: indexer-worker embeds, analytics counts products_published, inventory creates the stock row
+    M->>C: GET /products/{id}
+    C-->>M: status: published
 ```
 
 | Step | What happens | Specified in |
@@ -419,27 +474,33 @@ Partial failure never leaves a half-published product: steps 1–4 are Temporal 
 
 *Flow 2 — Checkout.*
 
-```
-customer        order          inventory      temporal        catalog     kafka
-   │              │                │             │               │          │
-   │ POST /orders │                │             │               │          │
-   │ Idempotency-Key: <uuid>       │             │               │          │
-   ├─────────────▶│                │             │               │          │
-   │              │ claim key (unique insert)    │               │          │
-   │              │ snapshot product data ───────┼──────────────▶│          │
-   │              │ persist order = pending      │               │          │
-   │              │ start OrderWorkflow ────────▶│               │          │
-   │◀─────────────┤ 202 {order_id, status}       │               │          │
-   │              │                │  reserve ───┤               │          │
-   │              │                │◀────────────┤               │          │
-   │              │                │  charge (simulated)         │          │
-   │              │                │  commit reservation         │          │
-   │              │                │  create shipment            │          │
-   │              │◀───────────────┼─ confirm ───┤               │          │
-   │              ├─ outbox ───────┼─────────────┼───────────────┼─────────▶│
-   │              │                │             │               │   order.confirmed
-   │              │                │             │               │     ├─▶ notification
-   │              │                │             │               │     └─▶ analytics
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Customer
+    participant O as order
+    participant CA as catalog
+    participant T as Temporal (OrderWorkflow)
+    participant IN as inventory
+    participant K as Kafka
+    participant N as notification, analytics
+    U->>O: POST /orders + Idempotency-Key
+    O->>O: claim key (unique insert, B7)
+    O->>CA: read each product with the user's token
+    CA-->>O: name, SKU, price (snapshotted)
+    O->>O: order pending + items + outbox order.created in one transaction
+    O->>T: start OrderWorkflow (workflow_id = order-{order_id})
+    O-->>U: 202 {order_id, status}
+    T->>IN: reserve (service token)
+    IN-->>T: reserved
+    T->>T: charge (simulated PaymentProvider)
+    T->>IN: commit reservation
+    T->>T: create shipment (simulated ShippingProvider)
+    T->>O: confirm
+    O->>O: confirmed + outbox order.confirmed in one transaction
+    O-)K: order.confirmed (published by outbox-relay)
+    K-)N: notification records and pushes, analytics counts
+    Note over O,IN: A failing step runs compensations in reverse: release reservation, refund, mark order failed
 ```
 
 | Step | What happens | Specified in |
@@ -456,19 +517,27 @@ Any step failing runs its compensation in reverse — release reservation, refun
 
 *Flow 3 — Assistant query.*
 
-```
-customer      gateway     assistant      vector store   catalog/inventory    LLM
-   │             │            │                │               │              │
-   │ POST /assistant/chat (SSE)                │               │              │
-   ├────────────▶├───────────▶│                │               │              │
-   │             │            │ embed query ───┼───────────────┼─────────────▶│
-   │             │            │ top-k search ─▶│               │              │
-   │             │            │◀── chunks ─────┤               │              │
-   │             │            │ hydrate live price/stock ─────▶│              │
-   │             │            │ assemble prompt + history      │              │
-   │             │            ├────────────────┼───────────────┼─────────────▶│
-   │◀══ token stream (SSE) ═══┤◀═══════════════┼═══════════════┼══════════════┤
-   │             │            │ persist message, emit assistant.interaction   │
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Customer
+    participant G as gateway
+    participant A as assistant
+    participant V as vector store (assistant_db)
+    participant H as catalog / inventory
+    participant L as LLM provider
+    U->>G: POST /assistant/chat (SSE)
+    G->>A: streaming pass-through
+    A->>L: embed query
+    A->>V: top-k search
+    V-->>A: chunks
+    A->>H: hydrate live price and stock
+    A->>A: assemble prompt + history
+    A->>L: generate
+    L-->>A: token stream
+    A-->>G: token stream (SSE)
+    G-->>U: token stream (SSE)
+    A->>A: persist message, emit assistant.interaction via the outbox
 ```
 
 | Step | What happens | Specified in |
@@ -481,27 +550,27 @@ customer      gateway     assistant      vector store   catalog/inventory    LLM
 
 *Beneath all three — the event path.* Every state-change event in the platform travels the same way:
 
-```
- producing service              outbox-relay              Kafka            consumer
-      │                              │                      │                    │
-      │ BEGIN                        │                      │                    │
-      │  update aggregate            │                      │                    │
-      │  insert outbox(event, correlation, client_id)       │                    │
-      │ COMMIT ──────────────────────┼──────────────────────┼────────────────────┤
-      │                              │ SELECT … WHERE       │                    │
-      │                              │  published_at IS NULL│                    │
-      │                              │  FOR UPDATE SKIP LOCKED                   │
-      │                              │ serialise Avro ─────▶│ key=aggregate_id   │
-      │                              │ on ack: set published_at                  │
-      │                              │                      ├───────────────────▶│
-      │                              │                      │  restore trace ctx │
-      │                              │                      │  seen(event_id)?   │
-      │                              │                      │   yes → commit,skip│
-      │                              │                      │   no  → BEGIN      │
-      │                              │                      │     insert processed│
-      │                              │                      │     apply effect   │
-      │                              │                      │    COMMIT          │
-      │                              │                      │  commit offset     │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Producing service
+    participant DB as Producer database
+    participant R as outbox-relay
+    participant K as Kafka
+    participant C as Consumer
+    P->>DB: BEGIN, update aggregate, insert outbox (event, correlation, client_id), COMMIT
+    R->>DB: SELECT … WHERE published_at IS NULL FOR UPDATE SKIP LOCKED
+    R->>K: serialise Avro, produce with key = aggregate_id
+    K-->>R: ack
+    R->>DB: set published_at
+    K->>C: deliver (at-least-once)
+    C->>C: restore trace context
+    alt event_id already seen
+        C->>C: skip
+    else new event
+        C->>DB: BEGIN, insert processed_events, apply effect, COMMIT (consumer's own database)
+    end
+    C->>K: commit offset
 ```
 
 If the relay crashes after producing but before setting `published_at`, the row is re-published on restart — a duplicate `event_id` that the consumer's dedupe absorbs. That is the at-least-once trade (C4), and it is why the outbox, the envelope's `event_id` and `processed_events` are a single design rather than three. Relay and consumer base class: [RFC 0001](0001-platform-and-shared-infrastructure.md).
@@ -537,7 +606,7 @@ Boundaries are recursive: the same reasoning applies below the service line, whi
   tests/{unit,integration}/<entity>/
 ```
 
-**Why the version sits inside the entity.** A table has one shape at a time, so its ORM model and the rules that guard it cannot be versioned; only the HTTP contract (paths, request and response bodies) can. A v2 is a new `<entity>/v2/` folder and one `include_router` line, and both versions call the same repo. Version-first (`app/v1/<entity>/`) would copy models and rules per version; a split `app/<entity>/` + `app/api/v1/<entity>/` would spread each entity over two trees (ARC-D in §3.2.1).
+**Why the version sits inside the entity.** A table has one shape at a time, so its ORM model and the rules that guard it cannot be versioned; only the HTTP contract (paths, request and response bodies) can. A v2 is a new `<entity>/v2/` folder and one `include_router` line, and both versions call the same repo. Version-first (`app/v1/<entity>/`) would copy models and rules per version; a split `app/<entity>/` + `app/api/v1/<entity>/` would spread each entity over two trees ([ARC-D23](#321-decision-register)).
 
 **Routes.** Each `v<N>/routes.py` owns one `router = APIRouter()` and declares its handlers with decorators, with paths relative to the entity prefix and all HTTP metadata on the decorator (`@router.get("/{product_id}", response_model=ProductDetail)`). `app/router.py` builds `APIRouter(prefix="/api/v1")` and includes each entity router under its prefix and tag (`v1.include_router(products_v1.router, prefix="/products", tags=["products"])`); `main.py` mounts it. Declaration order inside a routes module is significant — a literal segment such as `/me` is declared before `/{id}`.
 
@@ -613,6 +682,61 @@ Fixed here so producers and consumers are designed against the same list. A prod
 | `inventory.stockout` | `inventory` | `variant_id` | `analytics`, `notification` | [RFC 0006](0006-inventory-service.md#3123-events-produced) |
 | `assistant.interaction` | `assistant` | `conversation_id` | `analytics` | [RFC 0009](0009-assistant-service.md#3123-events-produced) |
 
+**Event flow.** The same catalogue drawn as producer → topic → consumer. Every edge from a producer goes through its `outbox` and `outbox-relay` (§3.1.1.6, *the event path*).
+
+```mermaid
+flowchart LR
+    subgraph producers["Producers"]
+        p_idn["identity"]
+        p_cat["catalog"]
+        p_ord["order"]
+        p_inv["inventory"]
+        p_ast["assistant"]
+    end
+    subgraph topics["Topics (smartretail.*)"]
+        t_ur(["identity.user.registered"])
+        t_ms(["identity.merchant.status_changed"])
+        t_pp(["catalog.product.published"])
+        t_pu(["catalog.product.updated"])
+        t_pn(["catalog.product.unpublished"])
+        t_oc(["order.created"])
+        t_ok(["order.confirmed"])
+        t_of(["order.failed"])
+        t_ox(["order.cancelled"])
+        t_pay(["payment.succeeded / payment.failed"])
+        t_sh(["shipment.status_changed"])
+        t_rr(["inventory.reserved / inventory.released"])
+        t_so(["inventory.stockout"])
+        t_ai(["assistant.interaction"])
+    end
+    subgraph consumers["Consumers"]
+        c_cat["catalog"]
+        c_inv["inventory"]
+        c_ntf["notification"]
+        c_anl["analytics"]
+        c_idx["indexer-worker"]
+    end
+    p_idn --> t_ur & t_ms
+    p_cat --> t_pp & t_pu & t_pn
+    p_ord --> t_oc & t_ok & t_of & t_ox & t_pay & t_sh
+    p_inv --> t_rr & t_so
+    p_ast --> t_ai
+    t_ur --> c_anl & c_ntf
+    t_ms --> c_cat & c_anl
+    t_pp --> c_inv & c_anl & c_idx
+    t_pu --> c_idx & c_anl & c_cat
+    t_pn --> c_idx & c_anl
+    t_oc --> c_anl
+    t_ok --> c_ntf & c_anl
+    t_of --> c_ntf & c_anl
+    t_ox --> c_ntf & c_anl & c_inv
+    t_pay --> c_ntf & c_anl
+    t_sh --> c_ntf & c_anl
+    t_rr --> c_anl
+    t_so --> c_anl & c_ntf
+    t_ai --> c_anl
+```
+
 **Count.** The table has fourteen rows — the "fourteen topics" the archived events RFC refers to. Two rows name a pair (`payment.succeeded` / `payment.failed`, `inventory.reserved` / `inventory.released`), so the number of distinct topics, and of registered schemas and DLQs, is **sixteen**. The `catalog` consumer on `catalog.product.updated` comes from the archived events RFC's cache-invalidation rule and was not listed in the archived catalogue; it is added here so the table is complete.
 
 **Carrying tables.** A producer carries `outbox`; a consumer carries `processed_events` — tabulated per database in §3.1.3.2.
@@ -653,7 +777,7 @@ The fields not held as outbox columns (`event_version`, `producer`) are supplied
 
 **Schema rules.**
 
-- **Avro with Schema Registry, `BACKWARD` compatibility (C5).** Schemas are checked at registration, so an incompatible change fails in CI rather than in a consumer at runtime. JSON Schema was the alternative; Avro is what Part A's "Schema Registry" implies and gives compact payloads with real evolution rules. Schemas live in `common/events/schemas/` and are registered by a script ([RFC 0001](0001-platform-and-shared-infrastructure.md)).
+- **Avro with Schema Registry, `BACKWARD` compatibility (C5).** Schemas are checked at registration, so an incompatible change fails in CI rather than in a consumer at runtime. JSON Schema was the alternative; Avro is what Part A's "Schema Registry" implies and gives compact payloads with real evolution rules. Schemas live in `common/smartretail_common/events/schemas/` and are registered by a script ([RFC 0001](0001-platform-and-shared-infrastructure.md)).
 - **Additive evolution only.** A new field is optional with a default. `client_id` is the worked example: `{"name": "client_id", "type": ["null", "string"], "default": null}` — `null` must be first in the union for the default to be legal, and with the default present the change is `FULL`, not merely the `BACKWARD` that C5 requires: a v2 reader resolves a v1 record through the default, and a v1 reader skips the unknown field. The compatibility test asserts both directions.
 - **Minimum payload.** Events carry ids and the minimum payload a consumer needs — no credentials, no password hashes, no card data, no full PII beyond what a consumer requires.
 
@@ -689,10 +813,10 @@ Fixed once, followed by every service. A deviation is a review failure, not a st
 | S1 | **Primary keys** | One test: **does the id ever leave the database?** Yes → `uuid` v4, generated by the database (`gen_random_uuid()`). No, and the table is high-volume and append-only → `bigserial`. The `bigserial` set is exactly `*_audit_log`, `order_status_history`, `stock_movements`, `outbox` and `notifications.seq` | **`uuid` where the id leaves the database** — URLs, API responses, event payloads, analytics joins. There a sequential integer leaks volume (`/orders/84215`), collides when analytics merges ids from separate databases, and cannot be generated before the insert, which idempotency and correlation ids require. **`bigserial` where it never does** — none of those three benefits apply, so only UUID's cost is left, and these are the highest-insert tables in the system. A random UUID lands each insert on a random B-tree leaf (page splits, cache misses, extra WAL); `bigserial` appends to the rightmost leaf, is 8 bytes instead of 16, and gives a built-in order that `ORDER BY id` and cursor reads rely on (the outbox relay, notification catch-up). `notifications` shows both: `id` is a `uuid` because clients see it and use it to remove duplicates, while `seq` is a `bigserial` used only for internal ordering |
 | S2 | **Money** | `numeric(12,2)` plus a `char(3)` ISO 4217 currency column, always adjacent. Never `float` | Binary floating point cannot represent 0.10. A stored total that disagrees with the sum of its lines by a cent is a defect with no defence |
 | S3 | **Timestamps** | `timestamptz`, UTC, never naive. `created_at` and `updated_at` on every mutable table | A naive timestamp is ambiguous the first time anything runs in another zone, and the ambiguity is unrecoverable |
-| S4 | **Enums** | A plain `text` column. No Postgres `ENUM` type and no `CHECK` constraint. The permitted set is a `DomainEnum` (a `StrEnum`) in the owning entity's `enums.py` (or `app/core/enums.py` when several entities share it), enforced on write by a `DomainEnumText` type decorator and at the API edge by Pydantic — which also publishes the set into OpenAPI. A state machine is additionally constrained by an explicit transition table in the service layer | Adding a value becomes a one-line edit rather than an Alembic revision, and — the decisive reason — `ALTER TYPE … ADD VALUE` is irreversible, so a native enum cannot satisfy S14's mandatory `downgrade`. `text` with a `CHECK` is a migration too, so it solves nothing. Self-documentation moves from `\d` to OpenAPI, which is where clients actually read it. For a state machine the transition table is *stricter* than the type it replaces: a Postgres enum accepts `delivered → pending`, a transition table does not |
+| S4 | **Enums** | A plain `text` column. No Postgres `ENUM` type and no `CHECK` constraint. The permitted set is a `DomainEnum` (a `StrEnum`) in the owning entity's `enums.py` (or `app/core/enums.py` when several entities share it), enforced on write by a `DomainEnumText` type decorator and at the API edge by Pydantic — which also publishes the set into OpenAPI. A state machine is additionally constrained by an explicit transition table in the entity's `utils.py` | Adding a value becomes a one-line edit rather than an Alembic revision, and — the decisive reason — `ALTER TYPE … ADD VALUE` is irreversible, so a native enum cannot satisfy S14's mandatory `downgrade`. `text` with a `CHECK` is a migration too, so it solves nothing. Self-documentation moves from `\d` to OpenAPI, which is where clients actually read it. For a state machine the transition table is *stricter* than the type it replaces: a Postgres enum accepts `delivered → pending`, a transition table does not |
 | S5 | **Soft delete** | A terminal status value (`archived`, `is_active = false`), never a hard `DELETE`, on anything referenced across a boundary | A hard delete breaks snapshots and projections that no foreign key protects. Exception: derived data (`product_chunks`) is hard-deleted, because it is rebuildable |
 | S6 | **Optimistic concurrency** | `version integer`, checked and incremented on update, on every aggregate root with concurrent writers | Lost-update prevention without holding locks across a request. The loser gets `409` |
-| S7 | **Audit** | Per-service audit table, written by the service layer in the same transaction as the change, carrying actor and correlation id | A trigger cannot see the authenticated actor or the request id. Atomicity means no change can exist without its trail |
+| S7 | **Audit** | Per-service audit table, written by the entity's repo in the same transaction as the change, carrying actor and correlation id | A trigger cannot see the authenticated actor or the request id. Atomicity means no change can exist without its trail |
 | S8 | **`jsonb` use** | Permitted for genuinely open-ended data (`attributes`, `variant_options`, `shipping_address` snapshots, event payloads). Never for anything filtered, joined, or constrained across rows | Rigid columns would be wrong within a week for merchant-defined attributes; but a `jsonb` field that gets filtered is an index and a validation problem waiting to happen |
 | S9 | **Naming** | `snake_case`; plural tables; singular columns; `<entity>_id` for references; `is_`/`has_` for booleans; no abbreviations | Eight services written over five weeks; consistency is the only thing that makes them read as one system |
 | S10 | **Nullability** | `NOT NULL` by default. A nullable column must have a documented meaning for null | "Unknown", "not yet", and "not applicable" are three different things and should not share a representation |
@@ -801,7 +925,7 @@ class DomainEnumText(TypeDecorator[Any]):
 
 **Two failure modes that are easy to get wrong**, both verified against this project's pinned SQLAlchemy 2.0 and Pydantic 2.10:
 
-1. `process_bind_param` runs inside the flush, so SQLAlchemy wraps its exception: the caller sees `sqlalchemy.exc.StatementError` with the `UnknownEnumValueError` on `.orig`. The type decorator is therefore a **backstop, not the primary gate** — it fires late, inside the transaction, with a poor error shape. The primary gates are Pydantic at the edge and `transition()` in the service layer.
+1. `process_bind_param` runs inside the flush, so SQLAlchemy wraps its exception: the caller sees `sqlalchemy.exc.StatementError` with the `UnknownEnumValueError` on `.orig`. The type decorator is therefore a **backstop, not the primary gate** — it fires late, inside the transaction, with a poor error shape. The primary gates are Pydantic at the edge and `transition()` in the entity's `utils.py`, called by its repo.
 2. A tolerant ORM read is cancelled out by a strict Pydantic *response* schema — `model_validate` raises `ValidationError` on the unknown value and the 500 reappears one layer later. Both layers must agree. Request schemas stay strict always: the API never accepts a value this build does not know. Response schemas for `passthrough` columns widen to `ProductStatus | str` via a `BeforeValidator`; response schemas for `fallback` columns stay strict, because the ORM already guarantees a member.
 
 **The API contract does not weaken.** Pydantic v2 renders a `DomainEnum` field as a `$defs` entry carrying the full value list, and FastAPI lifts it into OpenAPI unchanged. The published enum is generated from the `DomainEnum` class, so — unlike a hand-maintained `CHECK` or a `\d` listing — it cannot drift from what the service actually accepts.
@@ -889,53 +1013,59 @@ Derived from the event catalogue (§3.1.2.3): a **producer** needs an `outbox`, 
 
 ##### 3.1.3.3. Cross-service entity model
 
-Boxes are aggregates; solid lines are real foreign keys inside one database; dashed lines cross a boundary and are *not* foreign keys. The diagram shows shape — §3.1.3.4 is the complete list, and only that list is exhaustive.
+Entities are tables (§3.1.3.4 gives each one's database); solid lines are real foreign keys inside one database; dotted lines cross a boundary and are *not* foreign keys, and each is labelled with the referencing column and how the value arrives (kinds in §3.1.3.5). The diagram shows shape — §3.1.3.4 is the complete list, and only that list is exhaustive.
 
+```mermaid
+erDiagram
+    %% identity_db
+    users ||--o| merchant_profiles : "has"
+    users ||--o{ refresh_sessions : "holds"
+    %% catalog_db
+    categories ||--o{ categories : "parent of"
+    categories ||--o{ products : "classifies"
+    products ||--o{ product_variants : "has"
+    products ||--o{ product_media : "has"
+    products ||--o{ product_audit_log : "audited by"
+    products ||--o{ product_publish_failures : "records"
+    %% order_db
+    orders ||--o{ order_items : "contains"
+    orders ||--o{ order_status_history : "timeline"
+    idempotency_keys
+    %% inventory_db
+    stock_items ||--o{ reservations : "held by"
+    stock_items ||--o{ stock_movements : "ledger"
+    %% notification_db
+    notifications ||--o{ delivery_attempts : "attempted by"
+    push_subscriptions
+    stream_cursors
+    %% analytics_db (MongoDB)
+    counters
+    daily_metrics
+    product_stats
+    failure_stats
+    raw_events
+    assistant_conversions
+    %% assistant_db (+ pgvector)
+    conversations ||--o{ messages : "contains"
+    product_chunks
+    embedding_cache
+    index_state
+    query_log
+    generations
+    token_budgets
+    bulk_generation_jobs
+    prompt_templates
+    %% cross-boundary references: dotted, NOT foreign keys
+    users ||..o{ products : "merchant_id, projected via event"
+    users ||..o{ orders : "customer_id, claim in token"
+    products ||..o{ order_items : "product_id, snapshot at write"
+    product_variants ||..o| stock_items : "variant_id, projection via event"
+    orders ||..o{ reservations : "order_id, event payload"
+    orders ||..o{ notifications : "order_id, event payload"
+    products ||..o{ product_chunks : "product_id, projection"
 ```
- ┌── identity_db ────────────┐        ┌── catalog_db ──────────────────────┐
- │                           │        │                                    │
- │  users ──┬── merchant_    │        │  categories ──┐ (self-ref tree)     │
- │    │     │   profiles     │        │      │        │                     │
- │    └── refresh_sessions   │        │      ▼        │                     │
- │  outbox ‡                 │        │  products ────┼── product_variants  │
- └───────┬───────────────────┘        │      │        ├── product_media     │
-         ┊ merchant_id                │      │        ├── product_audit_log │
-         ┊ (projected via event)      │      │        └── product_publish_  │
-         └┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄▶ │      │             failures         │
-         ┊ customer_id                │  outbox · processed_events ‡        │
-         ┊ (claim in token)           └──────┼──────────────────────────────┘
-         ┊                                   ┊ product_id / variant_id
- ┌───────▼─── order_db ──────┐               ┊ (snapshot at write)
- │                           │               ├┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┐
- │  orders ──┬── order_items ┼┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘                     ┊
- │           ├── order_status_history         ┌── inventory_db ─────▼────┐
- │           │                                │                          │
- │  idempotency_keys                          │  stock_items ──┬── reser-│
- │  outbox                                    │       │        │   vations│
- │                                            │       └── stock_movements │
- └───────────┬───────────────┘                │  outbox · processed_ev. ‡│
-             ┊ order_id                       └──────────┬───────────────┘
-             ┊ (event payload)                           ┊ order_id
-             ├┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┘ (event payload)
-             ▼
- ┌── notification_db ────┐  ┌── analytics_db (Mongo) ──┐  ┌── assistant_db ────┐
- │                       │  │                          │  │  (+ pgvector)      │
- │  notifications ──┬──  │  │  counters                │  │                    │
- │   delivery_      │    │  │  daily_metrics           │  │  product_chunks ┄┄┼┄▶
- │   attempts       │    │  │  product_stats           │  │  embedding_cache   │
- │  push_subscriptions   │  │  failure_stats           │  │  index_state       │
- │  stream_cursors       │  │  raw_events              │  │  query_log         │
- │  processed_events     │  │  assistant_conversions   │  │  conversations ──┬─│
- └───────────────────────┘  │  processed_events        │  │   messages       │ │
-                            └──────────────────────────┘  │  generations       │
-                                                          │  token_budgets     │
-        ── solid: FK inside one database                  │  bulk_generation_  │
-        ┄┄ dashed: cross-boundary reference, NOT a FK     │    jobs            │
-        ‡  required by S12/S13, named in no archived      │  prompt_templates †│
-           source (§3.1.3.2)                              │  outbox ‡          │
-                                                          │  processed_events  │
-                                                          └────────────────────┘
-```
+
+`‡` and `†` markers, and the shared `outbox` and `processed_events` tables, are left off the diagram: which database carries which shared table is the matrix in §3.1.3.2, and the markers are in §3.1.3.4.
 
 ##### 3.1.3.4. Table index
 
@@ -1022,7 +1152,7 @@ Plus four `‡` **tables** rather than columns — `identity_db.outbox`, `assist
 
 ##### 3.1.3.5. Cross-boundary reference kinds
 
-Every dashed line in §3.1.3.3 is one of five kinds. Naming them is what makes "no foreign keys" a design rather than an omission. The fifth arrived with origin-scoped notification delivery and is proposed rather than settled (§3.3.1, archive/0006 Q7).
+Every dotted line in §3.1.3.3 is one of five kinds. Naming them is what makes "no foreign keys" a design rather than an omission. The fifth arrived with origin-scoped notification delivery and is proposed rather than settled (§3.3.1, archive/0006 Q7).
 
 | Kind | What it is | When used | Example | Consistency |
 | --- | --- | --- | --- | --- |
@@ -1034,18 +1164,15 @@ Every dashed line in §3.1.3.3 is one of five kinds. Naming them is what makes "
 
 The decision procedure, applied to any new cross-boundary reference:
 
-```
-  Does the historical value matter more than the current one?
-        yes ──▶ SNAPSHOT
-        no
-        │
-  Would a few seconds of staleness cause a wrong decision or a wrong display?
-        no  ──▶ PROJECTION (event-fed)
-        yes
-        │
-  Is the caller able to proceed without it?
-        yes ──▶ PROJECTION, with the staleness documented
-        no  ──▶ LIVE LOOKUP, and accept the availability coupling (R5)
+```mermaid
+flowchart TD
+    q1{"Does the historical value matter<br/>more than the current one?"}
+    q1 -- yes --> snap["SNAPSHOT"]
+    q1 -- no --> q2{"Would a few seconds of staleness cause<br/>a wrong decision or a wrong display?"}
+    q2 -- no --> proj["PROJECTION (event-fed)"]
+    q2 -- yes --> q3{"Is the caller able to<br/>proceed without it?"}
+    q3 -- yes --> proj2["PROJECTION, with the<br/>staleness documented"]
+    q3 -- no --> live["LIVE LOOKUP, and accept the<br/>availability coupling (R5)"]
 ```
 
 The fifth kind sits outside that procedure, because it is not a reference to a fact another service owns — nobody owns it. It is a token the client made up, which the platform agrees to carry and compare for equality and nothing else. That is exactly why it needs its own row: calling it a snapshot would imply a source of truth it does not have, and calling it a claim would imply it was verified.
@@ -1159,6 +1286,43 @@ No phase drops a table, and every migration is additive — which is what makes 
 Milestone 3 is where this becomes uncomfortable. Mitigation is fixed now, not then: **Compose profiles** (`core`, `workflow`, `events`, `observability`, `ai`) so that a developer runs the subset they are working on, the observability profile off by default, and one Postgres instance for all services ([RFC 0001](0001-platform-and-shared-infrastructure.md)).
 
 ### 3.2. Rationale
+
+The register in §3.2.1 lists every significant decision this RFC takes, one row each, with the reason in a required column. The arguments behind the rows are written out in full in §3.2.2 and in the sections each row links to.
+
+#### 3.2.1. Decision register
+
+Where a decision already has an archived ID (A1–A14, B*, C*, R*, S*, or another RFC's D*/E*), the row names it as "= A3" and keeps that ID as the binding one; ARC-D numbers are new and do not replace them.
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| ARC-D1 | Decompose by bounded context and data ownership; a candidate is a service only if it passes all four parts of the ownership test | The only method whose boundaries survive a change in requirements, because it follows the domain; a written test lets a reviewer dispute a row rather than a diagram ([§3.1.1.2](#3112-the-ownership-test), [§3.2.2](#322-the-arguments)) | By technical layer (a distributed monolith); by team (one developer); by capability (two services write one fact, [§5](#5-alternate-solutions) alt 3) | A premise in [§8](#8-impact-analysis) *If a premise changed* moves |
+| ARC-D2 | Eight services | What the ownership test yields when applied to all eighteen candidates ([§3.2.2](#322-the-arguments)) | Four (collapses order/inventory and transactional/analytical); fifteen (the prototype — services with nothing in them); modular monolith (strongest alternative, but defeats the distributed-systems objective and makes Kafka ceremony, [§5](#5-alternate-solutions) alt 1) | The Part A review judges the count excessive (archive/0006 Q5) |
+| ARC-D3 | `payment` and `shipment` are folded into `order`, behind a `PaymentProvider` / `ShippingProvider` interface (= A9) | No compliance boundary and no owned state: the provider is simulated and no cardholder data exists; splitting would need a distributed transaction to record one fact ([§3.1.1.2](#3112-the-ownership-test)) | Separate services (an empty box plus a cross-database transaction) | A real payment provider is introduced ([§8](#8-impact-analysis)) |
+| ARC-D4 | `gateway` is a service by exception: stateless, no business logic, no database, not the security boundary | Edge concerns (routing, early rejection, correlation, CORS, rate limits, aggregated OpenAPI) must live in exactly one place ([§3.1.1.2](#3112-the-ownership-test)) | No gateway — duplicate edge concerns into eight services or an unreviewed proxy config ([§5](#5-alternate-solutions) alt 10); Traefik/Kong (deferred, Q5) | Rate limiting and SSE proxying arrive and the hand-written gateway stops sharing `common` cheaply (Q5) |
+| ARC-D5 | One database and one role per service, on one PostgreSQL instance (= A1, A2, R1) | A cross-service query fails at connection time, not at review; eight Postgres containers would not fit beside Kafka and Temporal on a laptop ([§3.1.1.5](#3115-cross-cutting-decisions-a1a14)) | Shared database with a schema per service (the boundary becomes advisory, [§5](#5-alternate-solutions) alt 4); one instance per service (laptop cost) | Deployment leaves the laptop — splitting the instance is a connection-string change |
+| ARC-D6 | No foreign key crosses a boundary; every cross-boundary reference is one of five named kinds (= A3, R2, S15) | Independent deploy, migrate, restore and scale; naming the kinds makes each reference's consistency a decision rather than an accident ([§3.1.3.5](#3135-cross-boundary-reference-kinds), [§3.2.2](#322-the-arguments)) | Cross-database FKs (impossible under ARC-D5); a shared canonical data model and ORM library (couples every deploy, [§5](#5-alternate-solutions) alt 6) | An orphan reference causes a defect that S5, snapshots and events cannot prevent |
+| ARC-D7 | Data is snapshotted at the boundary, not joined across it (= A14, B8) | An order line records what was bought; reading the current price would restate history ([§3.2.2](#322-the-arguments)) | Live join or lookup of the current product (wrong domain behaviour and a runtime dependency) | — (a snapshot is the correct model, not a workaround) |
+| ARC-D8 | `identity` alone authenticates and signs RS256 tokens; every service verifies locally and re-verifies; authorisation is decided by the service that owns the row (= A4, A5) | No network call on the request path, so `identity` being down stops nothing; no shared secret whose leak forges identity; only the owner knows what a row means ([§3.1.1.4](#3114-authentication-and-authorisation-split), [§6.2](#62-security-considerations)) | Central policy service; the gateway as the security boundary; a shared HS256 secret | A delegated identity provider replaces `identity` ([RFC 0003](0003-identity-service.md)) |
+| ARC-D9 | Two internal trust models only: forward the user's token when a user is in context, otherwise a scoped service token; internal routes live under `/internal/v1/*`, reject user tokens and are never gateway-routed | A workflow outlives its request so has no user token; sharing one role for both would let a stolen customer token call internal routes ([§3.1.1.4](#3114-authentication-and-authorisation-split)) | One shared role for user and service callers; internal routes under `/api/v1` (left `stock-items` reachable at the edge, §11 amendment log) | A new internal caller fits neither row — that is an amendment here |
+| ARC-D10 | Exactly one synchronous write-path call: `order → catalog` at creation (= A13, R5) | Price and publication status at purchase must be authoritative; everything else is an event ([§3.1.1.5](#3115-cross-cutting-decisions-a1a14), [§3.3.1](#331-challenges-and-open-questions) Q3) | A local product projection in `order` (puts a staleness window on exactly the wrong fact) | Q3 / archive/0006 Q2 at the Part A review |
+| ARC-D11 | Temporal for multi-step processes, Kafka for facts, Celery for fire-and-forget jobs (= A12) | Three different questions; using one tool for another's job is a known anti-pattern ([§3.2.2](#322-the-arguments)) | Choreography over Kafka (no place shows where an order is stuck, [§5](#5-alternate-solutions) alt 7); Kafka for everything (no workflow state or compensation, alt 8) | — (all three are required by Part A) |
+| ARC-D12 | Transactional outbox in every producer, at-least-once delivery, idempotent consumers deduping on `event_id` in `processed_events` (= A10, A11, B11, C4, S12, S13) | Dual-writing loses events on a crash between commit and publish; Kafka exactly-once does not extend to a Postgres write or an email ([§3.2.2](#322-the-arguments), [§3.1.3.2](#3132-shared-tables--outbox-and-processed_events)) | Dual write in the handler; Kafka transactions; event sourcing as the primary model (too costly for five weeks, [§5](#5-alternate-solutions) alt 5) | Relay publish latency becomes user-visible |
+| ARC-D13 | A fixed event catalogue, keyed by aggregate id, Avro in Schema Registry with `BACKWARD` compatibility and additive-only evolution (= C3, C5) | Events are the hardest thing to change later; an incompatible schema fails at registration in CI, not in a consumer at runtime ([§3.1.2.3](#3123-event-catalogue), [§3.1.2.4](#3124-event-envelope)) | Topics discovered one producer at a time; plain JSON or JSON Schema (no compatibility rules) | A consumer needs global ordering across aggregates |
+| ARC-D14 | One API convention set: RFC 9457 problem details, limit/offset pagination capped at 100, `X-Request-ID` that becomes the trace ID (= A7, A8, C12) | One error shape means one handler in `common`; listings sort by arbitrary columns, where a cursor buys little ([§3.1.2.2](#3122-api-conventions)) | Per-service error shapes; cursor pagination everywhere | A high-volume path needs a cursor — stated in that service's RFC |
+| ARC-D15 | `Idempotency-Key` claimed by a unique insert, scoped per user, stored reply replayed, 24 h retention; deterministic workflow ids and activity tokens behind it (= B7, B3) | Read-check-write races under exactly the burst load Part A describes ([§3.1.2.2](#3122-api-conventions)) | Read-then-write; global (unscoped) keys that let callers probe each other | — |
+| ARC-D16 | Server-to-client streams are SSE, with a single-use ticket where `EventSource` cannot set a header (= E4, C15, C19) | Plain HTTP, so the gateway, JWT verification, rate limiting, tracing and problem details apply unchanged ([§3.1.2.2](#3122-api-conventions)) | WebSockets (a second protocol path through every layer); JWT in the query string (leaks into logs) | A client needs a bidirectional stream |
+| ARC-D17 | `uuid` primary keys wherever the id leaves the database; `bigserial` only for high-volume append-only tables that never expose it (= S1) | Sequential ids leak volume, collide across databases in analytics, and cannot be generated before insert; inside the database `bigserial` appends cheaply and orders naturally ([§3.1.3.1](#3131-schema-conventions-s1s15)) | `uuid` everywhere (random B-tree inserts on the hottest tables); `bigserial` everywhere | A `bigserial` id starts crossing a boundary |
+| ARC-D18 | Enums are `text` validated in the model (`DomainEnum` + `DomainEnumText`), strict on write and tolerant on read (= S4) | A native enum makes S14's mandatory `downgrade` impossible; a transition table is stricter than the type it replaces ([Why enum values are validated in the model](#why-enum-values-are-validated-in-the-model-not-the-database-s4)) | Native Postgres enum (irreversible, [§5](#5-alternate-solutions) alt 11); `CHECK` (still a migration per value — the escape hatch, alt 12); lookup table with FK (duplicated per database, alt 13) | A non-Python writer to any service database appears — then `CHECK (status IN (…))` |
+| ARC-D19 | Each service owns its audit trail, written in the same transaction as the change (= S7) | An audit row outside the change's transaction admits a change without a trail; cross-service transactions do not exist ([§3.1.1.2](#3112-the-ownership-test)) | A central `audit` service (rejected candidate 18); database triggers (cannot see actor or request id) | Cross-service audit queries become a requirement — build a consumer of events |
+| ARC-D20 | `analytics` uses MongoDB | Append-only, per-metric documents of varying shape, and it must never contend with checkout for a pool or lock manager; gives Part A's NoSQL requirement a real workload ([§3.1.3.7](#3137-store-selection), [§3.2.2](#322-the-arguments)) | Another database on the Postgres instance (contends with checkout; leaves the NoSQL requirement as a token table) | — |
+| ARC-D21 | Embeddings in pgvector inside `assistant_db` (= D1, [RFC 0009](0009-assistant-service.md)) | No extra container for a catalogue of a few thousand products ([§3.1.3.7](#3137-store-selection)) | Qdrant or another dedicated vector database (kept as the alternative behind the `VectorStore` protocol) | The corpus grows by two orders of magnitude, or recall or latency disappoint (Q2) |
+| ARC-D22 | One architecture RFC plus one RFC per service; each table's columns defined once, in its owner's RFC, indexed here | Puts everything about one service in one reviewable document; cross-service consistency needs one home ([§3.2.2](#322-the-arguments)) | Milestone-based RFCs (`products` defined three times, four tables missing, [§5](#5-alternate-solutions) alt 14); one document with every column (~1,300 lines read out of context, alt 15) | The catalogue-completeness test keeps finding drift between the index and the code |
+| ARC-D23 | Entity-first service layout with the version folder inside each entity (`<entity>/v1/{routes,schemas}.py` beside unversioned `models.py`, `repo.py`, `utils.py`); `app/router.py` only includes routers and owns every prefix; handlers declared with decorators | A table has one shape at a time, so only the HTTP contract can be versioned; everything about an entity sits in one folder; every URL readable in one file ([§3.1.1.7](#3117-module-structure-inside-a-service), [mentor review §3](../reviews/2026-10-06-mentor-review.md#3-entity-first-service-layout-with-versions)) | Version-first `app/v1/<entity>/` (v2 copies models and rules, which drift); hybrid `app/<entity>/` + `app/api/v1/<entity>/` (each entity split over two trees); central handler registration (indirection once routes and handlers share a file) | Two API versions need different business rules for the same entity |
+| ARC-D24 | Routes do not touch the ORM and repos do not build HTTP responses (enables B1) | One business rule is reachable from a route, a Temporal activity, an event consumer and a CLI, with one implementation and one set of tests ([§3.1.1.7](#3117-module-structure-inside-a-service), [§3.2.2](#322-the-arguments)) | Logic in route handlers (unreachable from activities and consumers) | — (highest cost of erosion; checked at every review, [§7](#7-test-plan)) |
+| ARC-D25 | Every RFC carries a decision register in §3.2.1 with a required *Why* column; no separate ADR files | One table per RFC, and a missing reason shows in review ([mentor review §2](../reviews/2026-10-06-mentor-review.md#2-a-reason-for-every-decision)) | ADR files under `docs/adr/` (splits a service's design across two places again); prose rationale only (nothing shows when a reason is missing) | Register rows routinely fall out of step with the spec text |
+| ARC-D26 | All diagrams are Mermaid; existing ASCII diagrams converted | Text in the Markdown, so it diffs and is reviewed; renders on GitHub, GitLab and VS Code; covers flowchart, sequence, ER and state diagrams ([mentor review §4](../reviews/2026-10-06-mentor-review.md#4-diagrams)) | PlantUML (needs a render server, no inline GitHub rendering); keep ASCII and add Mermaid only for new diagrams (two styles; ASCII ER and sequence diagrams are hard to maintain) | A diagram needs layout control Mermaid cannot give |
+
+#### 3.2.2. The arguments
 
 **Why eight services rather than four, or fifteen.** Four (gateway, identity, commerce, ai) would collapse the two boundaries that carry the most design weight — orders against inventory, and transactional against analytical. Fifteen was the prototype's answer and produced services with nothing in them; a boundary with no state behind it costs a Dockerfile, a migration history, a health check, and CI time while teaching nothing. Eight is what the ownership test in §3.1.1.2 yields when applied honestly, and each of the rejections in that table is a place where the count could have inflated for appearance's sake.
 
@@ -1443,7 +1607,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 - Projection convergence: after a source change and event propagation the projection matches; after a deliberate divergence, a rebuild restores it.
 - Soft delete: archiving a product leaves order history intact and readable.
 - Constraint enforcement: each S11 invariant is tested by attempting to violate it **concurrently**, not just sequentially.
-- Reference kinds: for each dashed edge in §3.1.3.3, assert the declared consistency behaviour — a snapshot does not change, a projection converges, a live lookup reflects the current value immediately.
+- Reference kinds: for each dotted edge in §3.1.3.3, assert the declared consistency behaviour — a snapshot does not change, a projection converges, a live lookup reflects the current value immediately.
 - State machine totality (S4): the transition table's keys are exactly the members of its `DomainEnum`, every target is a known state, every state is reachable from the initial one, and the terminal set is the expected one.
 - Illegal transitions (S4): every pair *not* in the transition table is parametrised and asserted to raise, with the entity unmutated. For `orders` that is 67 named assertions — the writes a native Postgres enum always accepted.
 
@@ -1466,7 +1630,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 - Does every service still pass all four ownership tests?
 - Has any service acquired a second writer for a fact it does not own?
 - Does `common` contain a business rule (R8)? For S4 this is mechanical: a grep of the package for any status literal must return nothing, and that grep is itself a unit test.
-- Has any router acquired direct ORM access, or any service-layer function an HTTP concern?
+- Has any `v<N>/routes.py` acquired direct ORM access, or any repo an HTTP concern?
 - Has any new cross-boundary reference been added without declaring its kind?
 - **Has every `†` and `‡` cell in the §3.1.3.4 census been ratified or re-decided?**
 
@@ -1605,6 +1769,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
   | Sep 29, 2026 | §3.1.1.4 | Recorded the service-token path (client-credentials JWT with `scope`) for callers with no user in context, alongside user-token forwarding for `order → catalog` | archive/0000 reserved "a call with no user in context" for an amendment here; archive/0002 introduced it for Temporal activities without amending this section |
   | Sep 29, 2026 | §3.1.2.1, §3.1.2.3 | Surface map widened to `/api/v1/search/*` and `/api/v1/webhooks/shipment`; `catalog` added as a consumer of `catalog.product.updated`; topic count stated as fourteen rows / sixteen topics | Brought into line with the archived retrieval and events RFCs, which had extended both without amending the catalogue |
   | Sep 29, 2026 | §3.3.1 | Added ARC-Q1 (trace-context carrier) and ARC-Q2 (assistant hydration under R5/A13) | Inconsistencies surfaced by merging the archived RFCs; recorded rather than resolved silently |
+  | Oct 11, 2026 | §3.2.1, §3.1.1.1, §3.1.1.4, §3.1.1.6, §3.1.2.3, §3.1.3.3, §3.1.3.5 | Added the decision register (ARC-D1–ARC-D26); converted every ASCII diagram to Mermaid and added the system context, login sequence and event-flow diagrams | [Mentor review 2026-10-06](../reviews/2026-10-06-mentor-review.md) §2 and §4 |
 
 - **Definition of done for this RFC.** Goals G1–G12 satisfied; RFCs 0001–0009 exist and none contradicts it without saying so; the boundary and convention tests in §7 implemented and green in CI; the §3.1.3.4 census ratified at the Part A review; reviewed and moved to **DONE**.
 
@@ -1612,7 +1777,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against a specific row: a service inventory row or ownership-test candidate in §3.1.1, a boundary rule R1–R8, a decision A1–A14, a topic in the catalogue, a schema convention S1–S15, a `†` or `‡` cell in the §3.1.3.4 census, an open question (Q1–Q9, archive/0006 Q1–Q7, ARC-Q1–Q2), or a rejected alternative in §5 — so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against a specific row: a service inventory row or ownership-test candidate in §3.1.1, a boundary rule R1–R8, a decision A1–A14, a topic in the catalogue, a schema convention S1–S15, a `†` or `‡` cell in the §3.1.3.4 census, a decision-register row ARC-D1–ARC-D26, an open question (Q1–Q9, archive/0006 Q1–Q7, ARC-Q1–Q2), or a rejected alternative in §5 — so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

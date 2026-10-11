@@ -38,6 +38,8 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
+     - 3.2.2. [Rationale in prose](#322-rationale-in-prose)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -112,34 +114,34 @@ The design has four moving parts:
 
 #### 3.1.1. Architectural changes
 
+```mermaid
+flowchart TB
+  subgraph producers["Producers, via outbox-relay"]
+    identity["identity"]
+    catalog["catalog"]
+    order["order"]
+    inventory["inventory"]
+    assistant["assistant"]
+  end
+  kafka[("Kafka<br/>smartretail.domain.event topics<br/>plus topic.dlq")]
+  identity & catalog & order & inventory & assistant --> kafka
+  subgraph svc["analytics :8006"]
+    consumer["consumers/<br/>restore traceparent, decode Avro, handler"]
+    txn["One Mongo session transaction (ANL-1)<br/>1 insert processed_events, duplicate aborts and skips<br/>2 insert raw_events (envelope)<br/>3 $inc / $set / upsert on counters, daily_metrics,<br/>product_stats, failure_stats, assistant_conversions"]
+    offset["COMMIT, then commit Kafka offset"]
+    api["metrics/v1/routes.py<br/>/api/v1/analytics/* read-only<br/>windows composed on read (C9)"]
+    consumer --> txn --> offset
+  end
+  kafka -->|"consumer group analytics<br/>one process, all topics"| consumer
+  offset -.->|"offset commit"| kafka
+  mongo[("MongoDB analytics_db<br/>single-node replica set rs0")]
+  txn --> mongo
+  api -->|"reads"| mongo
+  beat["celery-worker + Beat<br/>rebuild_daily_rollups<br/>queue: analytics"] -->|"recompute and $set"| mongo
+  gateway["gateway :8000"] -->|"admin and merchant reads"| api
 ```
-   identity   catalog   order   inventory   assistant        (producers, via outbox-relay)
-       │         │        │         │           │
-       └─────────┴────────┴────┬────┴───────────┘
-                               ▼
-            Kafka  smartretail.<domain>.<event>  (+ <topic>.dlq)
-                               │
-                               │  consumer group "analytics"  (one process, all topics)
-                               ▼
-   ┌─────────────────── analytics :8006 ─────────────────────────────┐
-   │ consumers/  restore traceparent → decode Avro → handler           │
-   │   BEGIN (Mongo session, single-node replica set, ANL-1)           │
-   │     insert processed_events {_id:{group,event_id}}  ─ dup? abort, │
-   │     insert raw_events (envelope)                       skip       │
-   │     $inc / $set / upsert: counters, daily_metrics, product_stats, │
-   │                           failure_stats, assistant_conversions    │
-   │   COMMIT → commit Kafka offset                                    │
-   │                                                                   │
-   │ api/v1/analytics/*   read-only; windows composed on read (C9)     │
-   └───────────────────────────────┬──────────────────────────────────┘
-                                   │
-                          ┌────────▼────────┐        ┌──────────────────────┐
-                          │ MongoDB         │◀───────│ celery-worker (Beat) │
-                          │ analytics_db    │        │ rebuild_daily_rollups│
-                          └─────────────────┘        │ queue: analytics     │
-                                                     └──────────────────────┘
-   Nothing on the order path calls analytics, and analytics calls nothing.
-```
+
+Nothing on the order path calls `analytics`, and `analytics` calls nothing. The gateway only routes admin and merchant HTTP reads to it ([§3.1.1.5](#3115-dependencies-and-degradation)).
 
 ##### 3.1.1.1. Responsibility and boundaries
 
@@ -173,7 +175,7 @@ The service-inventory rationale ([archive 0000](archive/0000-system-architecture
 | R5 / A13 | It makes **no** synchronous cross-service call, in or out of the order path. The one permitted synchronous call in the system (`order → catalog`) does not involve it |
 | R6 / A14 | Product names in `product_stats` are snapshots from order lines, never looked up live |
 | R7 | Its reads never require another service to be up; Kafka being down stops ingestion, not reads |
-| R8 | Metric definitions live in `analytics`' service layer, not in `common` |
+| R8 | Metric definitions live in `analytics`' `app/metrics/repo.py` and `app/metrics/rollups.py`, not in `common` |
 | A1, A2 | A service with its own database. A2's shared Postgres instance does not apply: `analytics_db` is MongoDB ([store selection](0000-architecture.md#3137-store-selection)) |
 | A4, A5 | Every endpoint verifies the RS256 JWT locally against `identity`'s JWKS; the gateway's check is not trusted |
 | A6 | Async throughout: Motor for MongoDB, the async consumer base class |
@@ -189,27 +191,69 @@ The service-inventory rationale ([archive 0000](archive/0000-system-architecture
 | S5 (broken) | `raw_events` is hard-deleted by TTL — derived, rebuildable, TTL-bounded |
 | S8 (broken) | `analytics_db` collections are schemaless — per-metric document shapes genuinely vary |
 
-**Module layout** (per [RFC 0000](0000-architecture.md#3117-module-structure-inside-a-service); `models/` holds Motor collection accessors and index declarations instead of SQLAlchemy models):
+**Module layout** — the entity-first layout of [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) and [file-structure.md §4–§5](../file-structure.md#5-per-service-differences). `analytics` has one entity folder, `metrics/`, which owns every collection (`counters`, `daily_metrics`, `product_stats`, `failure_stats`, `raw_events`, `assistant_conversions`); the service is built around `consumers/`. Differences from the template: no `alembic/` and no SQLAlchemy — `metrics/models.py` holds Motor collection handles and index/TTL declarations, created by an idempotent init command ([§3.1.3](#313-dataschema-changes)).
 
 ```
-services/analytics/app/
-├── api/v1/          router.py (every /analytics/* route) + handler files — parse, validate, call, serialise. No rules
-├── services/
-│   ├── metrics.py       the metric definitions; the only place a formula lives
-│   ├── rollups.py       apply_<event_type>() — pure functions: envelope → list of Mongo update ops
-│   ├── scoping.py       merchant scope from the verified claim, injected into every pipeline
-│   ├── conversions.py   assistant interaction ↔ order correlation
-│   ├── reconcile.py     rebuild_daily_rollups logic (called by the Celery task)
-│   └── backfill.py      raw_events → projection replay
-├── models/          collection handles, index and TTL declarations, ensure_indexes()
-├── schemas/         Pydantic request/response contracts
-├── consumers/       one thin handler per topic: decode → services.rollups → txn
-├── tasks/           Celery task shims (rebuild_daily_rollups) — call services/reconcile.py
-├── cli/             backfill, bootstrap-compacted
-└── core/            settings, security dependency, Mongo client, telemetry
+services/analytics/
+├── Dockerfile
+├── pyproject.toml
+├── main.py                  create_application(): settings, logging, Mongo client, ensure_indexes(), router, /health
+└── app/
+    ├── router.py            includes only: owns /api/v1 + the /analytics prefix
+    ├── core/
+    │   ├── config.py        settings (§3.1.1.6)
+    │   ├── db.py            Motor client, session/transaction helper, replica-set check (ANL-1)
+    │   ├── logger.py        JSON logging
+    │   ├── dependencies.py  principal, role guards
+    │   ├── errors.py        DomainError subclasses (problem types)
+    │   ├── schemas.py       Pydantic bases (as_of, money as string)
+    │   └── utils.py         small pure helpers
+    ├── health/routes.py     /health, /health/ready (Mongo primary, broker, consumer lag)
+    ├── metrics/
+    │   ├── models.py        collection handles, index and TTL declarations, ensure_indexes()
+    │   ├── repo.py          MetricsRepo: the metric definitions and read pipelines; the only place a formula lives
+    │   ├── rollups.py       apply_<event_type>() — pure functions: envelope → list of Mongo update ops
+    │   ├── scoping.py       merchant scope from the verified claim, injected into every pipeline
+    │   ├── conversions_repo.py  assistant interaction ↔ order correlation
+    │   ├── reconcile_repo.py    rebuild_daily_rollups logic (called by the Celery task)
+    │   ├── backfill_repo.py     raw_events → projection replay; bootstrap-compacted
+    │   ├── dependencies.py  builds the repos for a request
+    │   ├── enums.py         CounterName, MetricKey, Granularity, PopularRankBy, FailureSource, InteractionKind
+    │   ├── utils.py         bucket keys (UTC date of occurred_at), week/month composition; no I/O
+    │   └── v1/
+    │       ├── routes.py    every /analytics/* route, decorated handlers — parse, validate, call, serialise. No rules
+    │       └── schemas.py   Pydantic request/response contracts
+    ├── consumers/           one thin handler per topic: decode → metrics.rollups → txn; Mongo dedupe adapter; DLQ observer
+    ├── tasks/               Celery task shims (rebuild_daily_rollups) — call metrics/reconcile_repo.py
+    └── cli/                 backfill, bootstrap-compacted — call metrics/backfill_repo.py
 ```
 
-`services/rollups.py` returns *operations*, not writes, so the same function is used by the live consumer, the reconciliation job and the backfill — one formula, three callers, one set of tests.
+`metrics/rollups.py` returns *operations*, not writes, so the same function is used by the live consumer, the reconciliation job and the backfill — one formula, three callers, one set of tests.
+
+```mermaid
+flowchart LR
+  gw["gateway :8000"] --> router["app/router.py<br/>/api/v1/analytics"]
+  router --> routes["metrics/v1/routes.py<br/>+ v1/schemas.py"]
+  routes --> deps["core/dependencies.py<br/>principal, role guards"]
+  routes --> repo["metrics/repo.py<br/>metric definitions, read pipelines"]
+  repo --> scoping["metrics/scoping.py<br/>merchant scope match"]
+  kafka[("Kafka, all catalogue topics<br/>and topic.dlq")] --> consumers["consumers/<br/>one handler per topic,<br/>dedupe adapter, DLQ observer"]
+  consumers --> rollups["metrics/rollups.py<br/>envelope to update ops, pure"]
+  consumers --> conv["metrics/conversions_repo.py"]
+  beat["Celery Beat, hourly"] --> tasks["tasks/<br/>rebuild_daily_rollups"]
+  tasks --> reconcile["metrics/reconcile_repo.py"]
+  reconcile --> rollups
+  reconcile --> conv
+  cli["cli/<br/>backfill, bootstrap-compacted"] --> backfill["metrics/backfill_repo.py"]
+  backfill --> rollups
+  models["metrics/models.py<br/>collections, indexes, TTLs"]
+  repo --> models
+  consumers --> models
+  conv --> models
+  reconcile --> models
+  backfill --> models
+  models --> mongo[("MongoDB analytics_db")]
+```
 
 ##### 3.1.1.2. Domain model
 
@@ -277,6 +321,17 @@ The definitions are stated explicitly so they can be challenged — particularly
 
 A later interaction by the same user while a window is `open` does not open a second window; the window is anchored on the first interaction, so one order cannot convert two windows (ANL-8).
 
+```mermaid
+stateDiagram-v2
+  [*] --> open: assistant.interaction, user_id not null, no open window for the user
+  open --> converted: order.confirmed by the same user within 24h of interaction_at
+  open --> expired: now past interaction_at + 24h with no match (derived at read, not written)
+  expired --> converted: rebuild_daily_rollups re-correlation finds an out-of-order order.confirmed (48h lookback)
+  converted --> [*]
+```
+
+Anonymous interactions (no `user_id`) never enter the machine. `open` and `expired` are both stored as `converted = false`; the difference is only time.
+
 ##### 3.1.1.4. Workflows and async jobs
 
 `analytics` runs no Temporal workflow. It owns three kinds of asynchronous work: the live consumer, the scheduled reconciliation task, and the backfill CLI.
@@ -290,7 +345,7 @@ on message(envelope):
   restore traceparent (C11) → span "analytics.consume {topic}"
   if envelope.occurred_at < now − (PROCESSED_EVENTS_TTL_DAYS − 1)d:      (ANL-2)
       metric outcome="stale"; commit offset; return
-  ops = services.rollups.apply(envelope)       # pure: envelope → Mongo update ops
+  ops = metrics.rollups.apply(envelope)        # pure: envelope → Mongo update ops
   with mongo.start_session() as s:
       s.with_transaction(lambda s:
           processed_events.insert_one({_id:{group:"analytics", event_id}, processed_at:now}, session=s)
@@ -300,6 +355,52 @@ on message(envelope):
       , write_concern=majority, read_concern=snapshot)
   commit Kafka offset
   on transient error: base class retries ×3 with backoff (C6), then → <topic>.dlq, commit offset
+```
+
+The decisions the handler makes for every message:
+
+```mermaid
+flowchart TD
+  msg["Message consumed"] --> trace["Restore traceparent (C11)<br/>span analytics.consume topic"]
+  trace --> stale{"occurred_at older than<br/>PROCESSED_EVENTS_TTL_DAYS - 1 days?"}
+  stale -->|"yes (ANL-2)"| skipStale["outcome = stale<br/>commit offset"]
+  stale -->|"no"| ops["ops = metrics.rollups.apply(envelope)"]
+  ops --> txn["Begin Mongo transaction"]
+  txn --> dedupe{"insert processed_events<br/>raises DuplicateKeyError?"}
+  dedupe -->|"yes"| dup["Abort transaction<br/>outcome = duplicate<br/>commit offset"]
+  dedupe -->|"no"| apply["insert raw_events<br/>execute ops"]
+  apply --> commit{"Transaction committed?"}
+  commit -->|"yes"| ok["outcome = applied<br/>commit Kafka offset"]
+  commit -->|"no, transient error"| retry{"Attempts left,<br/>3 in total (C6)?"}
+  retry -->|"yes, after backoff"| txn
+  retry -->|"no"| dlq["Publish to topic.dlq<br/>outcome = dlq<br/>commit offset"]
+```
+
+The same handling as a sequence, for one event:
+
+```mermaid
+sequenceDiagram
+  participant K as Kafka
+  participant C as analytics consumer
+  participant R as metrics.rollups
+  participant M as MongoDB analytics_db
+  K->>C: envelope (topic, partition, offset)
+  C->>C: restore traceparent, stale guard (ANL-2)
+  C->>R: apply(envelope)
+  R-->>C: list of update ops
+  C->>M: start session, begin transaction
+  C->>M: insert processed_events (group analytics, event_id)
+  alt duplicate _id
+    M-->>C: DuplicateKeyError
+    C->>M: abort transaction
+    C->>K: commit offset (outcome duplicate)
+  else first delivery
+    C->>M: insert raw_events (envelope)
+    C->>M: $inc / $set / $max / upsert rollups
+    C->>M: commit (write concern majority)
+    M-->>C: committed
+    C->>K: commit offset (outcome applied)
+  end
 ```
 
 **How the dedupe and the `$inc` are made atomic (ANL-1).** C4 and S13 require the dedupe record to be written "in the same transaction as the effect". MongoDB supports multi-document transactions only on a replica set, so `analytics_db` runs as a **single-node replica set** (`rs0`, one member) in Compose ([RFC 0001](0001-platform-and-shared-infrastructure.md) hosts it). Inside one transaction:
@@ -330,17 +431,42 @@ Q8 (archive 0000) asked whether rollups are computed on ingest, on read, or both
 | Task | `rebuild_daily_rollups` |
 | Queue | `analytics` |
 | Schedule | Celery Beat, hourly |
-| Host | `celery-worker` ([RFC 0001](0001-platform-and-shared-infrastructure.md)); logic in `services/analytics/app/services/reconcile.py` |
+| Host | `celery-worker` ([RFC 0001](0001-platform-and-shared-infrastructure.md)); logic in `services/analytics/app/metrics/reconcile_repo.py` |
 | Credential | `analytics`' Mongo user (R1, R3) |
 | Idempotent | Yes — it replaces documents with recomputed values; running it twice changes nothing |
 | Safe on two workers | Yes — each bucket is replaced by an `$set` of the full recomputed document keyed by `_id`; concurrent runs converge on the same value |
 
 What it does, in order:
 
-1. **Re-derive commerce and stockout buckets.** For each UTC date `D` in `[today − RECONCILE_LOOKBACK_DAYS, today]` — the days fully covered by `raw_events`' 7-day TTL — run the same `services.rollups` functions over `raw_events` for that date, aggregate in memory, and compare with the stored `daily_metrics` and `failure_stats` documents. A difference is corrected with a full `$set` of the recomputed fields and counted in `analytics_reconcile_drift_total{collection}`. Drift should be zero; a non-zero value is a bug signal, not a routine correction.
+1. **Re-derive commerce and stockout buckets.** For each UTC date `D` in `[today − RECONCILE_LOOKBACK_DAYS, today]` — the days fully covered by `raw_events`' 7-day TTL — run the same `metrics.rollups` functions over `raw_events` for that date, aggregate in memory, and compare with the stored `daily_metrics` and `failure_stats` documents. A difference is corrected with a full `$set` of the recomputed fields and counted in `analytics_reconcile_drift_total{collection}`. Drift should be zero; a non-zero value is a bug signal, not a routine correction.
 2. **Compute assistant latency statistics (ANL-7).** `assistant_avg_latency_ms` and `assistant_p95_latency_ms` cannot be maintained with `$inc` — a mean needs a sum and count, a p95 needs the distribution. The job computes both per `(date, merchant scope)` from `raw_events` (`$percentile` in MongoDB 7.0's aggregation) and `$set`s them. Days older than the lookback keep their last computed values, which are final because the day is complete.
 3. **Re-correlate assistant conversions.** For interactions in the last 48 hours still `converted = false`, look up `order.confirmed` events in `raw_events` for the same user within 24 hours after `interaction_at`. This repairs the out-of-order case where an `order.confirmed` was consumed before the `assistant.interaction` that preceded it (the two topics are on different partitions and keys).
 4. **Emit** `analytics_reconcile_runs_total{outcome}` and `analytics_reconcile_duration_seconds`.
+
+```mermaid
+sequenceDiagram
+  participant B as Celery Beat
+  participant Q as RabbitMQ queue analytics
+  participant W as celery-worker
+  participant T as metrics reconcile_repo
+  participant M as MongoDB analytics_db
+  B->>Q: rebuild_daily_rollups (hourly)
+  Q->>W: deliver task
+  W->>T: run with the analytics Mongo credential
+  loop each UTC date D in the lookback
+    T->>M: read raw_events for D
+    T->>T: re-apply metrics.rollups, aggregate in memory
+    T->>M: read daily_metrics and failure_stats for D
+    opt drift found
+      T->>M: $set full recomputed fields
+      T->>T: analytics_reconcile_drift_total +1
+    end
+    T->>M: avg and p95 latency per date and scope ($percentile), $set (ANL-7)
+  end
+  T->>M: open windows from the last 48h vs order.confirmed in raw_events
+  T->>M: $set converted, order_id, ordered_at on matches
+  T-->>W: emit runs_total and duration
+```
 
 The job never touches `counters` (they are all-time, and `raw_events` holds only 7 days) or `product_stats` (all-time totals, same reason). Both are protected by ANL-1 instead of by reconciliation.
 
@@ -361,9 +487,42 @@ make analytics-backfill PROJECTION=<name> [SINCE=<date>]
 - Once the projection's handler is also deployed in the live consumer, events arriving after the backfill's start are applied by the live consumer; the backfill stops at the deploy timestamp to avoid double application (the CLI takes `--until`, defaulting to "now at start").
 - **Reach is 7 days.** Beyond `raw_events`' TTL there is no backfill source. Kafka's retention is also 7 days, so the two escape hatches have the same horizon; this is the stated cost of Q4's bounded storage.
 
+```mermaid
+sequenceDiagram
+  actor O as Operator
+  participant CLI as app.cli backfill
+  participant B as metrics backfill_repo
+  participant M as MongoDB analytics_db
+  O->>CLI: make analytics-backfill PROJECTION=name SINCE=date
+  CLI->>B: backfill(projection, since, until = now at start)
+  B->>M: find raw_events from since to until, sorted by occurred_at
+  loop each envelope
+    B->>M: begin transaction
+    B->>M: insert processed_events (group analytics.backfill.name, event_id)
+    alt duplicate
+      M-->>B: DuplicateKeyError, abort, skip
+    else new for this group
+      B->>M: execute the projection's apply() ops, commit
+    end
+  end
+```
+
 ###### Bootstrapping from compacted topics
 
 `python -m app.cli bootstrap-compacted` recomputes `total_products` from the latest event per key on `catalog.product.published` / `.unpublished` (count of products whose latest event is `published`) and `$set`s the counter. It is the only correct way to seed a fresh `analytics_db` against a platform that has been running for longer than 30 days, and the only place compacted history is read from offset zero.
+
+```mermaid
+sequenceDiagram
+  actor O as Operator
+  participant CLI as app.cli bootstrap-compacted
+  participant K as Kafka compacted topics
+  participant M as MongoDB analytics_db
+  O->>CLI: make analytics-bootstrap
+  CLI->>K: read catalog.product.published and .unpublished from offset zero
+  K-->>CLI: latest event per product key
+  CLI->>CLI: count products whose latest event is published
+  CLI->>M: $set counters.total_products
+```
 
 ##### 3.1.1.5. Dependencies and degradation
 
@@ -470,6 +629,40 @@ All routes are under `/api/v1`, reached through the gateway at `:8000`, bearer-a
 | `422` | Invalid parameters (`violations[]`) |
 | `503` | MongoDB unavailable — the only dependency a read has |
 
+**Critical path: a merchant-scoped read.** `/orders`, `/revenue`, `/products/popular` and `/inventory/stockouts` share this shape; `/revenue` is shown.
+
+```mermaid
+sequenceDiagram
+  actor U as Merchant client
+  participant G as gateway :8000
+  participant A as analytics metrics/v1/routes.py
+  participant S as metrics scoping.py
+  participant R as metrics repo.py
+  participant M as MongoDB analytics_db
+  U->>G: GET /api/v1/analytics/revenue (from, to, granularity)
+  G->>G: coarse role check from the token (admin or merchant)
+  G->>A: forward with bearer token
+  A->>A: verify RS256 JWT locally (A4, A5), apply role matrix
+  alt merchant_id param differs from the claim
+    A-->>G: 422 problem details
+  else
+    A->>S: scope from the verified claim
+    S-->>A: match stage on merchant_id
+    A->>R: revenue(scope, window, granularity)
+    R->>M: aggregate daily_metrics (scope match, date range, group by period)
+    alt MongoDB unavailable
+      M-->>R: error
+      R-->>A: DomainError
+      A-->>G: 503 problem details
+    else
+      M-->>R: daily buckets
+      R-->>A: series, window totals, as_of
+      A-->>G: 200
+    end
+  end
+  G-->>U: response
+```
+
 ---
 
 **`GET /api/v1/analytics/overview`** — every counter in one payload; the dashboard's home. `admin`.
@@ -527,6 +720,15 @@ Answers: Total Customers, Total Merchants, Total Products Published.
 - **No `from`/`to`** → all-time ranking from `product_stats`, using the `{merchant_id, quantity_sold: -1}` index for a merchant, a collection sort for admin.
 - **`from` within the last `ANALYTICS_RAW_WINDOW_MAX_DAYS`** → the ranking is computed on read by aggregating `order.confirmed` line items in `raw_events` over the window (`$unwind` lines, `$match` scope, `$group` by `product_id`, `$sort`, `$limit`).
 - **`from` older than that** → `422` with a detail naming the retention bound. `product_stats` holds all-time totals only, so an arbitrary historical window has no source (Q-ANL-3).
+
+```mermaid
+flowchart TD
+  req["GET /analytics/products/popular"] --> win{"from / to given?"}
+  win -->|"no"| allTime["All-time ranking from product_stats<br/>merchant: index merchant_id, quantity_sold desc<br/>admin: collection sort"]
+  win -->|"yes"| recent{"from within the last<br/>ANALYTICS_RAW_WINDOW_MAX_DAYS?"}
+  recent -->|"yes"| raw["Aggregate order.confirmed lines in raw_events<br/>unwind lines, match scope, group by product_id,<br/>sort, limit"]
+  recent -->|"no"| err["422, detail names the retention bound"]
+```
 
 ```json
 {"as_of": "…", "rank_by": "quantity", "window": null,
@@ -615,7 +817,7 @@ The baseline is "confirmed orders not preceded by an interaction in the prior 24
 | `GET /analytics/assistant/conversion` | — | — | — | ✓ | — |
 | `/health`, `/health/ready`, `/metrics` | Compose network only | | | | ✓ |
 
-**Scoping rule.** A merchant's queries are filtered by the `merchant_id` in their verified token, **in the aggregation pipeline, not in the response** (archive 0003 §6.2). `services/scoping.py` builds the `$match` stage from the claim and every read path takes it as a mandatory argument, so a query without a scope cannot be constructed. A merchant must not be able to infer another merchant's revenue from a total, which is why merchants never see platform-scope documents, the `overview` counters, or `failures` (whose reasons can name other merchants' orders). A suspended merchant cannot obtain a token ([RFC 0003](0003-identity-service.md)), so suspension needs no analytics-side check.
+**Scoping rule.** A merchant's queries are filtered by the `merchant_id` in their verified token, **in the aggregation pipeline, not in the response** (archive 0003 §6.2). `app/metrics/scoping.py` builds the `$match` stage from the claim and every read path takes it as a mandatory argument, so a query without a scope cannot be constructed. A merchant must not be able to infer another merchant's revenue from a total, which is why merchants never see platform-scope documents, the `overview` counters, or `failures` (whose reasons can name other merchants' orders). A suspended merchant cannot obtain a token ([RFC 0003](0003-identity-service.md)), so suspension needs no analytics-side check.
 
 **The gateway's coarse check.** [Archive 0000](archive/0000-system-architecture.md) §3.1.1 gives "`/api/v1/analytics/*` is `admin`-only" as the gateway's example, while archive 0003 grants `merchant` on four routes. This RFC resolves it: the gateway's route table allows `admin` on all of `/api/v1/analytics/*` and `admin` or `merchant` on the four merchant-scoped routes above; every other role is rejected early. The gateway remains an optimisation (A5) — `analytics` re-verifies the token and applies the matrix itself. The corresponding row belongs in [RFC 0002](0002-gateway-service.md#3122-role-matrix).
 
@@ -649,6 +851,23 @@ Payload schemas are owned by the producer. The "Fields read" column is the contr
 | `assistant.interaction` | `assistant` | `conversation_id`, `user_id` (nullable), `kind`, `finish_reason`, `prompt_tokens`, `completion_tokens`, `cost_usd`, `latency_ms`, `merchant_id` (for `kind=generation`) | `counters.assistant_interactions` `$inc 1`. If `kind=chat`: `assistant_questions_asked` `$inc 1`; `finish_reason=refused` → `assistant_refusals` `$inc 1`; `finish_reason=stop` → `assistant_questions_answered` `$inc 1`; other reasons (`length`, `error`, `budget_exceeded`) count as asked only. `daily_metrics` `{D, assistant, null}` (and `{D, assistant, merchant_id}` for generation): `assistant_messages` `$inc 1`, `assistant_tokens` `$inc prompt+completion`, `assistant_cost` `$inc cost_usd`. If `user_id` not null and no `open` window for the user → insert `assistant_conversions` |
 | `^smartretail\..*\.dlq$` (ANL-9) | consumer base classes | Kafka headers only: original topic, consumer group, error class | Separate group `analytics-dlq-observer`. `failure_stats` `{D, "dlq", "<original_topic>:<error_class>"}` `$inc 1`. The payload is never deserialised — it is poison by definition |
 
+How `assistant.interaction` is classified (Q11, archive 0005; ANL-6; ANL-8):
+
+```mermaid
+flowchart TD
+  ev["assistant.interaction"] --> usage["counters.assistant_interactions +1<br/>daily_metrics assistant bucket:<br/>messages +1, tokens, cost"]
+  usage --> kind{"kind?"}
+  kind -->|"generation"| gen["Usage only<br/>also the per-merchant assistant bucket"]
+  kind -->|"chat"| asked["assistant_questions_asked +1"]
+  asked --> fr{"finish_reason?"}
+  fr -->|"stop"| ans["assistant_questions_answered +1"]
+  fr -->|"refused"| ref["assistant_refusals +1"]
+  fr -->|"length, error, budget_exceeded"| only["Counted as asked only"]
+  usage --> uid{"user_id not null and<br/>no open window for the user?"}
+  uid -->|"yes"| conv["Insert assistant_conversions<br/>window opens"]
+  uid -->|"no"| none["No conversion document"]
+```
+
 Handler failures on the DLQ observer are logged and skipped, never routed to a DLQ of their own, so a DLQ can never feed itself.
 
 **Workflow failure events.** Archive 0003 lists "workflow failure events" among the failure sources. The only workflow failure in the catalogue is `order.failed`. A failed `ProductPublishingWorkflow` is recorded in `catalog`'s `product_publish_failures` table but produces no event, so `analytics` cannot see it without breaking C8. The `workflow` value of `FailureSource` is reserved for it; see Q-ANL-5.
@@ -670,6 +889,88 @@ Owned by `analytics` · **MongoDB 7.x**, single-node replica set `rs0` (ANL-1) �
 | [`raw_events`](#raw_events) | Backfill escape hatch, TTL 7d |
 | [`assistant_conversions`](#assistant_conversions) | Assistant → order correlation |
 | [`processed_events`](#processed_events-mongo-variant) | S13, TTL 30d |
+
+The collections and their key fields, drawn as an ER diagram. **These are MongoDB collections, not relational tables**: entities are collections, attributes are document fields, and there are no foreign keys — the one drawn relationship is the logical link through `event_id`, not an enforced constraint. Types are mapped to the diagram's simple vocabulary: `numeric` is `Decimal128` (or `Int64` for counts), `jsonb` is an embedded object, `timestamptz` is a BSON date. Composite `_id` sub-fields are written `id_<part>` (for example `id_date` is `_id.date`).
+
+```mermaid
+erDiagram
+  counters {
+    text id PK "_id, CounterName"
+    numeric value "Int64, or Decimal128 for revenue_total"
+    text currency "revenue_total only, ANL-4"
+    timestamptz updated_at
+  }
+  daily_metrics {
+    date id_date PK "_id.date, UTC date of occurred_at"
+    text id_metric PK "_id.metric, orders.ISO4217 or stockouts or assistant"
+    uuid id_merchant_id PK "_id.merchant_id, null is platform scope"
+    int orders_created
+    int orders_confirmed
+    int orders_failed
+    numeric revenue "Decimal128"
+    text currency "ISO 4217"
+    int stockouts "metric stockouts only, ANL-5"
+    jsonb variants "variant_id to count, ANL-5"
+    int assistant_messages
+    int assistant_tokens
+    numeric assistant_cost
+    int assistant_avg_latency_ms "set by reconciliation, ANL-7"
+    int assistant_p95_latency_ms "set by reconciliation, ANL-7"
+    timestamptz updated_at
+  }
+  product_stats {
+    uuid id PK "_id is product_id"
+    uuid merchant_id
+    text name "snapshot from order lines"
+    int quantity_sold
+    numeric revenue "reporting currency, ANL-4"
+    text currency
+    int order_count
+    timestamptz last_sold_at "maintained with max"
+    timestamptz updated_at
+  }
+  failure_stats {
+    date id_date PK "_id.date"
+    text id_source PK "_id.source, FailureSource"
+    text id_reason PK "_id.reason"
+    int count
+    timestamptz updated_at
+  }
+  raw_events {
+    uuid event_id UK "unique"
+    text event_type
+    int event_version
+    timestamptz occurred_at "TTL 7 days"
+    text producer
+    text correlation_id
+    text causation_id
+    uuid actor_id
+    text client_id "stored, never read by a metric"
+    jsonb payload
+    text topic
+    int partition
+    int offset
+    timestamptz received_at
+  }
+  assistant_conversions {
+    uuid id PK "_id"
+    uuid user_id
+    timestamptz interaction_at
+    uuid order_id UK "partial unique, ANL-8"
+    timestamptz ordered_at
+    bool converted
+    uuid conversation_id
+    timestamptz created_at
+    timestamptz updated_at
+  }
+  processed_events {
+    text id_group PK "_id.group"
+    uuid id_event_id PK "_id.event_id"
+    text event_type
+    timestamptz processed_at "TTL 30 days"
+  }
+  raw_events |o..o{ processed_events : "same event_id"
+```
 
 **Markers**, as defined in [archive 0006](archive/0006-service-decomposition-and-data-model.md) §3.1.3: *(none)* — stated explicitly in the source RFC; `†` — the field **is named** in a source RFC but its **type was not stated** there, and the type shown is inferred from S1–S15; `‡` — the field is **not named in any source RFC** and exists because a convention requires it. Both markers are proposals for review. Fields and indexes added by this RFC are listed separately under each collection as **ANL additions**, so the copied definitions stay exactly as consolidated.
 
@@ -782,7 +1083,7 @@ TTL is on `occurred_at`, so an event replayed late with an `occurred_at` already
 
 **Migrations.** MongoDB has no Alembic, and S14's intent — independent, reversible, additive changes — is met differently:
 
-- Indexes and TTLs are declared in `models/` and created by an idempotent `ensure_indexes()` at start-up and by `make analytics-indexes` (the "collections and indexes" step in §3.1.5). `createIndex` on an existing identical index is a no-op.
+- Indexes and TTLs are declared in `app/metrics/models.py` and created by an idempotent `ensure_indexes()` at start-up and by `make analytics-indexes` (the "collections and indexes" step in §3.1.5). `createIndex` on an existing identical index is a no-op.
 - A TTL change is `collMod` with a new `expireAfterSeconds`, never drop-and-recreate.
 - Every schema change is an additive field. Readers treat a missing field as zero (`$ifNull`), so old documents need no backfill.
 - Rollback is the previous image; added fields are ignored by older code, and added indexes are harmless.
@@ -809,11 +1110,11 @@ Ordered so that the dedupe-plus-effect transaction is proven on one topic before
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
 | ANL-T1 | MongoDB single-node replica set in Compose; `analytics` skeleton on :8006; settings; `/health`, `/health/ready`, `/metrics`; Mongo user with `readWrite` on `analytics_db` only (archive 0003 T17) | Connectivity; transactions available; R1 grant test green | Platform Kafka and Mongo ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
-| ANL-T2 | `models/`: collections, indexes and TTLs via `ensure_indexes()`; `a001_initial` (archive 0003 T17) | Index creation idempotent; TTLs present | ANL-T1 |
+| ANL-T2 | `metrics/models.py`: collections, indexes and TTLs via `ensure_indexes()`; `a001_initial` (archive 0003 T17) | Index creation idempotent; TTLs present | ANL-T1 |
 | ANL-T3 | Mongo dedupe adapter for the `common` consumer base; the ANL-1 transaction; ANL-2 stale guard | One topic (`identity.user.registered`) end to end; crash-point tests green (ANL-G4) | ANL-T2, `common` consumer base |
-| ANL-T4 | `services/rollups.py` handlers for every commerce topic with ingest-time aggregation (C9) (archive 0003 T18) | Counters and buckets move on consumption; replay test green (ANL-G3) | ANL-T3 |
+| ANL-T4 | `metrics/rollups.py` handlers for every commerce topic with ingest-time aggregation (C9) (archive 0003 T18) | Counters and buckets move on consumption; replay test green (ANL-G3) | ANL-T3 |
 | ANL-T5 | DLQ observer group (ANL-9) | DLQ arrivals appear in `failure_stats` | ANL-T3 |
-| ANL-T6 | The nine [Part A](../part-a.md) §5 metrics in `services/metrics.py` and their read APIs, merchant-scoped in the pipeline (archive 0003 T19) | One test per metric (ANL-G1); merchant isolation (ANL-G7) | ANL-T4 |
+| ANL-T6 | The nine [Part A](../part-a.md) §5 metrics in `metrics/repo.py` and their read APIs (`metrics/v1/routes.py`), merchant-scoped in the pipeline (archive 0003 T19) | One test per metric (ANL-G1); merchant isolation (ANL-G7) | ANL-T4 |
 | ANL-T7 | `rebuild_daily_rollups` on the `analytics` Celery queue, hourly Beat | Drift test and idempotency test green | ANL-T4, platform Celery |
 | ANL-T8 | Backfill CLI and `bootstrap-compacted`; `make analytics-backfill` | Backfill equals live ingestion (ANL-G9) | ANL-T4 |
 | ANL-T9 | Observability: lag, outcome, freshness, reconcile metrics; spans with restored trace context; business-metrics and pipeline panels (archive 0003 T10, T11) | Panels live; consumer spans join producer traces | ANL-T4 |
@@ -840,6 +1141,43 @@ Ordered so that the dedupe-plus-effect transaction is proven on one topic before
 | Review of the Part B metric definitions (Q3, Q11 of archive 0005) | M7 |
 
 ### 3.2. Rationale
+
+The register lists every significant decision in this RFC with its reason; the prose in [§3.2.2](#322-rationale-in-prose) and the alternatives in [§5](#5-alternate-solutions) carry the full argument.
+
+#### 3.2.1. Decision register
+
+Decisions that already carry an ID in this RFC or its sources (ANL-1–ANL-10, C8, C9, and the archive Q-numbers) keep that ID; each register row names it with "= ID", and rows without one are new to the register.
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| ANL-D1 | `analytics` is a separate service with its own MongoDB `analytics_db` | Append-only writes, windowed aggregate reads and per-metric document shapes differ from every other service; a separate store cannot contend with checkout; gives Part A's NoSQL requirement a real workload ([§3.2.2](#322-rationale-in-prose)) | PostgreSQL — Part A requires NoSQL and this is the one genuine document workload (Alt 1, [§5](#5-alternate-solutions)) | Part A drops the NoSQL requirement, or metric shapes converge on one fixed schema |
+| ANL-D2 | Pure consumer: every number comes from a consumed event; never calls or reads another service (= C8) | Makes it structurally impossible for reporting to slow or break checkout ([§3.2.2](#322-rationale-in-prose), [§3.1.1.5](#3115-dependencies-and-degradation)) | Query the sources or their replicas on demand — couples reporting to the transaction path, breaks R1/R4 (Alt 2) | A required metric needs a fact no event carries — then add an event, not a query |
+| ANL-D3 | Counters on ingest, daily buckets on ingest composed on read, rankings on read, plus a reconciliation job (= C9, Q8 archive 0000) | One-shape totals are cheapest stored; windowed rankings cannot all be pre-aggregated; the job covers non-additive stats and drift ([§3.2.2](#322-rationale-in-prose)) | Compute everything on read from `raw_events` — 7-day horizon, scans on every load (Alt 5) | Read latency over daily buckets becomes a problem, or a metric needs finer than daily resolution |
+| ANL-D4 | At-least-once delivery plus an idempotent consumer; no Kafka exactly-once | Kafka transactions stop at Kafka and do not cover a MongoDB write ([§2.2](#22-non-goals)) | Kafka transactions (Alt 3) | — |
+| ANL-D5 | Dedupe record, `raw_events` insert and all rollup updates for one event commit in one MongoDB transaction on a single-node replica set; offset committed after (= ANL-1) | `$inc` is not idempotent, so dedupe-first loses and effect-first doubles increments; only an atomic commit is exactly-once in effect ([§3.1.1.4](#3114-workflows-and-async-jobs)) | `$addToSet` of event ids — unbounded arrays, still not atomic (Alt 6); per-event contribution docs — abandons C9; `$set` of absolute values — read-then-write race ([§3.2.2](#322-rationale-in-prose)) | MongoDB is sharded or transaction throughput becomes the bottleneck |
+| ANL-D6 | Consumer refuses to start without replica-set transactions (`ANALYTICS_REQUIRE_TRANSACTIONS=true`); `false` is an explicit at-most-once local mode | A silently degraded consumer would produce lossy or doubled counters, the one thing the service must not do ([§3.1.1.4](#3114-workflows-and-async-jobs), [§3.3](#33-tradeoffs)) | Silently fall back to non-transactional writes | — |
+| ANL-D7 | Events older than `PROCESSED_EVENTS_TTL_DAYS − 1` days are skipped as `stale` by the live consumer; compacted history is recomputed by `bootstrap-compacted` (= ANL-2) | Replays of compacted topics beyond the 30-day dedupe window would re-increment `total_products` ([§3.1.1.4](#3114-workflows-and-async-jobs)) | Apply every event regardless of age — double counts after the dedupe record expires | Dedupe TTL or Kafka retention changes |
+| ANL-D8 | Buckets keyed by the UTC date of `occurred_at` (= ANL-3) | Event time is stable under replay, lag and backfill, so the replay test and reconciliation are meaningful ([§3.2.2](#322-rationale-in-prose)) | Processing time — moves under replay and lag | Reporting in a local time zone is required |
+| ANL-D9 | One currency per `daily_metrics` document via `metric = orders.<ISO4217>`; all-time totals in one reporting currency (= ANL-4) | Keeps S2's one-currency-per-value rule and "per currency" series without widening `_id` ([§3.1.3](#313-dataschema-changes)) | Mixing currencies in one document — breaks S2 | The platform becomes multi-currency in practice (Q-ANL-6) |
+| ANL-D10 | Stockouts bucketed in `daily_metrics` under `metric = stockouts` with a per-variant map (= ANL-5) | Keeps the stockout-rate numerator in the same bucket shape as its `orders_created` denominator and supplies the offending variants ([§3.1.1.2](#3112-domain-model)) | A separate stockout collection — another collection for the same date × scope shape | Per-variant maps grow too large for one document |
+| ANL-D11 | Separate `assistant_questions_asked` counter; refusals never count as answers (= ANL-6, Q11 archive 0005) | "Asked" is not derivable once errors and budget refusals are excluded from both answered and refused; a ratio counting refusals flatters the feature ([§3.1.3](#313-dataschema-changes), [§3.2.2](#322-rationale-in-prose)) | Derive asked as answered + refused — undercounts; count refusals as answers | — |
+| ANL-D12 | Average and p95 assistant latency computed hourly by `rebuild_daily_rollups` from `raw_events` (= ANL-7) | A mean needs sum and count and a p95 needs the distribution; neither is maintainable with `$inc` ([§3.1.1.4](#3114-workflows-and-async-jobs)) | Compute on ingest — not possible for p95 | Near-live latency becomes a requirement |
+| ANL-D13 | Conversion = any `order.confirmed` within 24 h of the user's first interaction; one window per user per 24 h; one order converts at most one window; reported beside a baseline and labelled correlational (= ANL-8, Q3 archive 0005) | One order must not convert two windows; a metric that flatters the feature is worse than none ([§3.1.1.3](#3113-state-machines), [§3.2.2](#322-rationale-in-prose)) | A window per interaction — one order converts many; causal attribution — not supported by the data | A browse event makes a true non-interacting conversion rate possible (Q-ANL-4) |
+| ANL-D14 | A separate group `analytics-dlq-observer` counts DLQ arrivals from headers only and never re-DLQs (= ANL-9) | A DLQ payload is poison by definition, and a DLQ must never feed itself ([§3.1.2.4](#3124-events-consumed)) | Deserialise DLQ payloads; route observer failures to a DLQ | — |
+| ANL-D15 | The payload fields `analytics` reads are a consumer contract, contract-tested per topic (= ANL-10) | A producer dropping `lines[].merchant_id` or `role` would silently break scoping or counts ([§3.1.4](#314-breaking-changes)) | Rely on Avro `BACKWARD` alone — does not say which fields this consumer needs | — |
+| ANL-D16 | One consumer process and group for all topics (= Q2 archive 0003) | Fewer containers; ordering is per key anyway; handlers are small ([§3.3](#33-tradeoffs)) | One process per topic — more containers for no ordering gain | One topic's handler measurably delays the others |
+| ANL-D17 | Kafka is the only input, consumed by plain Python consumers | Replay, offset reset and backfill need a retained log; a stream processor is a large new concept for no requirement ([§5](#5-alternate-solutions)) | RabbitMQ / Celery as input — no replay (Alt 7); Kafka Streams, ksqlDB, Flink (Alt 4) | The metric set outgrows per-event Python handlers |
+| ANL-D18 | Keep every envelope in `raw_events` with a 7-day TTL (= Q4 archive 0003) | Backfill a new metric without replaying Kafka, with bounded storage ([§3.2.2](#322-rationale-in-prose)) | No raw store (replay Kafka); unbounded retention | A backfill horizon beyond 7 days is needed |
+| ANL-D19 | Reconciliation is an hourly Celery Beat task on the `analytics` queue that replaces documents; no Temporal workflow (A12, C7) | It is a scheduled, idempotent batch with no multi-step compensation; replacing rather than incrementing makes reruns and concurrent workers converge ([§3.1.1.4](#3114-workflows-and-async-jobs)) | A Temporal workflow — nothing to orchestrate | — |
+| ANL-D20 | Backfill and bootstrap are CLI-only, with a distinct dedupe group per projection | A re-run after a crash applies each event once and never repeats the live consumer's effects; replay through an API is a footgun ([§3.1.1.4](#3114-workflows-and-async-jobs), [§6.3](#63-deployment-strategy)) | An HTTP backfill endpoint; reusing the live consumer's group | — |
+| ANL-D21 | Merchant scope applied from the verified token inside the aggregation pipeline; merchants never see platform documents, `overview` or `failures` | A merchant must not see or infer another merchant's figures ([§3.1.2.2](#3122-role-matrix), [§6.2](#62-security-considerations)) | Filtering in the response; trusting the gateway's check (A5) | — |
+| ANL-D22 | Gateway allows `admin` on all `/api/v1/analytics/*` and `merchant` on the four scoped routes | Resolves the conflict between archive 0000's admin-only example and archive 0003's merchant grants ([§3.1.2.2](#3122-role-matrix)) | Admin-only — would reject merchants | — |
+| ANL-D23 | `analytics` produces no events and has no `outbox` | A metric crossing a threshold is not a domain fact and nothing downstream reacts to it ([§3.1.2.3](#3123-events-produced)) | Emitting threshold events | A downstream consumer needs a metric-derived fact |
+| ANL-D24 | Merchant revenue is the sum of the merchant's `line_total`s and excludes shipping; responses carry `basis` | Apportioning shipping would invent a number ([§3.3](#33-tradeoffs)) | Apportion shipping across merchants | — |
+| ANL-D25 | Popularity: all-time from `product_stats`, recent windows (≤ 7 days) from `raw_events`, older windows `422` (Q-ANL-3) | Covers the dashboard's use without a per-product-per-day collection ([§3.1.2.1](#3121-endpoints)) | Per-product-per-day collection — a schema decision not yet justified | Arbitrary historical windows are required |
+| ANL-D26 | Entity-first layout with one `metrics/` entity built around `consumers/`; no Alembic — indexes via idempotent `ensure_indexes()`, additive-only fields | One entity owns all collections; MongoDB has no Alembic, and additive changes meet S14's intent ([§3.1.1.1](#3111-responsibility-and-boundaries), [§3.1.3](#313-dataschema-changes)) | Several entity folders for collections that share one consumer and one formula module | A second, independently changing entity appears |
+
+#### 3.2.2. Rationale in prose
 
 **Why a separate service with MongoDB.** Its access pattern is genuinely different from every other service: append-only writes from event consumers, aggregate reads over time windows, and per-metric documents whose shape varies — a revenue series and a stockout rate share no columns. It must also never be able to slow down a checkout, which is easiest to guarantee when it cannot contend for the same connection pool or lock manager ([archive 0000](archive/0000-system-architecture.md) §3.2). Part A requires a NoSQL store; this gives the requirement a real workload rather than a token table. Deferring the store until this workload existed was a deliberate choice ([archive 0001](archive/0001-foundation-and-core-services.md): "a technology in search of a requirement" otherwise).
 
@@ -975,7 +1313,7 @@ Ordered so that the dedupe-plus-effect transaction is proven on one topic before
 - **No double counting, no lost increments** under crash, rebalance or replay (ANL-1, ANL-G4).
 - **Poison messages cannot stall a partition.** Three retries with backoff, then DLQ, then offset commit (C6); the DLQ observer counts it (ANL-9).
 - **Consumer lag is visible and bounded.** Exported and dashboarded; the consumer scales horizontally up to the partition count (3 locally). Replicas share the group, and the transaction's `_id` collision makes a rebalance duplicate harmless.
-- **Hot documents.** The platform-scope `daily_metrics` document for today and `counters.orders_total` take a write per order. At local volume this is far below MongoDB's per-document update rate; if it ever were not, the fix is sharding the counter into N sub-documents summed on read, a change inside `services/rollups.py` only.
+- **Hot documents.** The platform-scope `daily_metrics` document for today and `counters.orders_total` take a write per order. At local volume this is far below MongoDB's per-document update rate; if it ever were not, the fix is sharding the counter into N sub-documents summed on read, a change inside `metrics/rollups.py` only.
 - **Idempotent everywhere.** The consumer dedupes, the reconciliation job replaces rather than increments, and the backfill has its own dedupe group.
 - **Rebuildable within the horizon.** Buckets within 6 days are recomputed hourly; `total_products` is recomputable from compacted history.
 - **Known ceilings.** One Mongo node, three partitions, one consumer group. None is a design decision that blocks scaling.
@@ -1005,7 +1343,7 @@ Ordered so that the dedupe-plus-effect transaction is proven on one topic before
 
 **Unit** (no infrastructure).
 
-- `services/rollups.py`: for each topic, a fixed envelope produces the exact expected list of update operations — including the `role=admin` no-op, the per-merchant fan-out of a two-merchant order, and `order_count` incremented once for two variants of one product in one order.
+- `metrics/rollups.py`: for each topic, a fixed envelope produces the exact expected list of update operations — including the `role=admin` no-op, the per-merchant fan-out of a two-merchant order, and `order_count` incremented once for two variants of one product in one order.
 - Metric aggregation functions, given a synthetic event sequence (archive 0003 §7).
 - Bucket key: `occurred_at` at 23:59:59.999 UTC and 00:00:00 UTC land in different documents; a week composes Monday–Sunday.
 - AOV over a window is `Σ revenue ÷ Σ confirmed`, not the average of daily averages.

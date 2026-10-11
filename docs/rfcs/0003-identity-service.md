@@ -38,6 +38,8 @@
      - 3.1.4. [Breaking changes](#314-breaking-changes)
      - 3.1.5. [Action Plan](#315-action-plan)
    - 3.2. [Rationale](#32-rationale)
+     - 3.2.1. [Decision register](#321-decision-register)
+     - 3.2.2. [Rationale in detail](#322-rationale-in-detail)
    - 3.3. [Tradeoffs](#33-tradeoffs)
      - 3.3.1. [Challenges and Open Questions](#331-challenges-and-open-questions)
 4. [Dependencies/blockers/known issues](#4-dependenciesblockersknown-issues)
@@ -89,7 +91,7 @@ Goal IDs `G2` and `G4` are carried from [archive/0001](archive/0001-foundation-a
 | Excluded | Why / who owns it |
 | --- | --- |
 | Email delivery, email verification, password reset | No email channel exists; `email_verified` is carried but cannot move to `true`. Registration is immediate. A reset flow needs a delivery channel that `notification` ([RFC 0007](0007-notification-service.md)) would supply; not scheduled |
-| Token **verification** code | `common/auth.py` ([RFC 0001](0001-platform-and-shared-infrastructure.md)). `identity` defines the claims; the shared library checks them |
+| Token **verification** code | `common/smartretail_common/auth.py` ([RFC 0001](0001-platform-and-shared-infrastructure.md)). `identity` defines the claims; the shared library checks them |
 | Rate limiting enforcement | At the `gateway` ([RFC 0002](0002-gateway-service.md)) with Redis. The limits that apply to identity routes are recorded here (§6.2) |
 | Resource-level authorisation in other services | Owned by the service that owns the resource ([RFC 0000 §3.1.1.4](0000-architecture.md#3114-authentication-and-authorisation-split)). `identity` says "merchant `M` with role `merchant`"; `catalog` decides whether `M` may edit product `P` |
 | A central policy service, token introspection on each request | Rejected by A4/A5: verification is local |
@@ -151,7 +153,7 @@ Decided and recorded rather than open: `identity` is **not** split into `auth` a
 | R3 | `identity` is the single writer of users, roles, merchant status, sessions |
 | R4 | Other services learn identity facts through the token (claim), `GET /merchants/{id}` (API), or events |
 | R7 | Local JWT verification is the mechanism by which no other service needs `identity` up to serve reads |
-| R8 | `common` holds verification and the claim model, never `UserRole` or `MerchantStatus` values — those are in `identity/app/models/enums.py` |
+| R8 | `common` holds verification and the claim model, never `UserRole` or `MerchantStatus` values — those are in `services/identity/app/core/enums.py` |
 | A2 | `identity_db` is one logical database on the shared PostgreSQL 16 instance |
 | A4 | RS256; `identity` is the only signer. Every other component holds the public key and verifies locally, with no network call on the request path |
 | A5 | Every service re-verifies the token; the gateway's check is an early rejection, not the boundary |
@@ -161,39 +163,75 @@ Decided and recorded rather than open: `identity` is **not** split into `auth` a
 | A10 | Events are written to `identity_db.outbox` in the state-change transaction; `outbox-relay` publishes |
 | 0001-A5 | **Stateless access tokens, stateful refresh tokens.** Access tokens are short-lived (15 min) and never checked against the database. Refresh tokens are long-lived (7 days), stored hashed in `identity_db`, and can be revoked. The trade of revocation latency for scale, bounded by the access-token TTL |
 
-**Internal module layout** (the [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) shape; handlers do not touch the ORM, the service layer does not construct HTTP responses):
+**Internal module layout** (the entity-first shape of [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) and [file-structure.md](../file-structure.md) §4–§5). Routes handle HTTP only and never touch the ORM; repos hold every rule and never build HTTP responses. Entries marked *(planned)* belong to milestones not yet built (§3.1.5).
 
 ```
 services/identity/
+├── main.py                       create_application(): settings, logger, key ring, DB, /health, app.router
 ├── app/
-│   ├── main.py                 app factory, routers, handlers, /health, /health/ready, /metrics
-│   ├── api/v1/
-│   │   ├── router.py           every route: /auth, /users, /merchants (/me before /{id})
-│   │   ├── auth.py             handlers: register, login, refresh, logout, jwks, token
-│   │   ├── users.py            handlers: /users/me, /users/me/password, admin /users
-│   │   └── merchants.py        handlers: /merchants/me, /merchants/{id}, admin /merchants, /status
+│   ├── router.py                 includes only: /api/v1 + /auth, /users, /merchants prefixes
+│   ├── models.py                 every ORM model on one metadata (Alembic, seed)
+│   ├── seed.py                   admin from SEED_ADMIN_*, demo merchants and customers (T15)
 │   ├── core/
-│   │   ├── settings.py         pydantic-settings (§3.1.1.6)
-│   │   ├── security.py         key ring loading, Argon2id hasher instance
-│   │   └── deps.py             current_principal, require_roles, require_scope
-│   ├── domain/
-│   │   ├── enums.py            UserRole, MerchantStatus (S4)
-│   │   └── merchant_status.py  the transition table (§3.1.1.3)
-│   ├── services/               the only layer with rules
-│   │   ├── registration.py     create user (+ profile), outbox row
-│   │   ├── authentication.py   credential check, dummy-hash equalisation, rehash-on-login
-│   │   ├── sessions.py         issue, rotate, reuse detection, revoke
-│   │   ├── tokens.py           claim assembly and signing (access, service)
-│   │   ├── keys.py             key ring, JWKS document, ETag
-│   │   ├── users.py            profile, password change, admin updates
-│   │   ├── merchants.py        profile, status transitions, outbox row
-│   │   └── service_clients.py  client-credentials grant
-│   ├── models/                 User, MerchantProfile, RefreshSession, Outbox
-│   ├── schemas/                Pydantic request/response models (no password field on any response)
-│   └── db/                     session, base, seed.py
-├── alembic/                    per-service history (A8 of 0001, S14)
-└── tests/{unit,integration}/
+│   │   ├── config.py             Settings (pydantic-settings, §3.1.1.6)
+│   │   ├── db.py                 Database factory, get_db
+│   │   ├── logger.py             JSON logging
+│   │   ├── dependencies.py       app state, current_principal, require_admin / require_merchant
+│   │   ├── security.py           PasswordHasher (Argon2id, dummy hash), KeyRing (sign, JWKS), refresh-token helpers
+│   │   ├── errors.py             problem types: invalid-credentials, email-taken, last-admin, …
+│   │   ├── enums.py              UserRole, MerchantStatus (S4) — shared by several entities
+│   │   └── schemas.py            StrictModel / OutModel bases, shared field types
+│   ├── health/routes.py          /health, /health/ready (DB + active signing key)
+│   ├── auth/
+│   │   ├── models.py             RefreshSession
+│   │   ├── enums.py              TokenType (typ claim; not persisted)
+│   │   ├── dependencies.py       builds the auth repos
+│   │   ├── registration_repo.py  create user (+ merchant profile)
+│   │   ├── authentication_repo.py credential check, dummy-hash equalisation, rehash-on-login
+│   │   ├── session_repo.py       rotate, reuse detection, logout, revoke_all_sessions
+│   │   ├── token_repo.py         claim assembly and signing (access token, session pair)
+│   │   └── v1/{routes,schemas}.py register, login, refresh, logout, jwks (+ token, planned)
+│   ├── users/
+│   │   ├── models.py             User
+│   │   ├── repo.py               profile, password change, admin updates (IDN-7, I10)
+│   │   ├── dependencies.py
+│   │   ├── utils.py              password policy (IDN-2)
+│   │   └── v1/{routes,schemas}.py /users/me, /users/me/password, admin /users
+│   └── merchants/
+│       ├── models.py             MerchantProfile
+│       ├── repo.py               public profile, /me, admin listing (+ status transitions, planned)
+│       ├── dependencies.py
+│       ├── utils.py              MERCHANT_TRANSITIONS (§3.1.1.3), slug derivation
+│       └── v1/{routes,schemas}.py /merchants/me, /merchants/{id}, admin /merchants (+ /status, planned)
+├── alembic/                      per-service history (S14)
+└── tests/{unit,integration}/<entity>/
 ```
+
+The client-credentials grant (IDN-T3) and the outbox writes (IDN-T4, IDN-T5) are *(planned)*: they land in `auth/` and `merchants/` as further repos and routes, not as new top-level packages.
+
+**Components.**
+
+```mermaid
+flowchart LR
+    client["Client"] --> gw["gateway :8000"]
+    gw -->|"/api/v1/auth, /users, /merchants"| routes
+    tw["temporal-worker"] -->|"POST /api/v1/auth/token (direct, planned)"| routes
+    verifiers["Every verifier<br/>(gateway, services, workers)"] -->|"GET /api/v1/auth/jwks"| routes
+    subgraph identity["identity :8001"]
+        routes["auth / users / merchants<br/>v1/routes.py"] --> repos["Repos<br/>registration, authentication,<br/>session, token, user, merchant"]
+        repos --> sec["core/security.py<br/>PasswordHasher, KeyRing"]
+        routes --> sec
+    end
+    keys[("secrets/jwt/*.pem<br/>read-only mount")] --> sec
+    repos --> db[("identity_db<br/>users, merchant_profiles,<br/>refresh_sessions, outbox")]
+    db -.->|"outbox rows"| relay["outbox-relay"]
+    relay -.-> kafka["Kafka<br/>smartretail.identity.*"]
+    kafka -.-> catalog["catalog"]
+    kafka -.-> analytics["analytics"]
+    kafka -.-> notification["notification"]
+```
+
+Solid arrows are synchronous calls; dotted arrows are asynchronous. `identity` makes no synchronous call out (§3.1.1.5).
 
 There is no `consumers/` package: `identity` consumes no events (§3.1.2.4).
 
@@ -218,21 +256,21 @@ There is no `consumers/` package: `identity` consumes no events (§3.1.2.4).
 | I3 | `admin` is never self-assigned | Registration schema restricts `role` to `{customer, merchant}`; `admin` → `422` |
 | I4 | A user never changes their own role | `PATCH /users/me` forbids `role` (Pydantic `extra="forbid"`) → `422`; only `PATCH /users/{id}` as `admin` may |
 | I5 | Every user with `role = merchant` has exactly one `merchant_profiles` row | Created in the same transaction as the user (registration) or the role change (IDN-7) |
-| I6 | `merchant_profiles.status ∈ MerchantStatus`, and changes only along the transition table | `DomainEnumText` + `merchant_status.py` (S4) |
+| I6 | `merchant_profiles.status ∈ MerchantStatus`, and changes only along the transition table | `DomainEnumText` + `MERCHANT_TRANSITIONS` in `merchants/utils.py` (S4) |
 | I7 | A refresh token's raw value is never stored or logged | Only `token_hash` (SHA-256) is persisted |
 | I8 | A refresh session is usable at most once | Rotation sets `revoked_at` on the presented row and inserts a successor, in one transaction, under `SELECT … FOR UPDATE` |
 | I9 | No token is issued to an inactive user or a suspended merchant | Checked at login, refresh and role-bearing issuance ([archive/0003](archive/0003-events-and-observability.md) Q6) |
 | I10 | The platform always has at least one active `admin` | Admin updates that would demote or deactivate the last active admin → `409` (IDN-8) |
 | I11 | Users are never hard-deleted through the API | S5: deactivation is `is_active = false`. The cascades exist for operator and test cleanup only |
 
-**Vocabularies (S4), in `identity/app/models/enums.py`.**
+**Vocabularies (S4), in `services/identity/app/core/enums.py`** (shared by the `users` and `merchants` entities).
 
 | `DomainEnum` | Values | Column |
 | --- | --- | --- |
 | `UserRole` | `customer`, `merchant`, `admin` | `users.role` |
 | `MerchantStatus` | `pending`, `approved`, `suspended` | `merchant_profiles.status` |
 
-Non-persisted vocabularies (plain `StrEnum`, not columns): `TokenType` — `access`, `service` (the `typ` claim, §3.1.2.1); `LoginOutcome` — `success`, `invalid_credentials`, `inactive`, `suspended`, `rate_limited` (metric label only).
+Non-persisted vocabularies (plain `StrEnum`, not columns): `TokenType` — `access`, `service` (the `typ` claim, §3.1.2.1), in `app/auth/enums.py`; `LoginOutcome` — `success`, `invalid_credentials`, `inactive`, `suspended`, `rate_limited` (metric label only).
 
 **Credentials — Argon2id parameters (IDN-1).** [archive/0001](archive/0001-foundation-and-core-services.md) §6.2 specifies "Argon2id with library defaults". They are pinned here explicitly so a library upgrade cannot silently change them; the values are argon2-cffi 23.x's defaults, which are the RFC 9106 low-memory profile:
 
@@ -304,23 +342,43 @@ No `role`, no `sid`, no `merchant_status`. Internal routes require the scope and
 - **Emergency revocation** of a compromised key is steps 1, 3 and 4 back to back: every access token signed by the compromised key stops verifying as soon as verifiers refresh JWKS (at most `max-age`), which forces every client through refresh — which still works, because refresh tokens are not keyed to the signing key.
 - **Bootstrap for verifiers.** [archive/0001](archive/0001-foundation-and-core-services.md) Q4 put the public key in each service's environment; [archive/0000](archive/0000-system-architecture.md) §3.1.1 serves JWKS. Both are kept: `JWT_PUBLIC_KEYS` in a verifier's environment is the **fallback** key set, used when JWKS cannot be fetched at startup, so a verifier never needs `identity` up to boot (R7). JWKS is the rotation path.
 
+Planned key rotation (IDN-6), as a sequence:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant I as identity
+    participant V as Verifier (common JWKS cache)
+    Op->>Op: generate key B into secrets/jwt/
+    Op->>I: restart (B published in JWKS, A still signs)
+    V->>I: GET /api/v1/auth/jwks (cache refresh)
+    I-->>V: keys A and B
+    Note over Op,V: wait at least JWKS max-age (300 s)
+    Op->>I: set JWT_ACTIVE_KID = B, restart
+    Note over I,V: new tokens signed with B, old tokens still verify with A
+    Note over Op,V: wait at least ACCESS_TOKEN_TTL + max-age (20 min)
+    Op->>I: remove A, restart
+    V->>I: GET /api/v1/auth/jwks
+    I-->>V: key B only
+```
+
 ##### 3.1.1.3. State machines
 
-**`MerchantStatus`** — `merchant_profiles.status`. Initial state `pending` (column default). The transition table in `app/utils/merchant_status.py` is authoritative (S4); any pair not listed → `409` problem `…/errors/invalid-merchant-transition`.
+**`MerchantStatus`** — `merchant_profiles.status`. Initial state `pending` (column default). The transition table `MERCHANT_TRANSITIONS` in `app/merchants/utils.py` is authoritative (S4); any pair not listed → `409` problem `…/errors/invalid-merchant-transition`.
 
-```
-                register as merchant
-                (or role → merchant)
-                        │
-                        ▼
-                  ┌───────────┐   approve (admin)   ┌────────────┐
-                  │  pending  │ ──────────────────▶ │  approved  │
-                  └─────┬─────┘                     └──┬──────▲──┘
-                        │ suspend (admin)     suspend  │      │ reinstate
-                        ▼                     (admin)  ▼      │ (admin)
-                  ┌─────────────────────────────────────┐     │
-                  │              suspended              │─────┘
-                  └─────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> pending: register as merchant, or role set to merchant
+    pending --> approved: approve (admin)
+    pending --> suspended: suspend (admin), the rejection path
+    approved --> suspended: suspend (admin), or role changed away from merchant
+    suspended --> approved: reinstate (admin)
+    pending --> suspended: role changed away from merchant
+    note right of pending
+        pending is only ever initial.
+        A repeat of the current status is a no-op, 200, no event.
+    end note
 ```
 
 | From | To | Trigger | Who | Guards | Side effects (same transaction) |
@@ -355,6 +413,21 @@ A suspended merchant's already-issued access token lives out its ≤ 15 minutes;
 | `live` | `expired` | time passes `expires_at` | — (no write; checked on read) |
 | `rotated` / `revoked` | — (terminal) | presented again → **reuse detected** | → revoke every live session of the user, `401` |
 
+```mermaid
+stateDiagram-v2
+    [*] --> live: login, or successor of a rotation
+    live --> rotated: POST /auth/refresh presents it
+    live --> revoked: logout, password change, deactivation,<br/>role change, suspension, reuse detection
+    live --> expired: now() passes expires_at (no write)
+    rotated --> [*]
+    revoked --> [*]
+    expired --> [*]
+    note right of revoked
+        rotated and revoked are terminal. Presenting either again
+        is reuse: every live session of the user is revoked, 401.
+    end note
+```
+
 `rotated` and `revoked` are indistinguishable in the exact schema (both are `revoked_at IS NOT NULL`), so **any** presentation of a revoked token is treated as reuse. That is the fail-safe reading; see §3.3.1 IDN-Q2 for narrowing it to a family.
 
 **`users.is_active`** — boolean, not a machine: `true → false` (admin deactivate: revoke all sessions) and `false → true` (admin reactivate), both via `PATCH /users/{user_id}`.
@@ -367,10 +440,27 @@ A suspended merchant's already-issued access token lives out its ≤ 15 minutes;
 | --- | --- | --- | --- |
 | Event emission | Transactional outbox (A10, S12) | `identity` writes; `outbox-relay` publishes ([RFC 0001](0001-platform-and-shared-infrastructure.md)) | The user/profile change and its `outbox` row commit together. The relay polls `identity_db.outbox` (500 ms, `FOR UPDATE SKIP LOCKED`, archive/0003 C1/C2), produces with key `aggregate_id` (C3), sets `published_at`. Failure mode is a duplicate, never a loss |
 | Published-outbox sweep | Celery Beat `sweep_published_outbox`, `maintenance` queue, daily | Platform task, runs against every producer's outbox including `identity_db` | Deletes published rows past retention |
-| Expired-session sweep (IDN-9, proposed) | Celery Beat `sweep_expired_refresh_sessions`, `maintenance` queue, daily | `identity` service-layer function, hosted by `celery-worker` | Deletes `refresh_sessions` rows with `expires_at < now() - interval '30 days'` or `revoked_at < now() - interval '30 days'`, in batches of 1 000. The 30-day tail keeps reuse detection working for a replayed token well past its expiry |
-| Rehash on login | Inline, same request | `authentication.py` | Replaces an outdated Argon2 hash after a successful verify |
+| Expired-session sweep (IDN-9, proposed) | Celery Beat `sweep_expired_refresh_sessions`, `maintenance` queue, daily | `identity` repo function (`auth/session_repo.py`), hosted by `celery-worker` | Deletes `refresh_sessions` rows with `expires_at < now() - interval '30 days'` or `revoked_at < now() - interval '30 days'`, in batches of 1 000. The 30-day tail keeps reuse detection working for a replayed token well past its expiry |
+| Rehash on login | Inline, same request | `auth/authentication_repo.py` | Replaces an outdated Argon2 hash after a successful verify |
 
 **Outbox rows `identity` writes.** `aggregate_type` = `user`, `aggregate_id` = `users.id` (so the Kafka key is `user_id`, matching the catalogue), `event_type` from §3.1.2.3, `correlation_id` from the request context, `causation_id` null, `client_id` from `X-Client-Id` if the gateway passed one.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant I as identity
+    participant DB as identity_db
+    participant RL as outbox-relay
+    participant K as Kafka
+    participant Cs as catalog / analytics / notification
+    I->>DB: BEGIN, state change + INSERT outbox row, COMMIT
+    loop every 500 ms
+        RL->>DB: SELECT unpublished rows FOR UPDATE SKIP LOCKED
+        RL->>K: produce, key = aggregate_id (user_id)
+        RL->>DB: SET published_at
+    end
+    K->>Cs: deliver (at least once, consumers dedupe)
+```
 
 ##### 3.1.1.5. Dependencies and degradation
 
@@ -489,34 +579,137 @@ ETag: "<sha256 of the serialised key set, first 16 hex>"
 
 `max-age=300` bounds how long a newly published key takes to reach every verifier (rotation step 2). `stale-if-error=86400` tells caches — including the `common` in-process cache, which honours the same directives — to keep verifying with the last good set for a day if `identity` is unreachable, which is what makes IDN-G3 hold across an `identity` outage longer than five minutes. On a token with an unknown `kid` a verifier refetches immediately, at most once per `JWKS_MIN_REFETCH_SECONDS` (30), so a flood of forged `kid`s cannot turn verifiers into a JWKS amplifier.
 
-**Login and refresh flows.**
+How a verifier in `common` resolves the key for a token (IDN-6, R7):
 
+```mermaid
+flowchart TD
+    T["Bearer token"] --> A{"alg is RS256?"}
+    A -- no --> R1["401, before any key lookup"]
+    A -- yes --> K{"kid in cached key set?"}
+    K -- yes --> V["Verify signature, iss, aud, exp, nbf, typ"]
+    K -- no --> Th{"Last refetch older than<br/>JWKS_MIN_REFETCH_SECONDS?"}
+    Th -- no --> R2["401"]
+    Th -- yes --> F["Refetch JWKS"]
+    F --> Ok{"Fetched?"}
+    Ok -- yes --> K2{"kid now present?"}
+    K2 -- yes --> V
+    K2 -- no --> R2
+    Ok -- no --> St["Keep last good set<br/>(stale-if-error, 24 h)"]
+    St --> R2
+    Boot["Verifier start-up"] --> BJ{"JWKS reachable?"}
+    BJ -- yes --> Cache["Cache JWKS"]
+    BJ -- no --> Env["Use JWT_PUBLIC_KEYS<br/>from the environment"]
 ```
- client          gateway             identity                     identity_db
-   │ POST /auth/login│                    │                             │
-   ├────────────────▶│ rate limit (IP,    │                             │
-   │                 │   email) ──429?    │                             │
-   │                 ├───────────────────▶│ SELECT user BY email        │
-   │                 │                    ├────────────────────────────▶│
-   │                 │                    │ verify Argon2id (or dummy)  │
-   │                 │                    │ check is_active, merchant   │
-   │                 │                    │ BEGIN                       │
-   │                 │                    │  INSERT refresh_session     │
-   │                 │                    │  (rehash if needed)         │
-   │                 │                    │ COMMIT ────────────────────▶│
-   │                 │                    │ sign access JWT (sid=…)     │
-   │◀────────────────┤◀───────────────────┤ 200 {access, refresh}       │
 
- POST /auth/refresh {refresh_token}
-   identity: h = sha256(token)
-     BEGIN; SELECT … FROM refresh_sessions WHERE token_hash = h FOR UPDATE
-       none                         → 401
-       revoked_at IS NOT NULL       → REUSE: UPDATE refresh_sessions SET revoked_at = now()
-                                        WHERE user_id = :u AND revoked_at IS NULL; COMMIT; 401
-       expires_at <= now()          → 401
-       user inactive / suspended    → revoke; COMMIT; 401
-       else                         → UPDATE … SET revoked_at = now() WHERE id = :old;
-                                      INSERT successor; COMMIT; 200 {new access, new refresh}
+**Registration.** One transaction writes the user, the merchant profile when `role=merchant`, and (from M3, IDN-T4) the `identity.user.registered` outbox row.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as gateway
+    participant R as identity<br/>registration_repo
+    participant H as PasswordHasher<br/>(thread pool)
+    participant DB as identity_db
+    C->>G: POST /api/v1/auth/register
+    G->>R: forward (100/min per IP default limit)
+    R->>R: validate body: role in customer, merchant, password policy (IDN-2)
+    alt invalid body, role admin, weak password
+        R-->>C: 422 validation
+    end
+    R->>H: hash password (Argon2id, IDN-1)
+    H-->>R: PHC string
+    R->>DB: BEGIN, INSERT users
+    alt unique email violated (citext index)
+        DB-->>R: unique violation, ROLLBACK
+        R-->>C: 409 email-taken
+    else inserted
+        opt role is merchant
+            R->>DB: INSERT merchant_profiles (status pending, unique slug)
+        end
+        R->>DB: INSERT outbox identity.user.registered (M3)
+        R->>DB: COMMIT
+        R-->>C: 201, Location /api/v1/users/{id}, user resource (no tokens)
+    end
+```
+
+**Login.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as gateway
+    participant I as identity<br/>authentication_repo
+    participant DB as identity_db
+    C->>G: POST /api/v1/auth/login {email, password}
+    G->>G: rate limit 5/min per IP and per email
+    alt over the limit
+        G-->>C: 429 + Retry-After
+    end
+    G->>I: forward
+    I->>DB: SELECT user BY email
+    alt unknown email
+        I->>I: verify against the dummy hash (IDN-17)
+        I-->>C: 401 invalid-credentials
+    else wrong password
+        I->>I: verify Argon2id fails
+        I-->>C: 401 invalid-credentials (identical body)
+    else password verifies
+        alt user inactive
+            I-->>C: 403 account-inactive
+        else merchant suspended
+            I-->>C: 403 merchant-suspended
+        else allowed
+            I->>DB: BEGIN, INSERT refresh_sessions, rehash if needed, COMMIT
+            I->>I: sign access JWT (kid, sid, role, merchant_status)
+            I-->>C: 200 {access_token, refresh_token, expires_in 900}
+        end
+    end
+```
+
+**Refresh.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as gateway
+    participant S as identity<br/>session_repo
+    participant DB as identity_db
+    C->>G: POST /api/v1/auth/refresh {refresh_token}
+    G->>S: forward
+    S->>S: h = sha256(token)
+    S->>DB: BEGIN, SELECT refresh_sessions WHERE token_hash = h FOR UPDATE
+    alt no row, or expired
+        S-->>C: 401 invalid-refresh-token
+    else revoked_at set (reuse)
+        S->>DB: UPDATE refresh_sessions SET revoked_at = now()<br/>WHERE user_id = u AND revoked_at IS NULL, COMMIT
+        S-->>C: 401 invalid-refresh-token
+    else user inactive or merchant suspended
+        S->>DB: revoke this session, COMMIT
+        S-->>C: 401 invalid-refresh-token
+    else live
+        S->>DB: UPDATE old row SET revoked_at = now()
+        S->>DB: INSERT successor (fresh 7-day expiry), COMMIT
+        S-->>C: 200 {new access_token, new refresh_token}
+    end
+```
+
+The decision the refresh handler makes, in order:
+
+```mermaid
+flowchart TD
+    A["POST /auth/refresh"] --> B["h = sha256(token)<br/>SELECT ... FOR UPDATE"]
+    B --> C{"Row found?"}
+    C -- no --> X1["401"]
+    C -- yes --> D{"revoked_at IS NOT NULL?"}
+    D -- yes --> X2["Reuse: revoke every live session<br/>of the user, COMMIT, 401"]
+    D -- no --> E{"Expired?<br/>expires_at not in the future"}
+    E -- yes --> X3["401"]
+    E -- no --> F{"User inactive or<br/>merchant suspended?"}
+    F -- yes --> X4["Revoke session, COMMIT, 401"]
+    F -- no --> G["Revoke old row, INSERT successor,<br/>COMMIT, 200 new pair"]
 ```
 
 The `FOR UPDATE` row lock serialises two concurrent refreshes with the same token: the second sees `revoked_at` set and is treated as reuse — the correct reading, because two clients holding one refresh token is exactly what theft looks like.
@@ -534,6 +727,28 @@ The `FOR UPDATE` row lock serialises two concurrent refreshes with the same toke
 
 **User resource.** `{id, email, full_name, phone, role, is_active, email_verified, created_at, updated_at}`. There is no password field on any response model, so it cannot leak by accident.
 
+`PATCH /api/v1/users/{user_id}` carries the most rules of any route (I10, IDN-7):
+
+```mermaid
+flowchart TD
+    P["PATCH /users/{user_id}<br/>role?, is_active?"] --> A{"Caller is admin?"}
+    A -- no --> E403["403"]
+    A -- yes --> U{"User exists?"}
+    U -- no --> E404["404"]
+    U -- yes --> L{"Would demote or deactivate<br/>the last active admin?"}
+    L -- yes --> E409["409 last-admin"]
+    L -- no --> R{"role changed?"}
+    R -- "to merchant" --> M1["Create pending profile if none"]
+    R -- "away from merchant" --> M2["Suspend profile (kept),<br/>status_changed outbox row"]
+    R -- "other change" --> S["Revoke all the user's sessions"]
+    R -- no --> D{"is_active set to false?"}
+    M1 --> S
+    M2 --> S
+    D -- yes --> S
+    D -- no --> OK["200 user resource"]
+    S --> OK
+```
+
 **identity — merchants**
 
 | Method | Path | Auth | Request | Success | Errors |
@@ -544,9 +759,60 @@ The `FOR UPDATE` row lock serialises two concurrent refreshes with the same toke
 | `GET` | `/api/v1/merchants` | bearer | Query: `status`, `q`, `limit`, `offset` — the approval queue is `?status=pending` (IDN-14) | `200` page envelope of profiles | `403` |
 | `POST` | `/api/v1/merchants/{merchant_id}/status` | bearer | `{status, reason?}` | `200` profile. Emits `identity.merchant.status_changed` unless a no-op | `403`; `404`; `409` `…/errors/invalid-merchant-transition`; `422` |
 
-`/merchants/me` is registered before `/merchants/{merchant_id}` in `api/router.py` so `me` is never parsed as an id. `slug` is derived from `business_name` at creation (lower-case, ASCII-folded, hyphenated) with a `-2`, `-3`… suffix on collision; unique by index.
+`/me` is declared before `/{merchant_id}` in `merchants/v1/routes.py` so `me` is never parsed as an id. `slug` is derived from `business_name` at creation (lower-case, ASCII-folded, hyphenated) with a `-2`, `-3`… suffix on collision; unique by index.
 
 `catalog` does **not** call `GET /merchants/{merchant_id}` on its read path — that would be a second synchronous cross-service call, and A13/R5 allow exactly one (`order → catalog`). Clients call it, or `catalog` relies on its event-fed projection.
+
+**Merchant status change (M3).** The admin endpoint, its transaction, and the downstream reaction that needs no call back to `identity`:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Admin
+    participant G as gateway
+    participant I as identity<br/>merchant repo
+    participant DB as identity_db
+    participant K as Kafka (via outbox-relay)
+    participant Cat as catalog
+    A->>G: POST /api/v1/merchants/{id}/status {status, reason}
+    G->>I: forward (admin token)
+    I->>DB: BEGIN, load merchant_profiles row
+    alt status unchanged
+        I-->>A: 200 profile, no event (no-op)
+    else not in MERCHANT_TRANSITIONS
+        I-->>A: 409 invalid-merchant-transition
+    else allowed
+        I->>DB: UPDATE status, INSERT outbox status_changed
+        opt new status is suspended
+            I->>DB: revoke all live refresh sessions of the merchant
+        end
+        I->>DB: COMMIT
+        I-->>A: 200 profile
+        DB-->>K: relay publishes identity.merchant.status_changed
+        K->>Cat: consume, suspended hides products, approved restores
+    end
+```
+
+**Service token (M2, IDN-12).** Not routed by the gateway; `temporal-worker` calls `identity` directly.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as temporal-worker
+    participant I as identity
+    participant Inv as inventory
+    W->>I: POST /api/v1/auth/token<br/>grant_type=client_credentials, client_id, client_secret, scope
+    I->>I: look up SERVICE_CLIENTS, verify secret hash (Argon2id)
+    alt unknown client or wrong secret
+        I-->>W: 401 invalid_client
+    else scope not granted, or wrong grant_type
+        I-->>W: 400 invalid_scope / unsupported_grant_type
+    else ok
+        I-->>W: 200 {access_token typ=service, expires_in 300, scope}
+    end
+    W->>Inv: /internal/v1/inventory/reservations, Bearer service token
+    Inv->>Inv: verify locally, require typ=service and scope
+```
 
 **Operational**
 
@@ -642,17 +908,58 @@ Owned by `identity` · PostgreSQL 16 · one logical database on the shared insta
 
 **Markers** (as in [archive/0006](archive/0006-service-decomposition-and-data-model.md) §3.1.3): *(none)* — stated explicitly in a source RFC; `†` — the column is named in a source RFC but its type was not stated, and the type shown is inferred from S1–S15; `‡` — the column or table is not named in any source RFC and exists because a convention requires it (S1 a primary key, S3 timestamps, S12 an outbox for a producer, S13 a dedupe table for a consumer). The three `identity_db` tables carry no `†` or `‡` cells; the `identity_db.outbox` **table** is `‡`. Row counts: `users` 10 columns, `merchant_profiles` 7, `refresh_sessions` 8.
 
+```mermaid
+flowchart LR
+    subgraph idb["identity_db"]
+        users["users"]
+        mp["merchant_profiles (1:0..1)"]
+        rs["refresh_sessions (1:n)"]
+        ob["outbox ‡"]
+        users --- mp
+        users --- rs
+    end
+    users -. "sub claim (no FK, R2)" .-> claims["products.merchant_id,<br/>orders.customer_id, …"]
+    ob -. "identity.* events" .-> proj["catalog merchant projection<br/>(event-fed)"]
 ```
- ┌── identity_db ─────────────────────────────┐
- │  users ──┬── merchant_profiles (1:0..1)    │
- │          └── refresh_sessions  (1:n)       │
- │  outbox ‡                                  │
- └────────────────────────────────────────────┘
-        │ sub claim ┊ ┊ identity.* events
-        ▼           ▼ ▼
-   products.merchant_id, orders.customer_id, …   (claims — no FK, R2)
-   catalog merchant projection                   (projection, event-fed)
+
+```mermaid
+erDiagram
+    users ||--o| merchant_profiles : "is a merchant with"
+    users ||--o{ refresh_sessions : "holds"
+    users {
+        uuid id PK "gen_random_uuid()"
+        citext email "unique, not null"
+        text password_hash "Argon2id PHC string"
+        text full_name "not null"
+        text phone "nullable"
+        text role "UserRole: customer, merchant, admin"
+        bool is_active "default true"
+        bool email_verified "default false"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    merchant_profiles {
+        uuid user_id PK, FK "users.id, cascade delete"
+        text business_name "not null"
+        text slug "unique"
+        text description "nullable"
+        text status "MerchantStatus, default pending"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    refresh_sessions {
+        uuid id PK
+        uuid user_id FK "users.id, cascade delete, indexed"
+        text token_hash "SHA-256, raw value never stored"
+        timestamptz expires_at "indexed"
+        timestamptz revoked_at "nullable"
+        text user_agent "nullable"
+        text ip "nullable"
+        timestamptz created_at
+    }
 ```
+
+The shared `outbox` table (S12) is defined in [RFC 0000](0000-architecture.md#3132-shared-tables--outbox-and-processed_events) and has no FK to these tables, so it is not drawn.
 
 ###### `users`
 
@@ -703,7 +1010,7 @@ One-to-one with a `merchant` user, so `catalog` has something public to show wit
 | `merchant_profiles` | PK `user_id`; FK `user_id → users.id ON DELETE CASCADE`; unique `slug` | archive/0006 |
 | `refresh_sessions` | PK `id`; FK `user_id → users.id ON DELETE CASCADE`; btree `user_id`; btree `expires_at` | archive/0006 |
 | `refresh_sessions` | **Proposed (IDN-16):** unique btree on `token_hash`. Every refresh and logout looks a session up by hash, and 0006 lists no index for it; uniqueness also makes a 256-bit collision a constraint error rather than a silent ambiguity | this RFC — not in archive/0006 |
-| `users.role`, `merchant_profiles.status` | No `CHECK`, no native enum (S4). `COMMENT ON COLUMN … IS 'DomainEnum: see identity/app/models/enums.py'` | S4 / archive/0006 §3.3 |
+| `users.role`, `merchant_profiles.status` | No `CHECK`, no native enum (S4). `COMMENT ON COLUMN … IS 'DomainEnum <Name> — see services/identity/app/core/enums.py'` | S4 / archive/0006 §3.3 |
 
 Defaults the notes imply but do not spell out — `id` default on `refresh_sessions`, `now()` defaults on `merchant_profiles`/`refresh_sessions` timestamps, nullability of `slug`, `created_at`, `updated_at` — follow S1, S3 and S10: `gen_random_uuid()`, `NOT NULL DEFAULT now()`, and `NOT NULL` (a merchant always has a slug) respectively. These are applications of the conventions, not new decisions.
 
@@ -779,6 +1086,39 @@ Task IDs `T4`–`T7` and `T15` are carried from [archive/0001](archive/0001-foun
 | Expired-session sweep, `token_hash` unique index | M3 | proposed here (IDN-9, IDN-16) |
 
 ### 3.2. Rationale
+
+#### 3.2.1. Decision register
+
+This register lists every significant `identity` decision. Where a decision already carries an ID in this RFC (IDN-1 … IDN-17, or a platform ID such as A4 or 0001-A5), the row says "= <ID>" and that ID stays canonical; the IDN-D numbers only index the register. Cross-cutting decisions owned by [RFC 0000](0000-architecture.md#3115-cross-cutting-decisions-a1a14) are listed only where this RFC applies them in a specific way.
+
+| ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
+| --- | --- | --- | --- | --- |
+| IDN-D1 | `identity` is the only signer: RS256, private key in `identity` only, every other component verifies locally (= A4, A5) | A shared secret lets any verifier forge any identity; local verification keeps `identity` off every request path ([§3.2.2](#322-rationale-in-detail)) | HS256 shared secret: every service could mint tokens (Alt 3). Introspection per request: makes `identity` a runtime dependency of everything (Alt 4) — [§5](#5-alternate-solutions) | A KMS/HSM becomes available, or instant revocation becomes a requirement |
+| IDN-D2 | Stateless 15-minute access tokens, stateful 7-day refresh tokens (= 0001-A5) | Avoids a database read per request in every service; revocation latency is bounded by the access TTL ([§3.2.2](#322-rationale-in-detail), [§3.3](#33-tradeoffs)) | Server-side session cookies: a shared session store becomes a hard dependency of every service (Alt 1) | The 15-minute revocation window is unacceptable for some route |
+| IDN-D3 | Refresh tokens rotate on every use; presenting a rotated or revoked token is reuse and revokes every live session of the user | A stolen token is valid only until either party uses it; the collision is the detection signal (OAuth Security BCP) ([§3.2.2](#322-rationale-in-detail)) | Family-scoped revocation: the `refresh_sessions` schema has no family column (IDN-Q2). No rotation: theft goes undetected | IDN-Q2 adds `family_id` |
+| IDN-D4 | Refresh token is opaque, 32 random bytes, stored only as SHA-256 (= IDN-3, I7) | Only `identity` reads it and must look it up anyway; a signature buys nothing ([§3.1.1.2](#3112-domain-model)) | JWT refresh token: needs server state anyway, and another service might accept it (Alt 7) | — |
+| IDN-D5 | Refresh is deliberately non-idempotent; no reuse grace window | A retried refresh is indistinguishable from replay; a grace window needs the raw successor stored, which I7 forbids ([§3.1.2.1](#3121-endpoints)) | Short grace window or returned-once cache: weakens detection (IDN-Q3) | Client logs show retry-induced logouts |
+| IDN-D6 | Minimal access-token claim set with `sid` and `merchant_status`; no email, name or phone (= IDN-5) | `sid` answers "this session" and "all other sessions" without a lookup; tokens are copied into logs, so they carry only what authorisation needs ([§3.1.1.2](#3112-domain-model)) | Profile data in the token: data-minimisation breach | A consumer needs another claim for authorisation |
+| IDN-D7 | Service tokens: client-credentials grant, `typ=service` + `scope`, 5-minute TTL, `/auth/token` internal-only (= IDN-4, IDN-12) | Temporal activities have no user in context and outlive the user's token; distinct `typ` makes user and internal routes mutually exclusive by construction ([§3.2.2](#322-rationale-in-detail)) | Forward the user's token (Alt 5): fails after expiry and opens internal routes to users. A `service` role (Alt 6): one bug turns a user route internal | A non-Temporal internal caller needs different scopes or lifetimes |
+| IDN-D8 | Signing keys as PEM files in a gitignored mount, four-step rotation, JWKS with `max-age=300` and `stale-if-error`, env key set as verifier fallback (= IDN-6) | Rotation without a login outage or verifier redeploy; verifiers keep working through an `identity` outage (R7, IDN-G3, IDN-G6) ([§3.1.1.2](#3112-domain-model), [§3.1.2.1](#3121-endpoints)) | KMS/HSM: out of scope (archive/0001 Q4). JWKS fetch per request: reintroduces the dependency A4 removes ([§3.3](#33-tradeoffs)) | Deployment leaves Docker Compose |
+| IDN-D9 | Argon2id with parameters pinned in configuration, rehash on login, hashing in a thread pool (= IDN-1) | Memory-hard, OWASP first choice; pinning stops a library upgrade from silently changing cost ([§3.2.2](#322-rationale-in-detail)) | bcrypt / PBKDF2: not memory-hard, bcrypt truncates at 72 bytes (Alt 11). Library defaults: change silently | Login latency or capacity forces a lower cost |
+| IDN-D10 | Password policy: 12–128 characters after NFKC, not equal to the email (= IDN-2) | "Weak password → 422" needs a definition; the upper bound caps hashing cost per request ([§3.1.1.2](#3112-domain-model)) | Unbounded length: hashing cost is caller-controlled | — |
+| IDN-D11 | Email is `citext` with a unique index | Uniqueness enforced by the database, not by every caller remembering to lower-case ([§3.2.2](#322-rationale-in-detail)) | Application-level normalisation: has a race and a forgetting problem (Alt 10) | — |
+| IDN-D12 | Login enumeration defences: one `401` body for unknown email and wrong password, dummy-hash timing equalisation, `403`s only after the password verifies (= IDN-17) | IDN-G4: login cannot be used to enumerate accounts ([§6.2](#62-security-considerations)) | Distinct errors: leak account existence | — |
+| IDN-D13 | Registration keeps `409` on a duplicate email | The honest error a user needs; without email delivery there is no "check your email" alternative ([§3.3](#33-tradeoffs)) | Always-`202` flow: needs email delivery (IDN-Q4) | Email delivery exists |
+| IDN-D14 | `admin` is never self-assignable: seed or promotion by an admin only; the last active admin cannot be demoted or deactivated (= I3, IDN-8) | Every other privilege boundary is only as strong as this one ([§3.2.2](#322-rationale-in-detail)) | Self-chosen role at registration: anonymous path to `admin` | — |
+| IDN-D15 | `MerchantStatus` = `pending` → `approved` / `suspended`, with suspension as the rejection path and no `rejected` value; transitions only via `MERCHANT_TRANSITIONS`; a repeat is a no-op | `pending` is only ever initial; one table is the single source of truth (S4) ([§3.1.1.3](#3113-state-machines)) | Native Postgres `ENUM` or `CHECK`: no inverse for `ADD VALUE`, and weaker than the table (Alt 9) | A real rejection state is needed by the product |
+| IDN-D16 | Suspension refuses token issuance (login `403`, refresh `401`) and revokes sessions; the status is also a claim and an event | Two freshness needs: the claim gates writes for ≤ 15 min, the event-fed `catalog` projection hides products at once (archive/0003 Q6) ([§3.2.2](#322-rationale-in-detail)) | `catalog` calling `GET /merchants/<built-in function id>`: a second synchronous cross-service call, forbidden by A13/R5 | — |
+| IDN-D17 | A role change creates a `pending` profile (to merchant) or suspends it (away from merchant), and always revokes the user's sessions (= IDN-7) | Keeps I5 (every merchant has a profile) and makes the new role take effect at the next login ([§3.1.2.1](#3121-endpoints)) | Deleting the profile: violates S5 soft-delete | A role-change event gets a consumer (IDN-Q6) |
+| IDN-D18 | Non-approved merchants return `404` on the public profile route to non-owners (= IDN-13) | The profile route must not reveal pending or suspended merchants ([§3.1.2.1](#3121-endpoints)) | `200` with status: exposes unapproved merchants publicly | — |
+| IDN-D19 | Two events, `user.registered` and `merchant.status_changed`, written through `identity_db.outbox`; `identity` consumes nothing (= A10, IDN-15) | The event is part of the state-change transaction, so it cannot be lost ([§3.1.2.3](#3123-events-produced)) | Publish from the handler after commit: a crash loses the event (Alt 12) | A consumer needs a new identity fact (IDN-Q6) |
+| IDN-D20 | `identity` makes no synchronous call out; JWKS is served from memory | It sits at the bottom of the dependency graph and keeps serving JWKS when Postgres is down ([§3.1.1.5](#3115-dependencies-and-degradation)) | — | — |
+| IDN-D21 | `merchant` is not its own service, and `identity` is not split into `auth` and `user-profile` | Profiles share the `users` aggregate and its invariants; a split puts a distributed transaction inside registration ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Split services (Alt 8, ownership-test row 17) | Merchant data gains its own invariants or load profile |
+| IDN-D22 | Login rate limits (5/min per IP and per email) are enforced at the gateway and fail open | Edge limiting belongs to the gateway; availability over protection is a platform decision; Argon2id cost is the floor ([§6.2](#62-security-considerations)) | Limiting inside `identity` only: kept as the fallback for the per-email half (IDN-Q8) | IDN-Q8 is resolved the other way |
+| IDN-D23 | Expired-session sweep deletes rows 30 days past expiry or revocation; unique index on `token_hash` (= IDN-9, IDN-16) | Bounds `refresh_sessions` growth while keeping reuse detection for late replays; every refresh looks up by hash ([§3.1.1.4](#3114-workflows-and-async-jobs), [§3.1.3](#313-dataschema-changes)) | No sweep: unbounded table. Immediate delete: replays become "unknown" instead of reuse | — |
+| IDN-D24 | Entity-first layout: `auth/`, `users/`, `merchants/` each with models, repos and `v1/{routes,schemas}.py`; shared enums in `core/enums.py` | Only the HTTP contract can be versioned; one folder per entity keeps its rules together ([§3.1.1.1](#3111-responsibility-and-boundaries); [review §3](../reviews/2026-10-06-mentor-review.md#3-entity-first-service-layout-with-versions)) | Version-first `app/v1/<entity>/`: v2 would duplicate the ORM. Hybrid split tree: an entity in two places | — |
+
+#### 3.2.2. Rationale in detail
 
 **Why RS256 rather than a shared HMAC secret.** With a shared secret, any service that can verify a token can also forge one, so a single compromised service compromises the identity of every user. With asymmetric keys only `identity` can mint tokens, and the public key is not a secret at all. Verification is local, so `identity` being down does not stop `catalog` serving authenticated reads — which matters because `identity` is otherwise a single point of failure for the entire platform.
 
@@ -969,13 +1309,13 @@ Carried questions keep their archive IDs with the source RFC named, because Q nu
 - **Configuration** — twelve-factor, validated at startup; a missing `JWT_ACTIVE_KID` or unreadable key fails the container loudly.
 - **Key rotation** — the four-step procedure in §3.1.1.2 (IDN-6), each step a restart; no verifier redeploys.
 - **Rollback** — Alembic `downgrade` per revision; independent of every other service's history. Rolling back past `0004_outbox` is safe only after the relay has drained `identity_db.outbox`.
-- **Event schemas** — the two Avro schemas live in `common/events/schemas/` and are registered by the idempotent `make topics` step; compatibility `BACKWARD`.
+- **Event schemas** — the two Avro schemas live in `common/smartretail_common/events/schemas/` and are registered by the idempotent `make topics` step; compatibility `BACKWARD`.
 
 ---
 
 ## 7. Test Plan
 
-Target: 100% of the role matrix, ~80% on the service layer. Integration tests use a real Postgres (throwaway database per session), `httpx.ASGITransport`, a transaction rolled back per test.
+Target: 100% of the role matrix, ~80% on the repos (`*_repo.py`, `repo.py`). Integration tests use a real Postgres (throwaway database per session), `httpx.ASGITransport`, a transaction rolled back per test.
 
 **Unit** — no I/O.
 
@@ -1111,7 +1451,7 @@ Target: 100% of the role matrix, ~80% on the service layer. Integration tests us
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against a numbered item — a decision (A*, 0001-A5, IDN-*), an invariant (I1–I11), an open question (Q* with its source, IDN-Q*), a row of the role matrix, or a rejected alternative in §5 — so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against a numbered item — a decision (A*, 0001-A5, IDN-*, or a register row IDN-D*), an invariant (I1–I11), an open question (Q* with its source, IDN-Q*), a row of the role matrix, or a rejected alternative in §5 — so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |
