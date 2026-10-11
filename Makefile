@@ -1,17 +1,19 @@
 # SmartRetail — single entry point (RFC 0001 §3.1.1.12).
-# Milestone 1: the `core` profile (postgres, identity, catalog, gateway).
+# Profiles: `core` (postgres, identity, catalog, gateway) and, from Milestone 2,
+# `workflow` (temporal, temporal-ui, minio, inventory, order and the workers).
 
 SHELL := /bin/bash
-COMPOSE := docker compose --profile core
+PROFILES ?= --profile core --profile workflow
+COMPOSE := docker compose $(PROFILES)
 VENV ?= .venv
 PY := $(abspath $(VENV))/bin/python
-STORE_SERVICES := identity catalog
-PACKAGES := common services/identity services/catalog services/gateway
+STORE_SERVICES := identity catalog inventory order
+PACKAGES := common services/identity services/catalog services/gateway services/inventory services/order
 TEST_PG := smartretail-test-pg
 TEST_PG_PORT := 55432
 
 .DEFAULT_GOAL := help
-.PHONY: help env keys up down reset logs ps migrate seed dev-install hooks test-db test cov lint-types test-e2e lint fmt audit
+.PHONY: help env keys up db-init down reset logs ps migrate seed dev-install hooks test-db test cov lint-types test-e2e lint fmt audit
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -24,8 +26,13 @@ env: .env
 keys: .env ## Generate the RS256 key pair into keys/ if missing
 	./scripts/keys.sh
 
-up: keys ## Build and start the core stack, wait until healthy
+up: keys ## Build and start the stack (PROFILES=--profile core for M1 only), wait until healthy
+	$(COMPOSE) up -d --wait postgres
+	$(MAKE) --no-print-directory db-init
 	$(COMPOSE) up -d --build --wait
+
+db-init: ## Create any missing database and role (idempotent; safe on an existing volume)
+	$(COMPOSE) exec -T postgres bash /docker-entrypoint-initdb.d/01-databases.sh
 
 down: ## Stop the stack, keep volumes
 	$(COMPOSE) down
@@ -45,12 +52,15 @@ migrate: ## Run every service's migrations to head (never on start-up)
 		$(COMPOSE) run --rm --no-deps $$svc alembic upgrade head || exit 1; \
 	done
 
-seed: ## Seed admin, demo accounts and categories (idempotent)
+seed: ## Seed accounts and categories, then demo products published through the real workflow, stock and orders (idempotent)
 	$(COMPOSE) run --rm --no-deps identity python -m app.seed
 	$(COMPOSE) run --rm --no-deps catalog python -m app.seed
+	$(COMPOSE) run --rm --no-deps -v $(CURDIR)/scripts:/scripts:ro \
+		-e GATEWAY_URL=http://gateway:8000 gateway python /scripts/seed_demo.py
 
 dev-install: ## Install every package and dev tool into $(VENV)
-	$(PY) -m pip install -q -e common ./services/identity ./services/catalog ./services/gateway
+	$(PY) -m pip install -q -e "common[temporal]" ./services/identity ./services/catalog \
+		./services/gateway ./services/inventory ./services/order
 	$(PY) -m pip install -q "pytest>=8,<9" "pytest-asyncio>=0.24,<0.26" "pytest-cov>=6,<7" \
 		"ruff>=0.8,<0.9" "mypy>=1.13" "pip-audit>=2.7" "pre-commit>=4"
 
@@ -75,7 +85,7 @@ cov: test-db ## Tests with branch coverage; fails below 85% per package (HTML in
 		(cd $$pkg && $(PY) -m pytest -q --cov --cov-report=term --cov-report=html) || exit 1; \
 	done
 
-test-e2e: ## Smoke test through the gateway (needs `make up migrate seed`)
+test-e2e: ## End-to-end through the gateway (needs `make up migrate seed`)
 	$(PY) -m pytest -q tests/e2e
 
 lint: lint-types ## ruff (lint + format check) and mypy

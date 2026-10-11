@@ -1,6 +1,9 @@
 # SmartRetail local stack (RFC 0001 §3.1.1.12).
-# Milestone 1 ships the `core` profile: postgres, identity, catalog, gateway.
-# Only the gateway is published to the host, on 127.0.0.1:8000.
+#   core      postgres, identity, catalog, gateway                        (Milestone 1)
+#   workflow  temporal, temporal-ui, minio, inventory, order,
+#             catalog-worker, order-worker                                (Milestone 2)
+# Host-bound ports, all on 127.0.0.1: gateway 8000, Temporal UI 8080, MinIO
+# console 9001. Everything else is reachable on the Compose network only.
 
 x-service-env: &service-env
   ENVIRONMENT: ${ENVIRONMENT:-local}
@@ -10,12 +13,43 @@ x-service-env: &service-env
   JWT_AUDIENCE: ${JWT_AUDIENCE:-smartretail}
   JWT_LEEWAY_SECONDS: ${JWT_LEEWAY_SECONDS:-10}
   JWT_PUBLIC_KEY_PATH: /run/keys/jwt_public.pem
+  JWKS_URL: http://identity:8001/api/v1/auth/jwks
+  JWKS_MIN_REFETCH_SECONDS: ${JWKS_MIN_REFETCH_SECONDS:-30}
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+
+# Workflow plumbing shared by the services that start workflows and the
+# workers that run them (RFC 0001 §3.1.1.3, PLT-D13).
+x-workflow-env: &workflow-env
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: smartretail
+  INVENTORY_BASE_URL: http://inventory:8004
+  IDENTITY_TOKEN_URL: http://identity:8001/api/v1/auth/token
+  SERVICE_CLIENT_ID: temporal-worker
+  SERVICE_CLIENT_SECRET: ${SERVICE_CLIENT_SECRET:?run make keys}
+
+x-catalog-env: &catalog-env
+  SERVICE_NAME: catalog
+  PORT: "8002"
+  DATABASE_URL: postgresql+asyncpg://catalog_role:${CATALOG_DB_PASSWORD:-catalog_local}@postgres:5432/catalog_db
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-smartretail}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change-me-minio-password}
+  MINIO_MEDIA_BUCKET: product-media
+
+x-order-env: &order-env
+  SERVICE_NAME: order
+  PORT: "8003"
+  DATABASE_URL: postgresql+asyncpg://order_role:${ORDER_DB_PASSWORD:-order_local}@postgres:5432/order_db
+  CATALOG_BASE_URL: http://catalog:8002
 
 x-healthcheck: &ready-check
   interval: 10s
   timeout: 3s
   retries: 6
   start_period: 10s
+
+x-public-key: &public-key ./keys/jwt_public.pem:/run/keys/jwt_public.pem:ro
 
 services:
   postgres:
@@ -26,6 +60,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:-identity_local}
       CATALOG_DB_PASSWORD: ${CATALOG_DB_PASSWORD:-catalog_local}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:-order_local}
+      INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD:-inventory_local}
+      TEMPORAL_DB_PASSWORD: ${TEMPORAL_DB_PASSWORD:-temporal_local}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./ops/postgres/init:/docker-entrypoint-initdb.d:ro
@@ -45,8 +82,7 @@ services:
       SERVICE_NAME: identity
       PORT: "8001"
       DATABASE_URL: postgresql+asyncpg://identity_role:${IDENTITY_DB_PASSWORD:-identity_local}@postgres:5432/identity_db
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
+      JWKS_URL: ""
       JWT_KEYS_DIR: /run/secrets/jwt
       JWT_ACTIVE_KID: ${JWT_ACTIVE_KID:?run make keys}
       ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-900}
@@ -57,10 +93,14 @@ services:
       SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@smartretail.local}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-change-me-admin-password}
       SEED_DEMO_PASSWORD: ${SEED_DEMO_PASSWORD:-change-me-demo-password}
+      # Client-credentials registry (IDN-T3): a digest of the secret, never the secret.
+      SERVICE_CLIENTS: >-
+        {"temporal-worker": {"secret_hash": "sha256:${SERVICE_CLIENT_SECRET_SHA256:?run make keys}",
+        "scopes": ["inventory:internal", "catalog:internal"]}}
     volumes:
       # The private key is mounted into identity only.
       - ./keys:/run/secrets/jwt:ro
-      - ./keys/jwt_public.pem:/run/keys/jwt_public.pem:ro
+      - *public-key
     depends_on:
       postgres:
         condition: service_healthy
@@ -74,16 +114,12 @@ services:
       dockerfile: services/catalog/Dockerfile
     profiles: [core]
     environment:
-      <<: *service-env
-      SERVICE_NAME: catalog
-      PORT: "8002"
-      DATABASE_URL: postgresql+asyncpg://catalog_role:${CATALOG_DB_PASSWORD:-catalog_local}@postgres:5432/catalog_db
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
-      JWKS_URL: http://identity:8001/api/v1/auth/jwks
-      JWKS_MIN_REFETCH_SECONDS: ${JWKS_MIN_REFETCH_SECONDS:-30}
+      <<: [*service-env, *catalog-env]
+      # Publishing starts a workflow; without the workflow profile it is a 503 (CAT-9).
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: smartretail
     volumes:
-      - ./keys/jwt_public.pem:/run/keys/jwt_public.pem:ro
+      - *public-key
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,20 +140,162 @@ services:
       PORT: "8000"
       UPSTREAM_IDENTITY_URL: http://identity:8001
       UPSTREAM_CATALOG_URL: http://catalog:8002
-      JWKS_URL: http://identity:8001/api/v1/auth/jwks
-      JWKS_MIN_REFETCH_SECONDS: ${JWKS_MIN_REFETCH_SECONDS:-30}
+      UPSTREAM_ORDER_URL: http://order:8003
+      UPSTREAM_INVENTORY_URL: http://inventory:8004
       GATEWAY_CORS_ALLOW_ORIGINS: ${GATEWAY_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
       GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:8000}
       GATEWAY_MAX_BODY_BYTES: ${GATEWAY_MAX_BODY_BYTES:-1048576}
+      GATEWAY_MAX_UPLOAD_BYTES: ${GATEWAY_MAX_UPLOAD_BYTES:-10485760}
       GATEWAY_UPSTREAM_CONNECT_TIMEOUT_S: ${GATEWAY_UPSTREAM_CONNECT_TIMEOUT_S:-2}
       GATEWAY_UPSTREAM_READ_TIMEOUT_S: ${GATEWAY_UPSTREAM_READ_TIMEOUT_S:-10}
     volumes:
-      - ./keys/jwt_public.pem:/run/keys/jwt_public.pem:ro
+      - *public-key
     # No hard depends_on (RFC 0002): an unavailable upstream is a 503, not a
     # gateway that refuses to start.
     healthcheck:
       <<: *ready-check
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).status == 200 else 1)"]
 
+  # --- workflow profile (Milestone 2) ---------------------------------------
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    profiles: [workflow]
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: temporal_role
+      POSTGRES_PWD: ${TEMPORAL_DB_PASSWORD:-temporal_local}
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      # The init script creates both databases, owned by temporal_role (PLT-1).
+      SKIP_DB_CREATE: "true"
+      DEFAULT_NAMESPACE: smartretail
+      DEFAULT_NAMESPACE_RETENTION: 7d
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Healthy once the namespace exists, so workers never start before it.
+      test: ["CMD-SHELL", "tctl --address $$(hostname -i):7233 --namespace smartretail namespace describe >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    profiles: [workflow]
+    ports:
+      - "127.0.0.1:${TEMPORAL_UI_PORT:-8080}:8080"
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_DEFAULT_NAMESPACE: smartretail
+    depends_on:
+      temporal:
+        condition: service_healthy
+
+  minio:
+    # The MinIO server, from Bitnami's legacy catalogue: MinIO's own images are
+    # no longer published. It creates the bucket at start (no init container).
+    image: bitnamilegacy/minio:2025.7.23
+    profiles: [workflow]
+    ports:
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-smartretail}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-minio-password}
+      MINIO_DEFAULT_BUCKETS: product-media
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  inventory:
+    build:
+      context: .
+      dockerfile: services/inventory/Dockerfile
+    profiles: [workflow]
+    environment:
+      <<: *service-env
+      SERVICE_NAME: inventory
+      PORT: "8004"
+      DATABASE_URL: postgresql+asyncpg://inventory_role:${INVENTORY_DB_PASSWORD:-inventory_local}@postgres:5432/inventory_db
+      # The expiry sweeper runs in-process until Celery Beat exists (INV-10).
+      INVENTORY_SWEEPER_INPROCESS: "true"
+    volumes:
+      - *public-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8004/health/ready', timeout=2).status == 200 else 1)"]
+
+  order:
+    build:
+      context: .
+      dockerfile: services/order/Dockerfile
+    profiles: [workflow]
+    environment:
+      <<: [*service-env, *order-env]
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: smartretail
+    volumes:
+      - *public-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8003/health/ready', timeout=2).status == 200 else 1)"]
+
+  # One worker per owning service (PLT-D13a): each runs its service's code with
+  # that service's database role only (PLT-1). Same image, different command.
+  catalog-worker:
+    build:
+      context: .
+      dockerfile: services/catalog/Dockerfile
+    profiles: [workflow]
+    command: ["python", "-m", "app.workflows.worker"]
+    environment:
+      <<: [*service-env, *catalog-env, *workflow-env]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      # The worker is PID 1: alive means polling. The image's HTTP check does not apply.
+      <<: *ready-check
+      test: ["CMD-SHELL", "kill -0 1"]
+    depends_on:
+      temporal:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  order-worker:
+    build:
+      context: .
+      dockerfile: services/order/Dockerfile
+    profiles: [workflow]
+    command: ["python", "-m", "app.workflows.worker"]
+    environment:
+      <<: [*service-env, *order-env, *workflow-env]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      # The worker is PID 1: alive means polling. The image's HTTP check does not apply.
+      <<: *ready-check
+      test: ["CMD-SHELL", "kill -0 1"]
+    depends_on:
+      temporal:
+        condition: service_healthy
+
 volumes:
   postgres-data:
+  minio-data:

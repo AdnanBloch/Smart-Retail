@@ -40,7 +40,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [common, services/identity, services/catalog, services/gateway]
+        package:
+          - common
+          - services/identity
+          - services/catalog
+          - services/gateway
+          - services/inventory
+          - services/order
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -59,7 +65,8 @@ jobs:
           cache: pip
       - run: python -m venv .venv && make dev-install
       # --cov applies [tool.coverage] from the package's pyproject: branch
-      # coverage, fail_under = 85.
+      # coverage, fail_under = 85. Workflow suites download Temporal's
+      # time-skipping test server on first use.
       - name: pytest with coverage gate
         working-directory: ${{ matrix.package }}
         run: ${{ github.workspace }}/.venv/bin/python -m pytest -q --cov --cov-report=term

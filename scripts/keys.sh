@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Generate the RS256 signing key pair if none exists (RFC 0003 IDN-5).
-#   keys/<kid>.pem       private key, mounted into identity only
+# Generate local secrets if missing (RFC 0003 IDN-5, IDN-T3):
+#   keys/<kid>.pem       RS256 private key, mounted into identity only
 #   keys/jwt_public.pem  public key, mounted into every verifier
-# The kid is written to .env as JWT_ACTIVE_KID.
+#   .env JWT_ACTIVE_KID                the signing key's kid
+#   .env SERVICE_CLIENT_SECRET         the temporal-worker client secret (workers only)
+#   .env SERVICE_CLIENT_SECRET_SHA256  its digest, the only form identity sees
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -23,8 +25,20 @@ fi
 # keys/ is gitignored and local-only.
 chmod 644 keys/*.pem
 
-if grep -q '^JWT_ACTIVE_KID=' .env; then
-  sed -i.bak "s/^JWT_ACTIVE_KID=.*/JWT_ACTIVE_KID=$kid/" .env && rm -f .env.bak
-else
-  echo "JWT_ACTIVE_KID=$kid" >> .env
+set_env() {
+  if grep -q "^$1=" .env; then
+    sed -i.bak "s|^$1=.*|$1=$2|" .env && rm -f .env.bak
+  else
+    echo "$1=$2" >> .env
+  fi
+}
+
+set_env JWT_ACTIVE_KID "$kid"
+
+secret=$(grep '^SERVICE_CLIENT_SECRET=' .env | cut -d= -f2- || true)
+if [ -z "$secret" ]; then
+  secret=$(openssl rand -hex 32)
+  set_env SERVICE_CLIENT_SECRET "$secret"
+  echo "keys: generated the temporal-worker client secret"
 fi
+set_env SERVICE_CLIENT_SECRET_SHA256 "$(printf %s "$secret" | openssl dgst -sha256 -r | cut -d' ' -f1)"
