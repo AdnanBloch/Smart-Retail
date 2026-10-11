@@ -13,7 +13,7 @@ from app.core import utils
 from app.core.errors import DuplicateSku, VariantNotFound
 from app.products import audit_repo
 from app.products.enums import ProductAuditAction
-from app.products.repo import bump, lock_for_change
+from app.products.repo import after_published_change, bump, lock_for_change
 from app.variants.models import ProductVariant
 from smartretail_common.auth import Principal
 
@@ -68,6 +68,7 @@ class VariantRepo:
                 "after": {"sku": sku, "options": options, "price_override": price_override},
             },
         )
+        await after_published_change(self.session, product.id, ["variants"])
         await self.session.commit()
         return VariantWrite(variant, product.version)
 
@@ -90,6 +91,7 @@ class VariantRepo:
                 action=ProductAuditAction.VARIANT_UPDATED,
                 changes={"variant_id": variant.id, **diff},
             )
+            await after_published_change(self.session, product.id, ["variants"])
         await self.session.commit()
         await self.session.refresh(variant)
         return VariantWrite(variant, product.version)
@@ -110,6 +112,8 @@ class VariantRepo:
                 action=ProductAuditAction.VARIANT_REMOVED,
                 changes={"variant_id": variant.id, "is_active": {"from": True, "to": False}},
             )
+            # Deactivating the last active variant of a published product is a 409.
+            await after_published_change(self.session, product.id, ["variants"])
         await self.session.commit()
         return VariantWrite(variant, product.version)
 

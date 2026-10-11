@@ -29,14 +29,31 @@ def test_terminal_set_is_archived_only() -> None:
 
 
 def test_reachability_from_draft() -> None:
-    # `published` becomes reachable through `publishing` in Milestone 2.
     seen, frontier = {S.DRAFT}, [S.DRAFT]
     while frontier:
         for nxt in PRODUCT_TRANSITIONS[frontier.pop()]:
             if nxt not in seen:
                 seen.add(nxt)
                 frontier.append(nxt)
-    assert seen == set(S) - {S.PUBLISHED}
+    assert seen == set(S)
+
+
+def test_published_only_through_publishing() -> None:
+    """I8: no edge reaches `published` except the workflow's T5."""
+    sources = {a for a, targets in PRODUCT_TRANSITIONS.items() if S.PUBLISHED in targets}
+    assert sources == {S.PUBLISHING}
+    # `publishing` is entered only from draft or inactive (T3/T4) and left
+    # only by the workflow (T5 mark_published, T6 compensation).
+    assert {a for a, t in PRODUCT_TRANSITIONS.items() if S.PUBLISHING in t} == {
+        S.DRAFT,
+        S.INACTIVE,
+    }
+    assert PRODUCT_TRANSITIONS[S.PUBLISHING] == {S.PUBLISHED, S.DRAFT}
+
+
+def test_edge_count() -> None:
+    # 11 legal edges of the 25 ordered pairs over five states (RFC 0004 §3.1.1.3).
+    assert len(LEGAL) == 11 and len(ILLEGAL) == 14
 
 
 LEGAL = [(a, b) for a, targets in PRODUCT_TRANSITIONS.items() for b in targets]

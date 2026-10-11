@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "SmartRetail catalog service (RFC 0004): products, variants, categories, media, audit trail"
 requires-python = ">=3.12"
 dependencies = [
-    "smartretail-common",
+    "smartretail-common[temporal]",
     "fastapi>=0.115,<0.116",
     "uvicorn[standard]>=0.32,<0.35",
     "sqlalchemy[asyncio]>=2.0.36,<2.1",
@@ -19,6 +19,10 @@ dependencies = [
     "pyjwt[crypto]>=2.10,<2.11",
     "python-slugify>=8,<9",
     "anyio>=4",
+    "python-multipart>=0.0.20,<0.1",
+    "temporalio>=1.9,<1.10",
+    "minio>=7.2,<8",
+    "pillow>=11,<12",
 ]
 
 [tool.setuptools]

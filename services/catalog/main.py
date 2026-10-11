@@ -9,17 +9,27 @@ from app.core.config import Settings, get_settings
 from app.core.db import create_database
 from app.core.logger import init_logger
 from app.health import routes as health
+from app.media.storage import MediaStorage, MinioStorage
+from app.products.publishing_repo import PublishStarter
 from app.router import router
+from app.workflows.client import TemporalPublishStarter
 from smartretail_common.app import install_platform
 from smartretail_common.auth import JwtVerifier
+from smartretail_common.temporal import TemporalClientFactory
 
 
 def create_application(
-    settings: Settings | None = None, verifier: JwtVerifier | None = None
+    settings: Settings | None = None,
+    verifier: JwtVerifier | None = None,
+    *,
+    publish_starter: PublishStarter | None = None,
+    storage: MediaStorage | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     init_logger(settings)
     db = create_database(settings)
+    # Temporal is connected on first use: only publishing needs it (CAT-9).
+    temporal = TemporalClientFactory(settings.temporal_address, settings.temporal_namespace)
     # Tokens are verified locally (A5): no call to identity per request.
     verifier = verifier or JwtVerifier.from_settings(settings)
 
@@ -40,6 +50,10 @@ def create_application(
     application.state.settings = settings
     application.state.db = db
     application.state.verifier = verifier
+    application.state.publish_starter = publish_starter or TemporalPublishStarter(
+        temporal, settings
+    )
+    application.state.storage = storage or MinioStorage(settings)
     install_platform(application)
     application.include_router(health.build_router(db))
     application.include_router(router)

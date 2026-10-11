@@ -8,6 +8,7 @@ from typing import Literal
 from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.media.enums import MediaProcessingStatus
 from app.media.models import ProductMedia
 from app.products import access
 from app.products.enums import ProductStatus
@@ -117,7 +118,11 @@ class ListingRepo:
     ) -> Slice[Listing]:
         primary_media = (
             select(ProductMedia.url)
-            .where(ProductMedia.product_id == Product.id)
+            .where(
+                ProductMedia.product_id == Product.id,
+                # Public listings show processed media only.
+                ProductMedia.processing_status == MediaProcessingStatus.READY,
+            )
             .order_by(ProductMedia.position, ProductMedia.created_at)
             .limit(1)
             .scalar_subquery()

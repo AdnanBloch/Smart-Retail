@@ -9,10 +9,12 @@ from pydantic import Field, model_validator
 
 from app.categories.v1.schemas import CategoryRef
 from app.core.schemas import Currency, Money, OpenMap, OutModel, Sku, StrictModel, Version
+from app.media.enums import MediaProcessingStatus
 from app.media.v1.schemas import MediaOut
-from app.products.enums import ProductAuditAction, ProductStatus
+from app.products.enums import ProductAuditAction, ProductStatus, PublishState
 from app.products.listing_repo import Listing
 from app.products.models import Product
+from app.products.publishing_repo import PublishAccepted, PublishStatus
 from app.variants.v1.schemas import VariantOut
 from smartretail_common.enums import widen_for_response
 
@@ -96,8 +98,17 @@ class ProductDetail(OutModel):
     media: list[MediaOut]
 
     @classmethod
-    def from_product(cls, product: Product) -> "ProductDetail":
-        """``product`` must have its category, variants and media loaded."""
+    def from_product(cls, product: Product, *, all_media: bool = True) -> "ProductDetail":
+        """``product`` must have its category, variants and media loaded.
+
+        Public callers see ``ready`` media only; the owner and admins see every
+        row with its ``processing_status`` (``all_media``).
+        """
+        media = [
+            m
+            for m in product.media
+            if all_media or m.processing_status == MediaProcessingStatus.READY
+        ]
         return cls(
             id=product.id,
             merchant_id=product.merchant_id,
@@ -115,7 +126,7 @@ class ProductDetail(OutModel):
             created_at=product.created_at,
             updated_at=product.updated_at,
             variants=[VariantOut.from_variant(v) for v in product.variants],
-            media=[MediaOut.model_validate(m) for m in product.media],
+            media=[MediaOut.model_validate(m) for m in media],
         )
 
 
@@ -131,3 +142,49 @@ class AuditEntry(OutModel):
     action: Annotated[ProductAuditAction | str, widen_for_response(ProductAuditAction)]
     changes: dict[str, Any]
     created_at: datetime
+
+
+class PublishLinks(OutModel):
+    publish_status: str
+
+
+class PublishAcceptedOut(OutModel):
+    """``202``: the publish runs asynchronously; poll ``_links.publish_status``."""
+
+    workflow_id: str
+    status: StatusOut
+    version: int
+    links: PublishLinks = Field(serialization_alias="_links")
+
+    @classmethod
+    def from_accepted(cls, accepted: PublishAccepted) -> "PublishAcceptedOut":
+        product = accepted.product
+        return cls(
+            workflow_id=accepted.workflow_id,
+            status=product.status,
+            version=product.version,
+            links=PublishLinks(publish_status=f"/api/v1/products/{product.id}/publish-status"),
+        )
+
+
+class PublishStatusOut(OutModel):
+    state: PublishState
+    workflow_id: str | None = None
+    step: str | None = None
+    started_at: str | None = None
+    failed_step: str | None = None
+    failure_reason: str | None = None
+    failed_at: datetime | None = None
+
+    @classmethod
+    def from_status(cls, status: PublishStatus) -> "PublishStatusOut":
+        failure = status.failure
+        return cls(
+            state=status.state,
+            workflow_id=status.workflow_id,
+            step=status.step,
+            started_at=status.started_at,
+            failed_step=str(failure.failed_step) if failure else None,
+            failure_reason=failure.reason if failure else None,
+            failed_at=failure.created_at if failure else None,
+        )

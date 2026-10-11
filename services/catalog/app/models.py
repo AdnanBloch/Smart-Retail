@@ -6,8 +6,18 @@ Alembic's ``env.py`` and the seed command import from here, so a new entity's
 
 from app.categories.models import Category
 from app.media.models import ProductMedia
-from app.products.models import Product, ProductAuditLog
+from app.products.models import Product, ProductAuditLog, ProductPublishFailure
 from app.variants.models import ProductVariant
 from smartretail_common.db import Base
+from smartretail_common.outbox import OutboxEvent
 
-__all__ = ["Base", "Category", "Product", "ProductAuditLog", "ProductMedia", "ProductVariant"]
+__all__ = [
+    "Base",
+    "Category",
+    "OutboxEvent",
+    "Product",
+    "ProductAuditLog",
+    "ProductMedia",
+    "ProductPublishFailure",
+    "ProductVariant",
+]

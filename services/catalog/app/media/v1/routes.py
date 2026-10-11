@@ -8,8 +8,9 @@ import uuid
 from fastapi import APIRouter, Depends, Query, Response, status
 
 from app.core.dependencies import require_catalog_writer
-from app.media.dependencies import media_repo
-from app.media.repo import MediaRepo
+from app.media.dependencies import media_repo, media_storage
+from app.media.repo import MediaRepo, delete_objects
+from app.media.storage import MediaStorage
 from smartretail_common.auth import Principal
 
 router = APIRouter()
@@ -21,6 +22,8 @@ async def remove_media(
     version: int = Query(..., ge=1),
     principal: Principal = Depends(require_catalog_writer),
     repo: MediaRepo = Depends(media_repo),
+    storage: MediaStorage = Depends(media_storage),
 ) -> Response:
-    await repo.remove(principal, media_id, version)
+    keys = await repo.remove(principal, media_id, version)
+    await delete_objects(storage, keys)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

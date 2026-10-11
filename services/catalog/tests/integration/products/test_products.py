@@ -137,13 +137,7 @@ async def test_status_transitions(client, callers) -> None:
     product = await set_status(client, callers.merchant_a, product, "draft")
     assert product["status"] == "draft" and product["version"] == 3
 
-    r = await client.post(
-        f"/api/v1/products/{product['id']}/status",
-        json={"status": "published", "version": product["version"]},
-        headers=callers.merchant_a,
-    )
-    assert r.status_code == 501
-
+    # `publishing` is never accepted from a client.
     r = await client.post(
         f"/api/v1/products/{product['id']}/status",
         json={"status": "publishing", "version": product["version"]},
@@ -157,6 +151,15 @@ async def test_status_transitions(client, callers) -> None:
         headers=callers.merchant_a,
     )
     assert r.status_code == 409 and r.json()["type"].endswith("/illegal-transition")
+
+    # G9: the M1 `501` on publish is now `202` — the publish contract is in
+    # tests/integration/products/test_publishing.py.
+    r = await client.post(
+        f"/api/v1/products/{product['id']}/status",
+        json={"status": "published", "version": product["version"]},
+        headers=callers.merchant_a,
+    )
+    assert r.status_code == 202
 
 
 @pytest.mark.parametrize("start", ["draft", "inactive"])

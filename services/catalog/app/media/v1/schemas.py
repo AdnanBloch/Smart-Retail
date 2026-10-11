@@ -2,12 +2,14 @@
 
 import uuid
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import AnyUrl, Field, UrlConstraints
 
 from app.core.schemas import OutModel, StrictModel, Version
+from app.media.enums import MediaProcessingStatus
 from app.media.repo import MediaWrite
+from smartretail_common.enums import widen_for_response
 
 HttpsUrl = Annotated[AnyUrl, UrlConstraints(allowed_schemes=["https"], max_length=2048)]
 
@@ -26,6 +28,13 @@ class MediaOut(OutModel):
     alt_text: str | None
     position: int
     created_at: datetime
+    processing_status: Annotated[
+        MediaProcessingStatus | str, widen_for_response(MediaProcessingStatus)
+    ]
+    content_type: str | None = None
+    size_bytes: int | None = None
+    # size name → storage key; null for URL media and until processed.
+    derived: dict[str, Any] | None = None
 
 
 class MediaWritten(MediaOut):

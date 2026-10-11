@@ -8,7 +8,7 @@ body, query or header.
 import uuid
 
 from app.core.enums import CallerRole
-from app.core.errors import ProductArchived, ProductNotFound, VersionConflict
+from app.core.errors import ProductArchived, ProductNotFound, ProductPublishing, VersionConflict
 from app.products.enums import ProductStatus
 from app.products.models import Product
 from smartretail_common.auth import Principal
@@ -60,3 +60,9 @@ def ensure_version(product: Product, version: int) -> None:
 def ensure_mutable(product: Product) -> None:
     if product.status == ProductStatus.ARCHIVED:
         raise ProductArchived()
+
+
+def ensure_not_publishing(product: Product) -> None:
+    """While a publish runs only the workflow writes the product (RFC 0004 §3.1.2.1)."""
+    if product.status == ProductStatus.PUBLISHING:
+        raise ProductPublishing()

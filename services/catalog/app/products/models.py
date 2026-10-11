@@ -1,4 +1,4 @@
-"""``products`` and ``product_audit_log`` tables (RFC 0004 §3.1.3)."""
+"""``products``, ``product_audit_log`` and ``product_publish_failures`` (RFC 0004 §3.1.3)."""
 
 import uuid
 from datetime import datetime
@@ -21,7 +21,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.products.enums import ProductAuditAction, ProductStatus
+from app.products.enums import ProductAuditAction, ProductStatus, PublishStep
 from smartretail_common.db import Base, CreatedAt, Timestamps, UUIDPrimaryKey
 from smartretail_common.db_types import DomainEnumText
 
@@ -72,6 +72,10 @@ class Product(UUIDPrimaryKey, Timestamps, Base):
     version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("1"), default=1
     )
+    # The running or last publish workflow (CAT-7): product-publish-{id}-v{version}.
+    publish_workflow_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The flattened projection built by build_search_document (RFC 0004 §3.1.2.3).
+    search_document: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     category: Mapped["Category | None"] = relationship(lazy="raise")
     variants: Mapped[list["ProductVariant"]] = relationship(
@@ -103,3 +107,25 @@ class ProductAuditLog(CreatedAt, Base):
         comment="DomainEnum ProductAuditAction — see services/catalog/app/products/enums.py",
     )
     changes: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+
+class ProductPublishFailure(UUIDPrimaryKey, CreatedAt, Base):
+    """One row per failed publish workflow, so a failure is a record, not a log line.
+
+    No FK to ``products``: the row must survive the product being archived.
+    """
+
+    __tablename__ = "product_publish_failures"
+    __table_args__ = (
+        Index("ix_product_publish_failures_product_id", "product_id"),
+        Index("ix_product_publish_failures_created_at", "created_at"),
+    )
+
+    product_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workflow_id: Mapped[str] = mapped_column(Text, nullable=False)
+    failed_step: Mapped[PublishStep | str] = mapped_column(
+        DomainEnumText(PublishStep),
+        nullable=False,
+        comment="DomainEnum PublishStep — see services/catalog/app/products/enums.py",
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)

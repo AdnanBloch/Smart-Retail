@@ -31,7 +31,9 @@ async def test_conventions(database_url) -> None:
                 """
             )
         )
+        # S1 exceptions: append-only logs that never cross a boundary.
         assert pk_types.pop("product_audit_log") == "bigint"
+        assert pk_types.pop("outbox") == "bigint"
         assert set(pk_types.values()) == {"uuid"}, pk_types
 
         naive = await conn.fetch(
