@@ -12,6 +12,11 @@ ALLOW_LIST: dict[str, str] = {
     # RFC 0000 I4: merchant_id is the subject of a merchant token; the
     # verifier needs to recognise that one role value to derive it.
     "merchant": "auth.py derives merchant_id from the merchant role (I4)",
+    # Generic words that M2's service enums happen to share. Each is part of an
+    # M1 contract in common, not a domain value (flagged for review, M2).
+    "expired": "auth.py: the InvalidToken detail for an expired JWT, not ReservationStatus",
+    "ready": "health.py: the readiness endpoint's status, not MediaProcessingStatus",
+    "failed": "health.py: a readiness check's result, not an order, payment or media status",
 }
 
 
