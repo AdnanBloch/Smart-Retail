@@ -1,5 +1,8 @@
 """GW-T9 smoke test: the M1 user journey through the gateway on :8000.
 
+Milestone 2's journeys (publish, order, the failure paths) are in
+``test_workflows.py``.
+
 Needs a running, migrated and seeded stack: ``make up migrate seed``.
 """
 
@@ -108,7 +111,8 @@ def test_m1_journey(client: httpx.Client) -> None:
     mine = client.get(f"/api/v1/products/me?category_id={category_id}", headers=merchant).json()
     assert [p["id"] for p in mine["items"]] == [product["id"]]
 
-    # 6. Status transitions: draft → inactive → draft; publishing is 501 in M1.
+    # 6. Status transitions: draft → inactive → draft. Publishing is a workflow,
+    #    covered end to end in test_workflows.py.
     for status in ("inactive", "draft"):
         r = client.post(
             f"/api/v1/products/{product['id']}/status",
@@ -118,12 +122,6 @@ def test_m1_journey(client: httpx.Client) -> None:
         assert r.status_code == 200, r.text
         assert r.json()["status"] == status
         version = r.json()["version"]
-    r = client.post(
-        f"/api/v1/products/{product['id']}/status",
-        json={"status": "published", "version": version},
-        headers=merchant,
-    )
-    assert r.status_code == 501
 
     # 7. The audit trail recorded every step.
     history = client.get(f"/api/v1/products/{product['id']}/history", headers=merchant).json()
@@ -142,7 +140,12 @@ def test_edge_behaviour(client: httpx.Client) -> None:
     assert client.get("/api/v1/users/me").status_code == 401
     ready = client.get("/health/ready").json()
     assert ready["status"] == "ready"
-    assert ready["informational"]["upstreams"] == {"identity": "ok", "catalog": "ok"}
+    assert ready["informational"]["upstreams"] == {
+        "identity": "ok",
+        "catalog": "ok",
+        "order": "ok",
+        "inventory": "ok",
+    }
     doc = client.get("/openapi.json").json()
     assert "/api/v1/products" in doc["paths"] and "/api/v1/auth/login" in doc["paths"]
     assert "x-upstreams-unavailable" not in doc
