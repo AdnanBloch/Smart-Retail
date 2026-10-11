@@ -508,44 +508,40 @@ If the relay crashes after producing but before setting `published_at`, the row 
 
 ##### 3.1.1.7. Module structure inside a service
 
-Boundaries are recursive: the same reasoning applies below the service line, which is what keeps a service from becoming a small monolith. Every service uses the same internal layering, so moving between them is not a re-orientation:
+Boundaries are recursive: the same reasoning applies below the service line, which is what keeps a service from becoming a small monolith. Every service uses the same internal layout, so moving between them is not a re-orientation. Code is grouped **by entity**, and only the HTTP contract is versioned:
 
 ```
-  main.py            create_application(): settings, logging, DB, router
-                     mounting, /health. Run as `uvicorn --factory main:create_application`.
+  main.py              create_application(): settings, logging, DB, router
+                       mounting, /health. Run as `uvicorn --factory main:create_application`.
   app/
-  ├── api/
-  │   ├── router.py      Every route: path, method, tags, response_model,
-  │   │                  status_code, route dependencies. Prefix /api/v<N>.
-  │   └── handlers/      HTTP only — parse, validate, call, serialise. No rules.
-  │       ├── <res>.py   `router = APIRouter()` plus plain handler functions,
-  │       │              no decorators. One file per resource.
-  │       ├── health.py  Readiness checks for /health/ready.
-  │       └── utils.py   FastAPI dependencies (session, principal, repos).
-  ├── services/      <entity>_repo.py — the only layer permitted business rules.
-  │                  Called by API handlers, Temporal activities, event consumers, CLI.
-  ├── models/        <entity>.py — SQLAlchemy ORM and the Pydantic request/response
-  │                  models for that entity (the contract; never the ORM object).
-  │                  enums.py — this service's value sets (S4); response.py — shared bases.
-  ├── configs/       env.py — the service's settings class.
-  ├── infrastructure/ db.py, logger.py, security.py, seed.py.
-  ├── exception_handlers/ This service's DomainError subclasses.
-  ├── middleware/    ASGI middleware (when the service has its own).
-  ├── clients/       Outbound calls to other services (when it makes them).
-  ├── constants/     Fixed values (when it has them).
-  ├── utils/         state machines (the transition table) and small pure helpers.
-  ├── consumers/     Event handlers — thin, like API handlers.
-  ├── workflows/     Temporal workflows and activities.
-  └── tasks/         Celery tasks.
-  alembic/           This service's own migration history (S14).
-  tests/
+  ├── router.py        Includes routers only. Owns the /api/v<N> prefix and each
+  │                    entity's prefix, so every URL is readable in one file.
+  ├── models.py        Imports every entity's ORM models onto one metadata (Alembic, seed).
+  ├── core/            Cross-entity infrastructure: config, db, logger, dependencies,
+  │                    security, errors (DomainError subclasses), shared enums and schemas.
+  ├── health/routes.py Readiness checks for /health/ready.
+  ├── <entity>/        One folder per entity (products/, users/, ...).
+  │   ├── models.py    SQLAlchemy ORM. One shape per table: never versioned.
+  │   ├── repo.py      <Entity>Repo — the only layer permitted business rules.
+  │   │                Called by routes, Temporal activities, event consumers, CLI.
+  │   ├── dependencies.py  Builds the entity's repos for a request.
+  │   ├── utils.py     State machine (the transition table) and pure helpers.
+  │   └── v1/
+  │       ├── routes.py    HTTP only — parse, validate, call, serialise. No rules.
+  │       └── schemas.py   Pydantic request/response models: the v1 contract.
+  ├── clients/         Outbound calls to other services (when it makes them).
+  ├── consumers/       Event handlers — thin, like routes.
+  ├── workflows/       Temporal workflows and activities.
+  └── tasks/           Celery tasks.
+  alembic/             This service's own migration history (S14).
+  tests/{unit,integration}/<entity>/
 ```
 
-The layout matches the EVA backends, so engineers moving between the two codebases find the same folders in the same places.
+**Why the version sits inside the entity.** A table has one shape at a time, so its ORM model and the rules that guard it cannot be versioned; only the HTTP contract (paths, request and response bodies) can. A v2 is a new `<entity>/v2/` folder and one `include_router` line, and both versions call the same repo. Version-first (`app/v1/<entity>/`) would copy models and rules per version; a split `app/<entity>/` + `app/api/v1/<entity>/` would spread each entity over two trees (ARC-D in §3.2.1).
 
-**Routes and handlers.** `api/router.py` is the only file that declares routes. Each handler module owns one `router = APIRouter()`; `router.py` registers every handler on it (`products.router.get("/{product_id}", response_model=ProductDetail)(products.get_product)`) and includes it in the root `router` under the `/api/v<N>` prefix with its resource prefix and tag (`router.include_router(products.router, prefix="/products", tags=["products"])`). `main.py` mounts the root router. Handler functions carry no decorators; a handler module may also hold a small request-parsing dependency its handlers share. Registration order in `router.py` is significant — a literal segment such as `/me` is registered before `/{id}`.
+**Routes.** Each `v<N>/routes.py` owns one `router = APIRouter()` and declares its handlers with decorators, with paths relative to the entity prefix and all HTTP metadata on the decorator (`@router.get("/{product_id}", response_model=ProductDetail)`). `app/router.py` builds `APIRouter(prefix="/api/v1")` and includes each entity router under its prefix and tag (`v1.include_router(products_v1.router, prefix="/products", tags=["products"])`); `main.py` mounts it. Declaration order inside a routes module is significant — a literal segment such as `/me` is declared before `/{id}`.
 
-The rule that matters: **handlers do not touch the ORM, and the service layer does not construct HTTP responses.** That single seam is why a Temporal activity (B1) and an event consumer can reuse the same business rule as an endpoint, with one implementation and one set of tests. Each service RFC's §3.1.1.1 shows its own instance of this layout; repository layout and the shared base images are in [RFC 0001](0001-platform-and-shared-infrastructure.md).
+The rule that matters: **routes do not touch the ORM, and repos do not construct HTTP responses.** That single seam is why a Temporal activity (B1) and an event consumer can reuse the same business rule as an endpoint, with one implementation and one set of tests. Each service RFC's §3.1.1.1 shows its own instance of this layout; repository layout and the shared base images are in [RFC 0001](0001-platform-and-shared-infrastructure.md).
 
 #### 3.1.2. API changes
 
@@ -693,7 +689,7 @@ Fixed once, followed by every service. A deviation is a review failure, not a st
 | S1 | **Primary keys** | One test: **does the id ever leave the database?** Yes → `uuid` v4, generated by the database (`gen_random_uuid()`). No, and the table is high-volume and append-only → `bigserial`. The `bigserial` set is exactly `*_audit_log`, `order_status_history`, `stock_movements`, `outbox` and `notifications.seq` | **`uuid` where the id leaves the database** — URLs, API responses, event payloads, analytics joins. There a sequential integer leaks volume (`/orders/84215`), collides when analytics merges ids from separate databases, and cannot be generated before the insert, which idempotency and correlation ids require. **`bigserial` where it never does** — none of those three benefits apply, so only UUID's cost is left, and these are the highest-insert tables in the system. A random UUID lands each insert on a random B-tree leaf (page splits, cache misses, extra WAL); `bigserial` appends to the rightmost leaf, is 8 bytes instead of 16, and gives a built-in order that `ORDER BY id` and cursor reads rely on (the outbox relay, notification catch-up). `notifications` shows both: `id` is a `uuid` because clients see it and use it to remove duplicates, while `seq` is a `bigserial` used only for internal ordering |
 | S2 | **Money** | `numeric(12,2)` plus a `char(3)` ISO 4217 currency column, always adjacent. Never `float` | Binary floating point cannot represent 0.10. A stored total that disagrees with the sum of its lines by a cent is a defect with no defence |
 | S3 | **Timestamps** | `timestamptz`, UTC, never naive. `created_at` and `updated_at` on every mutable table | A naive timestamp is ambiguous the first time anything runs in another zone, and the ambiguity is unrecoverable |
-| S4 | **Enums** | A plain `text` column. No Postgres `ENUM` type and no `CHECK` constraint. The permitted set is a `DomainEnum` (a `StrEnum`) in the owning service's `app/models/enums.py`, enforced on write by a `DomainEnumText` type decorator and at the API edge by Pydantic — which also publishes the set into OpenAPI. A state machine is additionally constrained by an explicit transition table in the service layer | Adding a value becomes a one-line edit rather than an Alembic revision, and — the decisive reason — `ALTER TYPE … ADD VALUE` is irreversible, so a native enum cannot satisfy S14's mandatory `downgrade`. `text` with a `CHECK` is a migration too, so it solves nothing. Self-documentation moves from `\d` to OpenAPI, which is where clients actually read it. For a state machine the transition table is *stricter* than the type it replaces: a Postgres enum accepts `delivered → pending`, a transition table does not |
+| S4 | **Enums** | A plain `text` column. No Postgres `ENUM` type and no `CHECK` constraint. The permitted set is a `DomainEnum` (a `StrEnum`) in the owning entity's `enums.py` (or `app/core/enums.py` when several entities share it), enforced on write by a `DomainEnumText` type decorator and at the API edge by Pydantic — which also publishes the set into OpenAPI. A state machine is additionally constrained by an explicit transition table in the service layer | Adding a value becomes a one-line edit rather than an Alembic revision, and — the decisive reason — `ALTER TYPE … ADD VALUE` is irreversible, so a native enum cannot satisfy S14's mandatory `downgrade`. `text` with a `CHECK` is a migration too, so it solves nothing. Self-documentation moves from `\d` to OpenAPI, which is where clients actually read it. For a state machine the transition table is *stricter* than the type it replaces: a Postgres enum accepts `delivered → pending`, a transition table does not |
 | S5 | **Soft delete** | A terminal status value (`archived`, `is_active = false`), never a hard `DELETE`, on anything referenced across a boundary | A hard delete breaks snapshots and projections that no foreign key protects. Exception: derived data (`product_chunks`) is hard-deleted, because it is rebuildable |
 | S6 | **Optimistic concurrency** | `version integer`, checked and incremented on update, on every aggregate root with concurrent writers | Lost-update prevention without holding locks across a request. The loser gets `409` |
 | S7 | **Audit** | Per-service audit table, written by the service layer in the same transaction as the change, carrying actor and correlation id | A trigger cannot see the authenticated actor or the request id. Atomicity means no change can exist without its trail |
@@ -717,7 +713,7 @@ Fixed once, followed by every service. A deviation is a review failure, not a st
 | No `updated_at` (S3) | Append-only tables | Nothing is ever updated |
 | Validation outside the database (S11) | Every enum-valued column (S4) | S11 exists because application checks have races. An enum value is not a concurrent-write invariant like `on_hand >= reserved` — it is a spelling check, and a spelling check has no race to lose. R1 already gives each database one service and one role, so the application is the only writer there is to constrain |
 
-**Vocabularies (S4), by owning service.** Each is a `DomainEnum` in that service's `app/models/enums.py`; every value, and every transition, is listed in the service RFC's §3.1.1.2–§3.1.1.3.
+**Vocabularies (S4), by owning service.** Each is a `DomainEnum` in the owning entity's `enums.py`; every value, and every transition, is listed in the service RFC's §3.1.1.2–§3.1.1.3.
 
 | Service | Vocabularies |
 | --- | --- |
@@ -808,7 +804,7 @@ class DomainEnumText(TypeDecorator[Any]):
 1. `process_bind_param` runs inside the flush, so SQLAlchemy wraps its exception: the caller sees `sqlalchemy.exc.StatementError` with the `UnknownEnumValueError` on `.orig`. The type decorator is therefore a **backstop, not the primary gate** — it fires late, inside the transaction, with a poor error shape. The primary gates are Pydantic at the edge and `transition()` in the service layer.
 2. A tolerant ORM read is cancelled out by a strict Pydantic *response* schema — `model_validate` raises `ValidationError` on the unknown value and the 500 reappears one layer later. Both layers must agree. Request schemas stay strict always: the API never accepts a value this build does not know. Response schemas for `passthrough` columns widen to `ProductStatus | str` via a `BeforeValidator`; response schemas for `fallback` columns stay strict, because the ORM already guarantees a member.
 
-**The API contract does not weaken.** Pydantic v2 renders a `DomainEnum` field as a `$defs` entry carrying the full value list, and FastAPI lifts it into OpenAPI unchanged. The published enum is generated from `app/models/enums.py`, so — unlike a hand-maintained `CHECK` or a `\d` listing — it cannot drift from what the service actually accepts.
+**The API contract does not weaken.** Pydantic v2 renders a `DomainEnum` field as a `$defs` entry carrying the full value list, and FastAPI lifts it into OpenAPI unchanged. The published enum is generated from the `DomainEnum` class, so — unlike a hand-maintained `CHECK` or a `\d` listing — it cannot drift from what the service actually accepts.
 
 **Alembic.** Columns are declared `sa.Column("status", sa.Text(), nullable=False, server_default="draft")` — an ordinary, trivially reversible revision. One hook is mandatory in every service's `alembic/env.py`, because autogenerate otherwise renders `DomainEnumText()` **without its required `enum_class` argument**, producing a migration that raises `TypeError` when run and that imports domain types into a layer where they do not belong:
 
@@ -828,11 +824,11 @@ context.configure(..., render_item=render_item, compare_type=True)
 
 ```python
 op.execute("COMMENT ON COLUMN orders.status IS "
-           "'DomainEnum OrderStatus — see services/order/app/models/enums.py; "
-           "transitions in app/utils/state_machine.py'")
+           "'DomainEnum OrderStatus — see services/order/app/orders/enums.py; "
+           "transitions in app/orders/state_machine.py'")
 ```
 
-**What adding a value costs, end to end.** One line in `app/models/enums.py`, plus an edge in the transition table if the column has one. No Alembic revision, no `alembic upgrade head`, no deploy ordering constraint — the column already accepts the string. The OpenAPI enum, the round-trip test, and the seed script all follow from the same source. CI confirms it was genuinely migration-free: `alembic check` must report no pending diff.
+**What adding a value costs, end to end.** One line in the entity's `enums.py`, plus an edge in the transition table if the column has one. No Alembic revision, no `alembic upgrade head`, no deploy ordering constraint — the column already accepts the string. The OpenAPI enum, the round-trip test, and the seed script all follow from the same source. CI confirms it was genuinely migration-free: `alembic check` must report no pending diff.
 
 **What is measurably given up.** Storage: an enum label is a fixed 4 bytes, a short text value is its length plus a one-byte header, so the delta is roughly 2–13 bytes per row on the status columns — invisible next to the `uuid`s, `numeric`s and `jsonb` snapshots already in those rows. Index size is about 1.5–2× per entry. Equality filtering is unaffected in practice: for a deterministic collation Postgres short-circuits `texteq` to a length check plus `memcmp` and never consults the collation library, so the familiar worry about expensive text comparison applies to ordering and pattern matching, not to `=`. The one real difference is ordering — `ORDER BY status` on a native enum sorted in declaration order, which was often meaningful; on `text` it sorts alphabetically, which is not. Any query relying on that must sort on a timestamp or an explicit `CASE`. The platform has no such query today, and the indexes S4's columns carry are all equality or composite-prefix indexes, which are unaffected.
 
@@ -1237,7 +1233,7 @@ One qualification, because the usual version of this argument overstates it: it 
 | Rigid conventions | Occasional local awkwardness | Eight schemas by one developer in five weeks read as one system only if the conventions hold. Deviations are listed (§3.1.3.1), not ad hoc |
 | `jsonb` for open-ended fields | No database-level validation; typo'd keys accepted | Variant dimensions are merchant-defined; a fixed schema would be wrong immediately. Validated at the Pydantic layer, never used for filtered fields (S8) |
 | Per-service audit tables | Cross-service audit queries need manual correlation | Transactional atomicity with the change is non-negotiable |
-| **Enum validity in the model, not the database (S4)** | A direct `psql` write is no longer constrained — `UPDATE orders SET status = 'shippd'` now succeeds. `\d orders` no longer lists permitted values | S14 becomes satisfiable at all, and state machines gain a transition table strictly stricter than the type it replaces. Bounded by R1 (one role per database) and reduced by a `COMMENT ON COLUMN` pointing at `app/models/enums.py`, a per-service round-trip test, and a runbook routing manual edits through an admin utility. Residual risk is a human with the service role at 2am, accepted knowingly |
+| **Enum validity in the model, not the database (S4)** | A direct `psql` write is no longer constrained — `UPDATE orders SET status = 'shippd'` now succeeds. `\d orders` no longer lists permitted values | S14 becomes satisfiable at all, and state machines gain a transition table strictly stricter than the type it replaces. Bounded by R1 (one role per database) and reduced by a `COMMENT ON COLUMN` pointing at the `DomainEnum` source, a per-service round-trip test, and a runbook routing manual edits through an admin utility. Residual risk is a human with the service role at 2am, accepted knowingly |
 | The gateway as a stateless exception | Slight inconsistency in the ownership test | Bounded explicitly — no logic, no database. The alternative duplicates edge concerns eight times |
 | **Schema split across service RFCs, with the index here** | A reader wanting every column opens eight documents; the index here can drift from the service RFCs and from the code | One definition per column is preserved, and each lives next to the behaviour that uses it. The catalogue-completeness test (§7) compares the index against each service's Alembic head; the `Cols` column makes a dropped column visible as arithmetic |
 
@@ -1434,7 +1430,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 | Outbox and dedupe | Every producer in §3.1.3.2's matrix has an identical `outbox`; every consumer has `processed_events`. **This test is what would have caught the four `‡` tables** |
 | Migrations | Every Alembic revision has a non-trivial `downgrade` |
 | Enums (S4) | No column's type is `sa.Enum`; no `CHECK` constraint names a status value; `pg_type` holds no enum type in any service database |
-| Enum round trip (S4) | Per service: discover every `DomainEnum` subclass in `app/models/enums.py`, and for every member of every `DomainEnumText` column, write it to real Postgres and read it back. Adding a value extends this test with no edit |
+| Enum round trip (S4) | Per service: discover every `DomainEnum` subclass under `app/`, and for every member of every `DomainEnumText` column, write it to real Postgres and read it back. Adding a value extends this test with no edit |
 | Enum write strictness (S4) | An unknown value is rejected on write and leaves no row behind. The error arrives as `sqlalchemy.exc.StatementError` with `UnknownEnumValueError` on `.orig`, because `process_bind_param` runs inside the flush |
 | Enum read tolerance (S4) | A value written by a newer deploy is readable by an older one — the rollback case. Write an unknown value through raw SQL, read it through the ORM |
 | `common` vocabulary (R8, S4) | A grep of `common` for any domain status literal returns nothing — the library holds the mechanism, services hold the values |

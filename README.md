@@ -112,18 +112,19 @@ The full map, including the layout every service follows, is in
 ```
 docker-compose.yml   Makefile   .env.example   pyproject.toml (ruff/mypy config)
 common/         smartretail_common + tests
-services/<svc>/      main.py, app/{api, configs, infrastructure, models, services, utils, …}, alembic/, tests/
+services/<svc>/      main.py, app/{router.py, core/, <entity>/, …}, alembic/, tests/
 ops/postgres/init/   databases, roles and grants
 scripts/keys.sh      RS256 key generation
 tests/e2e/           smoke test through the gateway
 ```
 
-Services follow the EVA backend layout. Handlers in `app/api/handlers/` deal
-with HTTP only, and every route is declared in `app/api/router.py`. Business
-rules live in the `app/services/*_repo.py` files. Each `app/models/<entity>.py`
-holds the ORM model together with its Pydantic request/response models, and
-those Pydantic models are the API contract. Vocabularies are in
-`app/models/enums.py` and state machines in `app/utils/`. The ORM is never
+Services are organised by entity. Each `app/<entity>/` holds its ORM model
+(`models.py`), its business rules (`repo.py`) and helpers such as the state
+machine. Only the HTTP contract is versioned: `app/<entity>/v1/routes.py`
+deals with HTTP only and `v1/schemas.py` holds the Pydantic request/response
+models, which are the API contract. `app/router.py` only includes the entity
+routers and owns the `/api/v1` and entity prefixes, so every URL can be read
+there. Cross-entity infrastructure lives in `app/core/`. The ORM is never
 exposed directly. See [docs/file-structure.md](docs/file-structure.md).
 
 ## API overview (Milestone 1)

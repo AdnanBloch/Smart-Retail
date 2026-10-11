@@ -127,15 +127,16 @@ Source: [RFC 0001 §3.1.1.1](rfcs/0001-platform-and-shared-infrastructure.md#311
 ## 4. Service layout (every service)
 
 Every service under `services/<svc>/` uses the same layout, so moving between
-services needs no re-orientation. It is the layout of the EVA backends
-(`EVA-*-Service-BE`). The tree below is the full template; a service includes
+services needs no re-orientation. Code is grouped **by entity**: everything
+about products sits in `app/products/`. Only the HTTP contract is versioned, in
+`app/<entity>/v<N>/`. The tree below is the full template; a service includes
 only the folders it needs (see §5).
 
 ```
 services/<svc>/
 ├── Dockerfile
 ├── pyproject.toml            # the service's package and dependencies
-├── main.py                   # create_application(): settings, logging, DB, routers, /health
+├── main.py                   # create_application(): settings, logging, DB, router, /health
 ├── alembic.ini               # only for services that own a Postgres database
 ├── alembic/                  # this service's own migration history
 │   ├── env.py
@@ -144,105 +145,110 @@ services/<svc>/
 │       └── NNNN_<change>.py  # e.g. 0001_users.py, 0002_merchant_profiles.py
 ├── app/
 │   ├── __init__.py
-│   ├── api/
-│   │   ├── router.py         # every route: path, method, tags, response_model, status_code
-│   │   └── handlers/
-│   │       ├── <resource>.py # `router = APIRouter()` + handlers: parse, validate, call a repo, serialise
-│   │       ├── health.py     # readiness checks behind /health/ready
-│   │       └── utils.py      # FastAPI dependencies (session, principal, repos)
-│   ├── configs/
-│   │   └── env.py            # the service's settings class (extends BaseServiceSettings)
-│   ├── infrastructure/
+│   ├── router.py             # every URL: includes entity routers, owns /api/v<N> + entity prefixes
+│   ├── models.py             # imports every entity's ORM models onto one metadata (Alembic, seed)
+│   ├── seed.py               # idempotent seed data (`python -m app.seed`)
+│   ├── core/                 # cross-entity infrastructure, no business rules
+│   │   ├── config.py         # the service's settings class (extends BaseServiceSettings)
 │   │   ├── db.py             # Database factory and the get_db session dependency
 │   │   ├── logger.py         # JSON logging setup
-│   │   ├── security.py       # service-specific security (e.g. password hashing, key ring)
-│   │   └── seed.py           # idempotent seed data (`python -m app.infrastructure.seed`)
-│   ├── exception_handlers/
-│   │   └── exception_handlers.py  # this service's DomainError subclasses
-│   ├── models/
-│   │   ├── enums.py          # this service's value sets (DomainEnum)
-│   │   ├── response.py       # shared Pydantic bases and field types
-│   │   └── <entity>.py       # SQLAlchemy ORM + that entity's Pydantic request/response models
-│   ├── services/
-│   │   └── <entity>_repo.py  # <Entity>Repo: business rules; the only layer allowed to hold them
-│   ├── utils/
-│   │   ├── state_machine.py  # the allowed-transition table
-│   │   └── helpers.py        # small pure helpers
-│   ├── middleware/           # ASGI middleware, when the service has its own
+│   │   ├── dependencies.py   # app state, role guards, principal
+│   │   ├── security.py       # service-specific security (password hashing, key ring)
+│   │   ├── errors.py         # this service's DomainError subclasses (problem types)
+│   │   ├── enums.py          # value sets shared by several entities (DomainEnum)
+│   │   ├── schemas.py        # Pydantic bases every versioned schema builds on
+│   │   └── utils.py          # small pure helpers shared by the entities
+│   ├── health/
+│   │   └── routes.py         # /health and /health/ready
+│   ├── <entity>/             # one folder per entity, e.g. products/, users/
+│   │   ├── models.py         # SQLAlchemy ORM: one shape per table, never versioned
+│   │   ├── repo.py           # <Entity>Repo: business rules; the only layer allowed to hold them
+│   │   ├── dependencies.py   # builds the entity's repos for a request
+│   │   ├── enums.py          # the entity's own value sets (when it has them)
+│   │   ├── utils.py          # state machine (transition table) and pure helpers; no I/O
+│   │   └── v1/
+│   │       ├── routes.py     # `router = APIRouter()` + decorated handlers: parse, call a repo, serialise
+│   │       └── schemas.py    # Pydantic request/response models: the v1 contract
 │   ├── clients/              # outbound calls to other services
-│   ├── constants/            # fixed values
-│   ├── consumers/            # (planned) Kafka event handlers; thin, like handlers
+│   ├── consumers/            # (planned) Kafka event handlers; thin, like routes
 │   ├── workflows/            # (planned) Temporal workflows and activities
 │   └── tasks/                # (planned) Celery tasks
 └── tests/
     ├── conftest.py
-    ├── unit/                 # no database: models, state machines, pure logic
-    │   └── test_<topic>.py
+    ├── unit/                 # no database; mirrors app/: unit/<entity>/test_<topic>.py
     └── integration/          # real PostgreSQL, migrated to head per suite
         ├── conftest.py
-        ├── test_<resource>.py
+        ├── <entity>/test_<topic>.py
         └── test_migrations.py   # head → base → head and `alembic check`
 ```
+
+An entity with several repos names them `<topic>_repo.py` (catalog's
+`products/listing_repo.py`, identity's `auth/session_repo.py`).
 
 The container runs `uvicorn --factory main:create_application`. Tests build
 the app the same way: `from main import create_application`.
 
+**Why entity-first with the version inside.** A table has one shape at a time,
+so its ORM model and the rules that guard it cannot be versioned; only the HTTP
+contract (paths, request and response bodies) can. v2 is a new `<entity>/v2/`
+folder plus one line in `app/router.py`, and both versions call the same repo.
+See [the review record](reviews/2026-10-06-mentor-review.md#3-entity-first-service-layout-with-versions)
+and decision ARC-D in RFC 0000 §3.2.1.
+
 **Layering rules**
 
-- The API layer (`api/`) handles HTTP only and never touches the ORM.
-- `api/router.py` is the only file that registers routes. Each handler module
-  owns one `router = APIRouter()`; its functions carry no decorators.
-- `services/` is the only place business rules live. Handlers, event consumers,
+- `v<N>/routes.py` handles HTTP only and never touches the ORM.
+- `app/router.py` only includes routers. It owns the version prefix and each
+  entity's prefix, so every URL the service serves can be read from one file.
+- `repo.py` is the only place business rules live. Routes, event consumers,
   Temporal activities and CLI commands all call the repos, so each rule has one
   implementation and one set of tests.
-- The service layer never builds HTTP responses. It raises `DomainError`s, and
-  the shared handlers turn them into problem details.
-- The Pydantic models in `models/` are the contract. ORM objects are never
-  returned directly.
-- `utils/` state machines and helpers do no I/O.
-- A service never imports another service's code. Shared code goes in
-  `common`.
+- Repos never build HTTP responses. They raise `DomainError`s, and the shared
+  handlers turn them into problem details.
+- `v<N>/schemas.py` is the contract. ORM objects are never returned directly.
+- `utils.py` state machines and helpers do no I/O.
+- An entity may import another entity's repo or models in the same service; a
+  service never imports another service's code. Shared code goes in `common`.
 
-**Routes and handlers**
+**Routes**
 
 ```python
-# app/api/handlers/products.py: one router, plain handler functions
+# app/products/v1/routes.py: one router, decorated handlers
 router = APIRouter()
 
+@router.get("/me", response_model=Page[ProductSummary])
+async def my_products(...): ...
+
+@router.get("/{product_id}", response_model=ProductDetail)
 async def get_product(
     product_id: uuid.UUID, repo: ProductRepo = Depends(product_repo)
 ) -> ProductDetail:
     return await repo.get(product_id)
 
-# app/api/router.py: every route
-router = APIRouter(prefix="/api/v1")
-
-# Route: /products/
-products.router.get("/me", response_model=Page[ProductSummary])(products.my_products)
-products.router.get("/{product_id}", response_model=ProductDetail)(products.get_product)
-
-router.include_router(products.router, prefix="/products", tags=["products"])
+# app/router.py: includes only
+v1 = APIRouter(prefix="/api/v1")
+v1.include_router(products_v1.router, prefix="/products", tags=["products"])
+router.include_router(v1)
 ```
 
-- `router.py` keeps one block per resource, headed by a `# Route:` comment, in
-  registration order. A literal segment (`/me`) is registered before `/{id}`.
-- Each registration carries all of that route's HTTP metadata: `response_model`,
+- Paths in `routes.py` are relative to the entity prefix. A literal segment
+  (`/me`) is declared before `/{id}`.
+- Each decorator carries all of that route's HTTP metadata: `response_model`,
   `status_code`, `dependencies=[...]` and `responses={...}`.
-- Handler modules may also hold a small request-parsing dependency that their
-  handlers share (e.g. `product_filters`). Anything else belongs in
-  `api/handlers/utils.py`, `models/` or `services/`.
+- A routes module may hold a small request-parsing dependency its handlers
+  share (e.g. `product_filters`). Anything else belongs in `dependencies.py`,
+  `schemas.py` or `repo.py`.
 - `/health` and `/health/ready` are mounted at the root by `main.py`, outside
   `/api/v1`.
 
 **Naming**
 
-- Handler modules are named after the resource in plural (`products.py`).
-  Models are singular (`product.py`, `user.py`). Repos are `<entity>_repo.py`
-  with a class `<Entity>Repo` (`product_repo.py`, `ProductRepo`).
+- Entity folders are plural (`products/`, `users/`); ORM classes are singular
+  (`Product`, `User`). Repos are classes `<Entity>Repo`.
 - Migrations are numbered `NNNN_<change>.py`.
-- Test files mirror the area they cover: `test_<resource>.py`.
+- Tests mirror `app/`: `tests/unit/products/test_state_machine.py`.
 
-`services/identity/` is the best example of the full layout today.
+`services/catalog/` is the best example of the full layout today.
 
 Source: [RFC 0000 §3.1.1.7](rfcs/0000-architecture.md#3117-module-structure-inside-a-service).
 
@@ -250,16 +256,16 @@ Source: [RFC 0000 §3.1.1.7](rfcs/0000-architecture.md#3117-module-structure-ins
 
 Each service uses the §4 template. Only the differences are listed here.
 
-| Service | Store | Differences from the template | RFC |
-| --- | --- | --- | --- |
-| `gateway` | none | No `alembic/`, `models/`, `services/` or `exception_handlers/`. `api/handlers/` holds `health.py`, `docs.py` (merged OpenAPI, Swagger UI) and `proxy.py` (the catch-all route). `middleware/` (CORS; later correlation, size limit, rate limit), `clients/upstream/` (forwarding, upstream errors, OpenAPI aggregation, SSE relay) and `utils/routing.py` (route table, matching). | [0002](rfcs/0002-gateway-service.md) |
-| `identity` | Postgres | Template as shown. `utils/merchant_status.py` holds the merchant transition table. | [0003](rfcs/0003-identity-service.md) |
-| `catalog` | Postgres | `utils/access.py` (visibility and ownership checks). Adds `workflows/` (product publishing on Temporal), `tasks/` (media processing on Celery) and `consumers/`. | [0004](rfcs/0004-catalog-service.md#3114-workflows-and-async-jobs) |
-| `order` | Postgres | Adds `workflows/` (order saga) and `consumers/`. | [0005](rfcs/0005-order-service.md#3114-workflows-and-async-jobs) |
-| `inventory` | Postgres | Adds `consumers/` and the activities the order saga calls. | [0006](rfcs/0006-inventory-service.md#3114-workflows-and-async-jobs) |
-| `notification` | Postgres | Adds `consumers/`, `tasks/` (delivery) and `stream/` (SSE). | [0007](rfcs/0007-notification-service.md#3114-workflows-and-async-jobs) |
-| `analytics` | MongoDB | No `alembic/` (an idempotent init command creates the indexes). Built around `consumers/`. | [0008](rfcs/0008-analytics-service.md#3114-workflows-and-async-jobs) |
-| `assistant` | Postgres + pgvector | Also provides the `indexer-worker` entry point. Adds `consumers/` and `tasks/`. | [0009](rfcs/0009-assistant-service.md#3114-workflows-and-async-jobs) |
+| Service | Store | Entities | Differences from the template | RFC |
+| --- | --- | --- | --- | --- |
+| `gateway` | none | `health/`, `docs/`, `proxy/` | Owns no API contract, so no `v<N>/` folders, `alembic/`, `models.py` or repos. `docs/` serves the merged OpenAPI and Swagger UI; `proxy/` holds the route table (`routing.py`), forwarding, upstream errors and JWT checks (`auth.py`) and the catch-all route. `core/cors.py` holds CORS (later correlation, size limit, rate limit). | [0002](rfcs/0002-gateway-service.md) |
+| `identity` | Postgres | `auth/`, `users/`, `merchants/` | `auth/` has several repos (`authentication_repo.py`, `registration_repo.py`, `session_repo.py`, `token_repo.py`). `merchants/utils.py` holds the merchant transition table. | [0003](rfcs/0003-identity-service.md) |
+| `catalog` | Postgres | `products/`, `variants/`, `categories/`, `media/` | `products/` adds `state_machine.py`, `access.py` (visibility and ownership), `listing_repo.py` and `audit_repo.py`. Later adds `workflows/` (publishing on Temporal), `tasks/` (media processing on Celery) and `consumers/`. | [0004](rfcs/0004-catalog-service.md#3114-workflows-and-async-jobs) |
+| `order` | Postgres | (planned) `orders/` (orders, items, status history); `idempotency_keys` in `core/` | Adds `workflows/` (order saga) and `consumers/`. | [0005](rfcs/0005-order-service.md#3114-workflows-and-async-jobs) |
+| `inventory` | Postgres | (planned) `stock/` (stock items, movements), `reservations/` | Adds `consumers/` and the activities the order saga calls. | [0006](rfcs/0006-inventory-service.md#3114-workflows-and-async-jobs) |
+| `notification` | Postgres | (planned) `notifications/` (notifications, delivery attempts), `subscriptions/` (push) | Adds `consumers/`, `tasks/` (delivery) and `stream/` (SSE). | [0007](rfcs/0007-notification-service.md#3114-workflows-and-async-jobs) |
+| `analytics` | MongoDB | (planned) `metrics/` (counters, rollups, product and failure stats) | No `alembic/` (an idempotent init command creates the indexes). Built around `consumers/`. | [0008](rfcs/0008-analytics-service.md#3114-workflows-and-async-jobs) |
+| `assistant` | Postgres + pgvector | (planned) `chat/` (conversations, messages), `search/` (chunks, embedding cache, index state), `generations/`, `prompts/` | Also provides the `indexer-worker` entry point. Adds `consumers/` and `tasks/`. | [0009](rfcs/0009-assistant-service.md#3114-workflows-and-async-jobs) |
 
 For the exact workflows, tasks and consumers of each service, see that
 service's RFC §3.1.1.4.

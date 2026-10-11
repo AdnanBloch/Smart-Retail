@@ -457,7 +457,7 @@ The dedupe row and the effect are one transaction, which is why C4 and the dedup
 
 **Metrics setup.** `setup_metrics(app, settings)` installs the OTel meter provider with a Prometheus reader, mounts `/metrics`, and registers the standard instruments of §3.1.1.11 (HTTP server RED, HTTP client, DB pool, consumer, producer). Services add their own instruments through the same meter.
 
-**`DomainEnum` and `DomainEnumText` (S4).** The rule — enums are `text`, never a Postgres `ENUM` or a `CHECK`; the permitted set is a `DomainEnum` in the owning service's `app/models/enums.py`; strict on write, tolerant on read — and its rationale are defined in [RFC 0000 §3.1.3.1](0000-architecture.md#3131-schema-conventions-s1s15). `common` supplies the mechanism only:
+**`DomainEnum` and `DomainEnumText` (S4).** The rule — enums are `text`, never a Postgres `ENUM` or a `CHECK`; the permitted set is a `DomainEnum` in the owning entity's `enums.py` (or `app/core/enums.py` when several entities share it); strict on write, tolerant on read — and its rationale are defined in [RFC 0000 §3.1.3.1](0000-architecture.md#3131-schema-conventions-s1s15). `common` supplies the mechanism only:
 
 | Symbol | Contract |
 | --- | --- |
@@ -1013,7 +1013,7 @@ SmartRetail/
 └── tests/e2e/                   # through-the-gateway end-to-end suites
 ```
 
-Inside each service the layering is the one fixed in [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service): a root `main.py`, then `app/api/` (`router.py` and `handlers/`, HTTP only), `services/` (`*_repo.py`, the only layer permitted business rules), `models/` (ORM and Pydantic contract, `enums.py`), `configs/`, `infrastructure/`, `exception_handlers/`, `utils/` (state machines, helpers), `consumers/`, `workflows/`, `tasks/`.
+Inside each service the layering is the one fixed in [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service): a root `main.py`, then `app/router.py` (includes routers only; owns the `/api/v<N>` and entity prefixes), `app/core/` (config, db, logger, dependencies, security, errors), one `app/<entity>/` per entity (`models.py` ORM, `repo.py` business rules, `dependencies.py`, `utils.py` state machine and helpers, and `v1/routes.py` + `v1/schemas.py` for the versioned HTTP contract), then `consumers/`, `workflows/`, `tasks/`.
 
 **Compose profiles.**
 
@@ -1126,7 +1126,7 @@ What a service may import. Anything not listed is private to the package and may
 | `pagination` | `PageParams`, `Page[T]`, `LIMIT_CEILING = 100` | Every service with a list endpoint |
 | `db` | `make_engine(settings)`, `get_session`, `unit_of_work(session)`, `Base` (declarative base with S1/S3 mixins) | Every Postgres service |
 | `db_types` | `DomainEnumText`, `render_item` | Every Postgres service, every `alembic/env.py` |
-| `enums` | `DomainEnum`, `UnknownEnumValueError`, `widen_for_response(enum_class)` | Every service's `app/models/enums.py` |
+| `enums` | `DomainEnum`, `UnknownEnumValueError`, `widen_for_response(enum_class)` | Every service's entity `enums.py` files |
 | `idempotency` | `idempotent(store)`, `IdempotencyStore` (protocol), `canonical_request_hash(body)` | `order`; any later service with a state-creating POST |
 | `outbox` | `outbox.add(session, *, event_type, aggregate_type, aggregate_id, payload, causation_id=None, client_id=…)`, `OutboxRow` (mapped to the shared DDL) | Every producer |
 | `events` | `Envelope`, `EventRegistry`, `AvroSerde`, `EventProducer`, `EventConsumer`, `DedupeStore`, `PostgresDedupeStore`, `run_consumers(*consumers)` | The relay; every consumer |
