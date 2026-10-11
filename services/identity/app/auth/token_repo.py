@@ -48,6 +48,22 @@ class TokenRepo:
             claims["merchant_status"] = str(user.merchant_profile.status)
         return self.keyring.sign(claims)
 
+    def service_token(self, client_id: str, scopes: list[str]) -> str:
+        """IDN-4: ``typ=service``, ``sub=service:<client_id>``; no role, sid or merchant claim."""
+        now = int(time.time())
+        claims: dict[str, object] = {
+            "iss": self.settings.jwt_issuer,
+            "aud": self.settings.jwt_audience,
+            "sub": f"service:{client_id}",
+            "typ": TokenType.SERVICE.value,
+            "scope": " ".join(scopes),
+            "iat": now,
+            "nbf": now,
+            "exp": now + self.settings.service_token_ttl_seconds,
+            "jti": str(uuid.uuid4()),
+        }
+        return self.keyring.sign(claims)
+
     def new_session(
         self, user_id: uuid.UUID, *, user_agent: str | None, ip: str | None
     ) -> tuple[RefreshSession, str]:

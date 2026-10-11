@@ -3,15 +3,23 @@
 import json
 import uuid
 
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, Form, Request, Response, status
+from fastapi.responses import JSONResponse
 
 from app.auth.authentication_repo import AuthenticationRepo
-from app.auth.dependencies import authentication_repo, registration_repo, session_repo
+from app.auth.client_credentials_repo import ClientCredentialsRepo
+from app.auth.dependencies import (
+    authentication_repo,
+    client_credentials_repo,
+    registration_repo,
+    session_repo,
+)
 from app.auth.registration_repo import RegistrationRepo
 from app.auth.session_repo import SessionRepo
-from app.auth.v1.schemas import LoginIn, RefreshIn, RegisterIn, TokenPair
+from app.auth.v1.schemas import LoginIn, RefreshIn, RegisterIn, ServiceToken, TokenPair
 from app.core.config import Settings
 from app.core.dependencies import client_ip, current_principal, get_keyring, get_settings
+from app.core.errors import OAuthError
 from app.core.security import KeyRing
 from app.users.v1.schemas import UserOut
 from smartretail_common.auth import Principal
@@ -93,4 +101,29 @@ async def jwks(
         content=json.dumps(keyring.jwks),
         media_type="application/jwk-set+json",
         headers=headers,
+    )
+
+
+@router.post(
+    "/token",
+    response_model=ServiceToken,
+    responses={400: {"description": "RFC 6749 error"}, 401: {"description": "invalid_client"}},
+)
+async def service_token(
+    grant_type: str = Form(...),
+    client_id: str = Form(..., max_length=128),
+    client_secret: str = Form(..., max_length=256),
+    scope: str | None = Form(None, max_length=1024),
+    repo: ClientCredentialsRepo = Depends(client_credentials_repo),
+) -> ServiceToken | JSONResponse:
+    """Client-credentials grant (RFC 6749 §4.4). Internal: the gateway never routes it."""
+    try:
+        issued = await repo.issue(
+            grant_type=grant_type, client_id=client_id, client_secret=client_secret, scope=scope
+        )
+    except OAuthError as exc:
+        headers = {"WWW-Authenticate": "Basic"} if exc.status == 401 else None
+        return JSONResponse({"error": exc.error}, status_code=exc.status, headers=headers)
+    return ServiceToken(
+        access_token=issued.access_token, expires_in=issued.expires_in, scope=issued.scope
     )

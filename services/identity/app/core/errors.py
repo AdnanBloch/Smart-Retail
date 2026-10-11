@@ -41,3 +41,12 @@ class EmailTaken(Conflict):
 class LastAdmin(Conflict):
     type_slug = "last-admin"
     title = "Cannot remove the last active admin"
+
+
+class OAuthError(Exception):
+    """RFC 6749 §5.2 error for ``POST /auth/token``: an OAuth body, not a problem detail."""
+
+    def __init__(self, status: int, error: str) -> None:
+        super().__init__(error)
+        self.status = status
+        self.error = error

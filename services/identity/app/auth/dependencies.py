@@ -4,6 +4,7 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.authentication_repo import AuthenticationRepo
+from app.auth.client_credentials_repo import ClientCredentialsRepo
 from app.auth.registration_repo import RegistrationRepo
 from app.auth.session_repo import SessionRepo
 from app.auth.token_repo import TokenRepo
@@ -39,3 +40,11 @@ def session_repo(
     session: AsyncSession = Depends(get_db), issuer: TokenRepo = Depends(token_repo)
 ) -> SessionRepo:
     return SessionRepo(session, issuer)
+
+
+def client_credentials_repo(
+    settings: Settings = Depends(get_settings),
+    hasher: PasswordHasher = Depends(get_hasher),
+    issuer: TokenRepo = Depends(token_repo),
+) -> ClientCredentialsRepo:
+    return ClientCredentialsRepo(settings, hasher, issuer)

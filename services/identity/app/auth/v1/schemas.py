@@ -46,3 +46,12 @@ class TokenPair(StrictModel):
             refresh_token=tokens.refresh_token,
             expires_in=tokens.expires_in,
         )
+
+
+class ServiceToken(StrictModel):
+    """No refresh token: a client re-presents its credentials instead."""
+
+    access_token: str
+    token_type: Literal["Bearer"] = "Bearer"
+    expires_in: int
+    scope: str
