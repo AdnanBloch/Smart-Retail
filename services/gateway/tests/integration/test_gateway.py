@@ -171,7 +171,7 @@ async def test_cors_preflight_and_headers(client, upstreams) -> None:
 
 
 def test_cors_wildcard_rejected() -> None:
-    from app.configs.env import GatewaySettings
+    from app.core.config import GatewaySettings
 
     with pytest.raises(ValueError):
         GatewaySettings(gateway_cors_allow_origins="*")

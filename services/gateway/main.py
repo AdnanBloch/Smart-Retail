@@ -10,13 +10,13 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 
-from app.api.router import router
-from app.clients.upstream.forward import make_client
-from app.clients.upstream.openapi import OpenApiAggregator
-from app.configs.env import GatewaySettings, get_settings
-from app.infrastructure.logger import init_logger
-from app.middleware.cors import EdgeCORSMiddleware
-from app.utils.routing import ROUTES, RouteTable
+from app.core.config import GatewaySettings, get_settings
+from app.core.cors import EdgeCORSMiddleware
+from app.core.logger import init_logger
+from app.docs.openapi import OpenApiAggregator
+from app.proxy.forward import make_client
+from app.proxy.routing import ROUTES, RouteTable
+from app.router import router
 from smartretail_common.app import install_platform
 from smartretail_common.auth import JwtVerifier
 

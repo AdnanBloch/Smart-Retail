@@ -5,7 +5,7 @@ import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.configs.env import GatewaySettings
+from app.core.config import GatewaySettings
 from main import create_application
 from smartretail_common.auth import JwtVerifier
 from smartretail_common.testing import KeyPair, generate_keypair, mint_token

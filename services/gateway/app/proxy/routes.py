@@ -3,14 +3,17 @@
 from fastapi import APIRouter, Request
 from starlette.responses import Response
 
-from app.clients.upstream.errors import MethodNotAllowed, RouteNotFound
-from app.clients.upstream.forward import forward
-from app.infrastructure.security import enforce_policy
-from app.utils.routing import Policy
+from app.proxy.auth import enforce_policy
+from app.proxy.errors import MethodNotAllowed, RouteNotFound
+from app.proxy.forward import forward
+from app.proxy.routing import Policy
+
+PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 router = APIRouter(include_in_schema=False)
 
 
+@router.api_route("/{path:path}", methods=PROXY_METHODS)
 async def proxy(request: Request, path: str) -> Response:
     state = request.app.state
     match = state.routes.match(request.method, request.url.path)

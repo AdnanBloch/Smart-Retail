@@ -2,7 +2,7 @@
 
 from fastapi import Request
 
-from app.utils.routing import Policy, RouteRule
+from app.proxy.routing import Policy, RouteRule
 from smartretail_common.auth import InvalidToken, JwtVerifier, Principal, bearer_token
 from smartretail_common.errors import Forbidden
 

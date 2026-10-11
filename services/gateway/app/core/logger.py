@@ -2,7 +2,7 @@
 
 import logging
 
-from app.configs.env import GatewaySettings
+from app.core.config import GatewaySettings
 from smartretail_common.logging import configure_logging
 
 logger = logging.getLogger("gateway")

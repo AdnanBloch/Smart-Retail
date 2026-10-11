@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 router = APIRouter(include_in_schema=False)
 
 
+@router.get("")
 async def get_health() -> dict[str, str]:
     return {"status": "ok"}
 
@@ -24,6 +25,7 @@ async def _probe(client: httpx.AsyncClient | None) -> str:
         return "unreachable"
 
 
+@router.get("/ready")
 async def get_ready(request: Request) -> JSONResponse:
     state = request.app.state
     checks = {

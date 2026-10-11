@@ -7,9 +7,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 router = APIRouter(include_in_schema=False)
 
 
+@router.get("/openapi.json")
 async def get_openapi(request: Request) -> JSONResponse:
     return JSONResponse(await request.app.state.openapi.document())
 
 
+@router.get("/docs")
 async def get_docs() -> HTMLResponse:
     return get_swagger_ui_html(openapi_url="/openapi.json", title="SmartRetail API")

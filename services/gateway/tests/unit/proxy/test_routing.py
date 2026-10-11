@@ -1,6 +1,6 @@
 import pytest
 
-from app.utils.routing import ROUTES, Policy, RouteRule, RouteTable
+from app.proxy.routing import ROUTES, Policy, RouteRule, RouteTable
 
 UPSTREAMS = {"identity": "http://identity", "catalog": "http://catalog"}
 TABLE = RouteTable(ROUTES, UPSTREAMS)

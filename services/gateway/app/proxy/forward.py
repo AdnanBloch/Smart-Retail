@@ -11,7 +11,7 @@ from fastapi import Request
 from starlette.background import BackgroundTask
 from starlette.responses import Response, StreamingResponse
 
-from app.clients.upstream.errors import (
+from app.proxy.errors import (
     PayloadTooLarge,
     UpstreamBadResponse,
     UpstreamError,
