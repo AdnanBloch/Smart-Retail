@@ -21,6 +21,8 @@
 
 ## Milestone 1 — Foundation & Core Services
 
+**Status:** delivered — gateway, identity, catalog, `common`, the local stack.
+
 ### Scope
 
 - Initial system design and setup
@@ -37,6 +39,11 @@
 ---
 
 ## Milestone 2 — Core Business Logic
+
+**Status:** delivered — the product publishing workflow and the order saga on
+Temporal, inventory reservation, idempotent checkout, the state machines, and
+the `workflow` Compose profile. What was built and where it departs from the
+RFCs: [README](../README.md#milestone-2-decisions-and-deviations).
 
 ### Scope
 

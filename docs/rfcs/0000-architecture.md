@@ -465,7 +465,7 @@ sequenceDiagram
 | Step | What happens | Specified in |
 | --- | --- | --- |
 | Request | Owner merchant or admin posts `{"status":"published"}`; `catalog` guards (owner? `draft` or `inactive`? not already running?), sets `publishing`, records `workflow_id`, returns `202` | [RFC 0004 §3.1.2.1](0004-catalog-service.md#3121-endpoints), [§3.1.1.3](0004-catalog-service.md#3113-state-machines) |
-| 1–4 | `validate_product`, `process_media` (enqueued to Celery), `build_search_document`, `sync_downstream` — Temporal activities with retry policies | [RFC 0004 §3.1.1.4](0004-catalog-service.md#3114-workflows-and-async-jobs) |
+| 1–4 | `validate_product`, `process_media` (an inline activity in Milestone 2; enqueued to Celery from Milestone 3, RFC 0004 Q7), `build_search_document`, `sync_downstream` — Temporal activities with retry policies | [RFC 0004 §3.1.1.4](0004-catalog-service.md#3114-workflows-and-async-jobs) |
 | 5 | `mark_published`: status, `published_at`, audit row and outbox row in one transaction — the only state write | [RFC 0004 §3.1.1.4](0004-catalog-service.md#3114-workflows-and-async-jobs), §3.1.3.2 |
 | Publish | `outbox-relay` publishes `catalog.product.published` | [RFC 0001](0001-platform-and-shared-infrastructure.md), [RFC 0004 §3.1.2.3](0004-catalog-service.md#3123-events-produced) |
 | React | `indexer-worker` chunks and embeds; `analytics` counts; `inventory` creates the zero-quantity stock row (Q4) | [RFC 0009 §3.1.2.4](0009-assistant-service.md#3124-events-consumed), [RFC 0008 §3.1.2.4](0008-analytics-service.md#3124-events-consumed), [RFC 0006 §3.1.2.4](0006-inventory-service.md#3124-events-consumed) |

@@ -234,7 +234,7 @@ services/inventory/
 │   │   ├── models.py           Reservation
 │   │   ├── repo.py             ReservationRepo: reserve / commit / release / reverse / expire — the one hard function
 │   │   ├── enums.py            ReservationStatus
-│   │   ├── utils.py            RESERVATION_TRANSITIONS, transition() — no I/O
+│   │   ├── state_machine.py    RESERVATION_TRANSITIONS, transition() — no I/O (INV-D26)
 │   │   ├── dependencies.py
 │   │   └── v1/
 │   │       ├── routes.py       internal (service token) /reservations routes
@@ -309,7 +309,7 @@ A reservation belongs to one stock item (one variant) and names one order. An or
 | `StockMovementReason` | `stock_movements.reason` | `initial`, `manual_adjustment`, `reserve`, `release`, `commit`, `expire`, `restock`, `return`, `compensation` | `passthrough` — a ledger vocabulary, displayed and filtered, expected to grow |
 | `StockoutTrigger` (INV-7) | event payload only (`inventory.stockout.trigger`) | `depleted`, `low_stock`, `reservation_refused` | n/a — not a column |
 
-Adding a value is one line in the entity's `enums.py`, plus an edge in the transition table if it is a state; no Alembic revision, and `alembic check` must report no pending diff. The creating migration comments the column with a pointer to the source of truth (`COMMENT ON COLUMN reservations.status IS 'DomainEnum ReservationStatus — see services/inventory/app/reservations/enums.py; transitions in app/reservations/utils.py'`).
+Adding a value is one line in the entity's `enums.py`, plus an edge in the transition table if it is a state; no Alembic revision, and `alembic check` must report no pending diff. The creating migration comments the column with a pointer to the source of truth (`COMMENT ON COLUMN reservations.status IS 'DomainEnum ReservationStatus — see services/inventory/app/reservations/enums.py; transitions in app/reservations/state_machine.py'`).
 
 ##### 3.1.1.3. State machines
 
@@ -377,7 +377,7 @@ Every status change goes through one guarded method, which raises `IllegalTransi
 | `reverse_commit_inventory(order_id)` | Compensation after a post-commit failure (shipment creation, step 5), serving [RFC 0005](0005-order-service.md#3114-workflows-and-async-jobs) ORD-12 | `POST /internal/v1/inventory/reservations/{id}/reverse` for each reservation id | reservation id; a second reverse is a no-op | `200` | `409 reservation-not-committed` (a defect in the saga — surfaced) | as above |
 | `sync_downstream(product_id, variants)` | `ProductPublishingWorkflow` step 4 | `POST /internal/v1/inventory/stock-items` (INV-4) | `variant_id` — the unique constraint; existing rows untouched | `200` with the rows | `422` on a malformed variant list | as above |
 
-**Error contract to the activities (INV-5).** Business outcomes are `4xx` and must be raised as Temporal `NonRetryableError`; contention and infrastructure outcomes are `503`/`5xx` and are retried under the workflow's retry policy. `inventory` never returns `5xx` for a business failure, which is what lets the workflow's retry policy be written without knowing inventory's rules. Recommended policy for the three `OrderWorkflow` inventory activities, adopted in RFC 0005: `start_to_close` 10 s, exponential backoff from 1 s, coefficient 2, maximum interval 10 s, maximum 5 attempts — well inside the 15-minute reservation TTL, so no retry chain can outlive the reservation it is retrying.
+**Error contract to the activities (INV-5).** Business outcomes are `4xx` and must be raised as Temporal `NonRetryableError`; contention and infrastructure outcomes are `503`/`5xx` and are retried under the workflow's retry policy. `inventory` never returns `5xx` for a business failure, which is what lets the workflow's retry policy be written without knowing inventory's rules. The policies are the workflow owner's: RFC 0005's ORD-10 table (INV-D29). `reserve_inventory` gets 5 attempts inside 60 s; `commit_inventory` and the compensations retry without an attempt cap inside their windows — all well inside the 15-minute reservation TTL for the forward path, so no forward retry chain can outlive the reservation it is retrying.
 
 **`OrderWorkflow` against `inventory`** — the saga steps that reach this service (step order and compensation order are RFC 0005's; shown here for the calls and outcomes `inventory` serves):
 
@@ -1087,7 +1087,7 @@ Vocabularies (`ReservationStatus`, `StockMovementReason`) are not migrations (S4
 | # | Task | Output | Depends on |
 | --- | --- | --- | --- |
 | 1 | `inventory` service skeleton, settings, health, Alembic with the S4 `render_item` hook; `0001_initial` (three tables + outbox) | Migration to head; `alembic check` clean | `common` outbox, idempotency, service-token verify ([RFC 0001](0001-platform-and-shared-infrastructure.md)) |
-| 2 | Domain: `stock/enums.py`, `reservations/enums.py`, `RESERVATION_TRANSITIONS` and `transition()` in `reservations/utils.py`, `stock/ledger_repo.py` | Unit tests incl. all 13 illegal pairs | 1 |
+| 2 | Domain: `stock/enums.py`, `reservations/enums.py`, `RESERVATION_TRANSITIONS` and `transition()` in `reservations/state_machine.py`, `stock/ledger_repo.py` | Unit tests incl. all 13 illegal pairs | 1 |
 | 3 | Inventory core: reserve / release / commit with canonical lock order, `lock_timeout`, bounded retry, ledger and outbox writes | **Concurrency test — 50 parallel reserves on 10 units yield 10 successes**; deadlock test | 2 |
 | 4 | Internal routes and service-token scope check; `POST /stock-items` initialisation | Contract tests; user tokens rejected | 3, `identity` client-credentials grant |
 | 5 | Merchant APIs: read, set (with `If-Match`), adjust (with `Idempotency-Key`), movements, `low_stock` / `out_of_stock` filters | Tests green, ownership enforced | 3 |
@@ -1157,6 +1157,11 @@ Decisions that already carry an ID (B*, Q*, R*, INV-1 to INV-16, INV-A*) keep it
 | INV-D23 | `stock_movements` append-only by grant (= INV-12); reconciliation detects, never corrects | Ledger stays the record; an automatic fix would erase evidence; [§3.3](#33-tradeoffs) | Auto-correction — destroys the audit trail | Never |
 | INV-D24 | Public read cached in Redis for 10 s, invalidated after commit; reserve never reads the cache | Absorbs display and hydration reads; correctness never depends on the cache; [§3.3](#33-tradeoffs) | No cache — every page view hits Postgres; longer TTL — stale stock | Hydration latency (INV-Q8) |
 | INV-D25 | Entity-first layout: `stock/` and `reservations/` with `v1/` routes, repos hold the rules | One rule implementation for routes, activities, consumers and tasks; [§3.1.1.1](#3111-responsibility-and-boundaries) | Layered `api/` + `services/` trees — entity split across folders ([review §3](../reviews/2026-10-06-mentor-review.md#3-entity-first-service-layout-with-versions)) | Never |
+| INV-D26 | Reservation transitions live in `reservations/state_machine.py`, not `utils.py` (Milestone 2 implementation) | One name for one thing across services: catalog and order already use `state_machine.py`; `utils.py` stays for pure helpers | `utils.py` as written in §3.1.1.1 (two names for the same role) | — |
+| INV-D27 | The reserve replay check runs *after* the ordered `FOR UPDATE` on the stock rows, not before (Milestone 2 implementation) | Two concurrent reserves for one order lock the same rows, so the second sees the first's reservations under its lock and replays; checked before the lock, both would pass it and the second would hit the unique constraint after mutating `reserved` | Replay check first (a race that surfaces as a 500 under retries) | — |
+| INV-D28 | The unlocked fast reject (INV-8) is skipped for an order that already holds reservations (Milestone 2 implementation) | Otherwise a retried reserve, whose own holding took `available` to zero, is refused against itself and the order fails `INSUFFICIENT_STOCK` while its stock is held | Fast reject unconditionally (as the §3.1.1.4 step order reads) | — |
+| INV-D29 | The retry policy for the order workflow's inventory activities is RFC 0005's ORD-10 (`commit` and the compensations retry without an attempt cap inside their windows); §3.1.1.4's "recommended policy … adopted in RFC 0005" is superseded (Milestone 2 implementation) | The workflow's owner sets its policies; a capped retry on a compensation is worse than a late one | Five attempts for every inventory activity (a compensation could give up) | — |
+| INV-D30 | An `adjust` `Idempotency-Key` is stored as the ledger reference `uuid5(namespace, "<caller>:<variant>:<key>")` with `reference_type = adjustment` (implements INV-11; Milestone 2 implementation) | `reference_id` is a uuid column, keys are free text; a deterministic uuid scoped to caller and variant makes the replay check one indexed lookup | A key column on `stock_movements` (widens an append-only ledger for one route) | — |
 
 #### 3.2.2. Reasoning
 

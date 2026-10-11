@@ -165,13 +165,15 @@ services/<svc>/
 │   │   ├── repo.py           # <Entity>Repo: business rules; the only layer allowed to hold them
 │   │   ├── dependencies.py   # builds the entity's repos for a request
 │   │   ├── enums.py          # the entity's own value sets (when it has them)
-│   │   ├── utils.py          # state machine (transition table) and pure helpers; no I/O
+│   │   ├── state_machine.py  # transition table and transition(), when the entity has a status
+│   │   ├── utils.py          # pure helpers; no I/O
 │   │   └── v1/
 │   │       ├── routes.py     # `router = APIRouter()` + decorated handlers: parse, call a repo, serialise
 │   │       └── schemas.py    # Pydantic request/response models: the v1 contract
 │   ├── clients/              # outbound calls to other services
 │   ├── consumers/            # (planned) Kafka event handlers; thin, like routes
-│   ├── workflows/            # (planned) Temporal workflows and activities
+│   ├── workflows/            # Temporal: types.py, the workflow, activities.py (thin, call
+│   │                         #   the repos), client.py (start/query/signal), worker.py
 │   └── tasks/                # (planned) Celery tasks
 └── tests/
     ├── conftest.py
@@ -206,7 +208,10 @@ and decision ARC-D in RFC 0000 §3.2.1.
 - Repos never build HTTP responses. They raise `DomainError`s, and the shared
   handlers turn them into problem details.
 - `v<N>/schemas.py` is the contract. ORM objects are never returned directly.
-- `utils.py` state machines and helpers do no I/O.
+- `state_machine.py` and `utils.py` do no I/O.
+- Workflow code holds sequence and compensation only. Activities are thin
+  adapters over the repos: they open a session, call one repo method, and turn
+  a 4xx `DomainError` into a non-retryable failure (`common.temporal`).
 - An entity may import another entity's repo or models in the same service; a
   service never imports another service's code. Shared code goes in `common`.
 
@@ -260,9 +265,9 @@ Each service uses the §4 template. Only the differences are listed here.
 | --- | --- | --- | --- | --- |
 | `gateway` | none | `health/`, `docs/`, `proxy/` | Owns no API contract, so no `v<N>/` folders, `alembic/`, `models.py` or repos. `docs/` serves the merged OpenAPI and Swagger UI; `proxy/` holds the route table (`routing.py`), forwarding, upstream errors and JWT checks (`auth.py`) and the catch-all route. `core/cors.py` holds CORS (later correlation, size limit, rate limit). | [0002](rfcs/0002-gateway-service.md) |
 | `identity` | Postgres | `auth/`, `users/`, `merchants/` | `auth/` has several repos (`authentication_repo.py`, `registration_repo.py`, `session_repo.py`, `token_repo.py`). `merchants/utils.py` holds the merchant transition table. | [0003](rfcs/0003-identity-service.md) |
-| `catalog` | Postgres | `products/`, `variants/`, `categories/`, `media/` | `products/` adds `state_machine.py`, `access.py` (visibility and ownership), `listing_repo.py` and `audit_repo.py`. Later adds `workflows/` (publishing on Temporal), `tasks/` (media processing on Celery) and `consumers/`. | [0004](rfcs/0004-catalog-service.md#3114-workflows-and-async-jobs) |
-| `order` | Postgres | (planned) `orders/` (orders, items, status history); `idempotency_keys` in `core/` | Adds `workflows/` (order saga). Consumes no events, so no `consumers/`; the carrier webhook is its own `webhooks/v1/`. | [0005](rfcs/0005-order-service.md#3114-workflows-and-async-jobs) |
-| `inventory` | Postgres | (planned) `stock/` (stock items, movements), `reservations/` | Adds `consumers/` and the activities the order saga calls. | [0006](rfcs/0006-inventory-service.md#3114-workflows-and-async-jobs) |
+| `catalog` | Postgres | `products/`, `variants/`, `categories/`, `media/` | `products/` adds `state_machine.py`, `access.py` (visibility and ownership), `listing_repo.py`, `audit_repo.py` and `publishing_repo.py` (accepting a publish and every write the workflow makes). `media/` adds `storage.py` (MinIO) and `processing.py` (validation, derived sizes). `workflows/` holds `ProductPublishingWorkflow`; `clients/inventory.py` serves `sync_downstream`. Later adds `tasks/` (media processing on Celery) and `consumers/`. | [0004](rfcs/0004-catalog-service.md#3114-workflows-and-async-jobs) |
+| `order` | Postgres | `orders/` (orders, items, status history); `idempotency_keys` in `core/idempotency.py` | `orders/` adds `state_machine.py` (order, payment and shipment tables), `snapshot.py`, `events.py`, `shipment_repo.py`. `providers/` holds the payment and shipping protocols and fakes; `clients/` the catalog and inventory calls; `workflows/` the order saga. Consumes no events, so no `consumers/`; the carrier webhook (Milestone 3) is its own `webhooks/v1/`. | [0005](rfcs/0005-order-service.md#3114-workflows-and-async-jobs) |
+| `inventory` | Postgres | `stock/` (stock items, movements), `reservations/` | `stock/` adds `ledger_repo.py` (the only writer of the ledger), `locking.py` (lock order, timeouts, bounded retry) and `events.py`; `reservations/` adds `state_machine.py` and the in-process `sweeper.py`. Internal routes are a second router per entity, mounted under `/internal/v1/inventory`. Later adds `consumers/`. | [0006](rfcs/0006-inventory-service.md#3114-workflows-and-async-jobs) |
 | `notification` | Postgres | (planned) `notifications/` (notifications, delivery attempts), `subscriptions/` (push) | Adds `consumers/`, `tasks/` (delivery) and `stream/` (SSE). | [0007](rfcs/0007-notification-service.md#3114-workflows-and-async-jobs) |
 | `analytics` | MongoDB | (planned) `metrics/` (counters, rollups, product and failure stats) | No `alembic/` (an idempotent init command creates the indexes). Built around `consumers/`. | [0008](rfcs/0008-analytics-service.md#3114-workflows-and-async-jobs) |
 | `assistant` | Postgres + pgvector | (planned) `chat/` (conversations, messages), `search/` (chunks, embedding cache, index state), `generations/`, `prompts/` | Also provides the `indexer-worker` entry point. Adds `consumers/` and `tasks/`. | [0009](rfcs/0009-assistant-service.md#3114-workflows-and-async-jobs) |
@@ -273,14 +278,19 @@ service's RFC §3.1.1.4.
 ## 6. workers/
 
 **(planned)** These are process hosts for platform code. They contain no domain
-logic and import their workflows and tasks from the services.
+logic and import their tasks from the services.
 
 ```
 workers/
 ├── outbox_relay/      # moves outbox rows to Kafka (platform code, no domain imports)
-├── temporal_worker/   # worker bootstrap; imports services/*/app/workflows
 └── celery_worker/     # worker bootstrap; imports services/*/app/tasks
 ```
+
+Temporal workers are not here. Each service that owns a workflow runs its own
+worker from its own image, `python -m app.workflows.worker`: `catalog-worker`
+on `catalog-publishing`, `order-worker` on `order-lifecycle` (decision
+PLT-D33). Every service's package is `app`, so one process could not import
+two of them, and one role per process is then true by construction (PLT-1).
 
 Source: [RFC 0001 §3.1.1.2–3.1.1.5](rfcs/0001-platform-and-shared-infrastructure.md#3112-outbox-relay).
 

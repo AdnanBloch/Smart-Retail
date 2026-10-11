@@ -608,7 +608,7 @@ sequenceDiagram
 
 ###### `OrderWorkflow` — the saga
 
-`OrderWorkflow(order_id, correlation_id, payment_method)` runs on the `orders` task queue with `workflow_id = order-{order_id}`. One workflow per order, not one long-running workflow per customer (archive/0002 Q3, decided): the per-order id gives free deduplication at the Temporal level behind the idempotency key.
+`OrderWorkflow(order_id, correlation_id, payment_method)` runs on the `order-lifecycle` task queue (ORD-D28) with `workflow_id = order-{order_id}`. One workflow per order, not one long-running workflow per customer (archive/0002 Q3, decided): the per-order id gives free deduplication at the Temporal level behind the idempotency key.
 
 Its input holds identifiers only (B2). `payment_method` is an opaque provider token (for the fake, a string such as `tok_ok`), never card data — there is no field anywhere that could hold a card number. It travels only in the workflow input because no column persists it (ORD-Q5). Temporal history is readable in its UI, and nothing sensitive is put in it.
 
@@ -872,7 +872,7 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | `sweep_idempotency_keys` | `celery-worker`, queue `maintenance` | Celery Beat, daily | `DELETE FROM idempotency_keys WHERE expires_at < now()` in batches; safe to run twice |
 | `resume_unstarted_orders` (ORD-9) | `celery-worker`, queue `maintenance` | Celery Beat, every minute | Finds `pending` orders with `workflow_run_id IS NULL` older than 30 s (the `(status, created_at)` index "for operational sweeps") and starts their workflow; `WorkflowAlreadyStarted` is success |
-| `OrderWorkflow` and its activities | `temporal-worker`, task queue `orders` | Per order | The saga above |
+| `OrderWorkflow` and its activities | `order-worker` (PLT-D33), task queue `order-lifecycle` | Per order | The saga above |
 
 ```mermaid
 sequenceDiagram
@@ -941,7 +941,7 @@ Twelve-factor, validated at startup by `pydantic-settings`; a missing required v
 | `IDENTITY_TOKEN_URL`, `SERVICE_CLIENT_ID`, `SERVICE_CLIENT_SECRET` | — (required in the worker) | Client-credentials grant for the service token |
 | `TEMPORAL_ADDRESS` | `temporal:7233` | |
 | `TEMPORAL_NAMESPACE` | `default` | |
-| `ORDER_TASK_QUEUE` | `orders` | |
+| `ORDER_TASK_QUEUE` | `order-lifecycle` | PLT-D13, ORD-D28 |
 | `ORDER_WORKFLOW_EXECUTION_TIMEOUT` | `24h` | |
 | `REDIS_URL` | `redis://redis:6379/0` | Optional; unset disables the fast path |
 | `IDEMPOTENCY_TTL_HOURS` | `24` | archive/0006, archive/0003 |
@@ -1368,6 +1368,12 @@ This RFC already carries ID'd decisions (A*, B*, C*, R*, S* from RFC 0000 and th
 | ORD-D25 | `origin_client_id` persisted on the order and copied into every outbox row (= C21, archive/0006 Q7) | `order.confirmed` and `order.failed` are emitted by the worker after the request has ended and would otherwise have no origin ([§3.2](#32-rationale)) | Reading the client id from request context (not available on the worker) | Not expected |
 | ORD-D26 | `order` is a producer only: seven events, no refund topic, no `processed_events` (= ORD-17, ORD-Q2) | Carrier updates are a signed HTTP call made idempotent by the state machine; refunds ride on `payment_status` so the RFC 0000 catalogue is not amended silently ([§3.1.2.4](#3124-events-consumed)) | A `payment.refunded` topic; consuming carrier events from Kafka | The RFC 0000 catalogue adds a refund topic (ORD-Q2) |
 | ORD-D27 | Entity-first layout: one `orders/` entity with `models`, `repo`, `enums`, `state_machine`, `utils` (money) and `v1/{routes,schemas}`; `idempotency_keys` in `core/` | The binding layout ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)); the idempotency mechanism is request plumbing, not an order rule (R8) ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Version-first `app/v1/<entity>/`; hybrid `app/api/v1/` split (mentor review §3) | A second entity needs idempotency, or the mechanism moves to `common` |
+| ORD-D28 | The task queue is `order-lifecycle` (RFC 0001 PLT-D13 owns the name; §3.1.1.4 and §3.1.1.6 said `orders`) (Milestone 2 implementation) | Platform owns hosting names; two names for one queue would be a defect | `orders` (contradicts the platform register) | — |
+| ORD-D29 | `orders.notified_at`, `orders.origin_client_id`, `outbox.client_id` and the `idempotency_keys(expires_at)` index are in `0001_initial` instead of revisions 0002-0004 (Milestone 2 implementation) | Nothing was deployed, and the M2 `notify` activity needs `notified_at`; one revision is easier to review than four additive ones on an empty database | Shipping 0001-0004 at once (four revisions for one release) | — |
+| ORD-D30 | ORD-1 (`awaiting_payment → refunding`) and the refund-then-reverse compensations are implemented in M2, ahead of the M4 review the phasing table lists (Milestone 2 implementation) | The M2 saga charges before it commits and ships, so a post-charge failure needs a refund path now; without the edge a refunded order would jump straight to `failed` | Defer, and leave post-charge failures uncompensated in M2 | The review rejects ORD-1 |
+| ORD-D31 | A failure after shipment creation but at the `confirmed` write compensates like a shipment failure (refund, reverse commit, `FULFILMENT_FAILED`); a failed `notify` leaves the order `confirmed` with `notified_at` null (Milestone 2 implementation) | The status write retries for five minutes, so failing it means the order cannot be confirmed; undoing the money and stock is the safe end. `notify` never changes the order's outcome | Leaving an order charged and committed but stuck `awaiting_payment` | — |
+| ORD-D32 | The request hash is computed over the validated request body (defaults filled in), not the raw bytes (refines ORD-7; Milestone 2 implementation) | Two requests that differ only in an omitted optional field are the same request; hashing the validated model makes that so, and the hash ignores key order and number formatting anyway | Raw-byte hashing (whitespace and key order would make retries look like different requests) | — |
+| ORD-D33 | An order accepted while Temporal is unreachable stays `pending` with a null `workflow_run_id` until `resume_unstarted_orders` (ORD-9) exists; M2 does not start it later (Milestone 2 implementation) | Checkout acceptance must not depend on the orchestrator (§3.1.1.5), and the resume job is phased with Celery Beat. `payment_method` is not persisted (ORD-Q5), so a resume job needs that question settled first | Returning 503 after the order is committed (the order would exist while the client believes it failed) | M3 adds Celery Beat |
 
 **Why Temporal rather than a chain of Kafka consumers.** Part A requires that an interrupted order be "resumable or cleanly reversible". With choreography, the answer to "where is order X stuck?" is "read six consumers' logs and infer", compensation is scattered across the consumers that happen to run after a failure, and step timeouts have to be hand-rolled everywhere. Temporal answers that question with a query, keeps compensation adjacent to the step it undoes, and persists workflow state so a worker crash resumes rather than loses. Kafka is the wrong tool for a saga — no built-in state, no compensation, no visibility into where a process is stuck — and Temporal is the wrong tool for broadcasting a fact, which is why the workflow's outcome leaves as events (A12).
 

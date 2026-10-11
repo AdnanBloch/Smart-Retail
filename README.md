@@ -5,46 +5,75 @@ assignment. Part A covers the commerce core (identity, catalog, orders,
 inventory, events, observability). Part B adds a GenAI layer on top
 (retrieval, a shopping assistant, merchant content generation).
 
-**Status: Milestone 1 (Foundation & Core Services)** is implemented. That
-covers the gateway, the identity and catalog services, the shared platform
-library, PostgreSQL and the local Docker Compose stack. Later milestones add
-services according to the delivery phasing in each RFC.
+**Status: Milestone 2 (Core Business Logic)** is implemented on top of
+Milestone 1. Products are published by a Temporal workflow, orders run as a
+Temporal saga with compensations, inventory reserves stock without overselling,
+and checkout is idempotent. Later milestones add services according to the
+delivery phasing in each RFC.
 
 The design is specified in [docs/rfcs/](docs/rfcs/). Read
 [RFC 0000](docs/rfcs/0000-architecture.md) first. The assignment itself is in
 [docs/](docs/README.md).
 
-## Architecture (Milestone 1)
+## Architecture (Milestone 2)
 
 ```mermaid
 flowchart LR
     client([Client]) -->|":8000"| gw[gateway]
-    gw -->|"/api/v1/auth, /users, /merchants"| idn[identity :8001]
-    gw -->|"/api/v1/categories, /products, /variants, /media"| cat[catalog :8002]
-    idn --> idb[(identity_db)]
-    cat --> cdb[(catalog_db)]
-    cat -. "JWKS (cached)" .-> idn
-    gw -. "JWKS (cached)" .-> idn
-    subgraph postgres [PostgreSQL 16 — one instance, one database + role per service]
-        idb
-        cdb
-    end
+    gw --> idn[identity :8001]
+    gw --> cat[catalog :8002]
+    gw --> ord[order :8003]
+    gw --> inv[inventory :8004]
+    ord -->|"checkout snapshot,<br/>customer's token"| cat
+    cat -->|"start ProductPublishingWorkflow"| tmp[(Temporal)]
+    ord -->|"start OrderWorkflow"| tmp
+    tmp <--> cw["catalog-worker<br/>catalog-publishing"]
+    tmp <--> ow["order-worker<br/>order-lifecycle"]
+    cw -->|"stock rows,<br/>service token"| inv
+    ow -->|"reserve, commit, release, reverse,<br/>service token"| inv
+    cw --> minio[(MinIO)]
+    cat --> minio
+    cw -. "client credentials" .-> idn
+    ow -. "client credentials" .-> idn
 ```
 
 - **gateway** is the only public entry point. It handles route matching,
   early JWT rejection with coarse role checks, `X-Request-ID`, CORS, size
   limits and upstream error normalisation, and serves the aggregated OpenAPI
-  document. It owns no data and makes no authorisation decisions.
+  document. It owns no data, makes no authorisation decisions, refuses
+  service tokens and never routes `/internal/*`.
 - **identity** owns users, roles (`customer`, `merchant`, `admin`), merchant
   profiles, Argon2id credentials, RS256 access tokens, rotating refresh tokens
-  with reuse detection, and JWKS.
-- **catalog** owns categories, products, variants, URL media and the product
-  audit trail. It enforces ownership, visibility, optimistic concurrency
-  (`version`) and the product status state machine.
+  with reuse detection, JWKS, and the client-credentials grant that gives the
+  workers short-lived `typ=service` tokens.
+- **catalog** owns categories, products, variants, media and the product
+  audit trail. **Publishing is a workflow**: `POST /products/{id}/status
+  {"status":"published"}` returns `202` and starts `ProductPublishingWorkflow`
+  (validate → process media → build search document → create stock rows →
+  mark published). The last step is the only one that makes a product public,
+  and it is one transaction; any failure returns the product to `draft` with
+  the reason in `GET /products/{id}/publish-status`.
+- **inventory** owns stock, reservations and an append-only ledger. Rows are
+  locked in a fixed order with bounded waits and retries, and a `CHECK`
+  makes oversell impossible even for a buggy writer. Expired reservations
+  are swept back into stock.
+- **order** owns orders, their payment and shipment sub-state, and the
+  idempotency keys. `POST /orders` with an `Idempotency-Key` snapshots the
+  products from catalog, persists the order and returns `202`;
+  `OrderWorkflow` then reserves stock, charges, commits, ships and confirms,
+  compensating in reverse (release, refund, reverse-commit) when a step
+  fails. Payment and shipping are deterministic fakes behind interfaces.
+- **catalog-worker / order-worker** run each service's workflow and
+  activities from the service's own image, with that service's database role.
 - **common** (`smartretail_common`) holds mechanism only: settings, JSON
   logging, RFC 9457 problem details, pagination, the async DB session,
-  `DomainEnum`/`DomainEnumText`, JWT verification and `require_roles`, and
-  health checks. It holds no domain vocabulary (rule R8, enforced by a test).
+  `DomainEnum`/`DomainEnumText`, JWT verification, `require_roles` and
+  `require_scope`, the transactional outbox writer, idempotency helpers, the
+  service-token client, Temporal helpers and health checks. It holds no domain
+  vocabulary (rule R8, enforced by a test).
+
+Every state change writes its outbox row in the same transaction. In
+Milestone 2 the rows accumulate; Milestone 3's relay publishes them to Kafka.
 
 Every service verifies tokens itself, locally, from the public key or a cached
 JWKS. Each service has its own database and role, and a role cannot connect
@@ -61,12 +90,21 @@ Requirements: Docker with Compose v2, `make`, `openssl`. Python 3.12 is
 needed only for tests and linting.
 
 ```bash
-make up        # creates .env and the RS256 key pair, builds, starts, waits until healthy
+make up        # creates .env, the RS256 key pair and the worker secret; builds, starts, waits
 make migrate   # runs each service's Alembic migrations to head
-make seed      # admin, 2 approved merchants, 2 customers, a category tree (idempotent)
+make seed      # accounts and categories; then 6 products published through the workflow,
+               # stock, and 4 orders through the saga (idempotent)
 ```
 
-Open <http://localhost:8000/docs> for the aggregated API docs.
+`make up` starts both Compose profiles, `core` and `workflow`
+(`PROFILES=--profile core make up` starts Milestone 1 alone). On an existing
+volume it creates any missing databases first, so no reset is needed.
+
+| URL | What |
+| --- | --- |
+| <http://localhost:8000/docs> | Aggregated API docs |
+| <http://localhost:8080> | Temporal UI, namespace `smartretail` (port `TEMPORAL_UI_PORT`) |
+| <http://localhost:9001> | MinIO console (`MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD`) |
 
 | Seeded account | Password (`.env`) |
 | --- | --- |
@@ -74,12 +112,25 @@ Open <http://localhost:8000/docs> for the aggregated API docs.
 | `merchant1@smartretail.local`, `merchant2@…` | `SEED_DEMO_PASSWORD` |
 | `customer1@smartretail.local`, `customer2@…` | `SEED_DEMO_PASSWORD` |
 
+Place an order as a seeded customer, for a seeded product:
+
 ```bash
 TOKEN=$(curl -s localhost:8000/api/v1/auth/login -H 'content-type: application/json' \
-  -d '{"email":"merchant1@smartretail.local","password":"change-me-demo-password"}' | jq -r .access_token)
-curl -s localhost:8000/api/v1/products -H "Authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' -d '{"sku":"TEE-1","name":"Tee","base_price":"19.00"}'
+  -d '{"email":"customer1@smartretail.local","password":"change-me-demo-password"}' | jq -r .access_token)
+PRODUCT=$(curl -s 'localhost:8000/api/v1/products?q=NW-TEE' | jq '.items[0].id' -r)
+VARIANT=$(curl -s localhost:8000/api/v1/products/$PRODUCT | jq '.variants[0].id' -r)
+curl -s localhost:8000/api/v1/orders -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: $(uuidgen)" -H 'content-type: application/json' \
+  -d '{"items":[{"product_id":"'$PRODUCT'","variant_id":"'$VARIANT'","quantity":1}],
+       "shipping_address":{"name":"Cara","line1":"1 Main St","city":"Springfield",
+                           "postal_code":"10001","country":"US"},
+       "payment_method":"tok_ok"}'
+# → 202 {order_id, order_number, status: "pending"}; poll GET /api/v1/orders/{id}
 ```
+
+`payment_method` `tok_decline`, `tok_timeout`, `tok_flaky_2` or
+`tok_refund_fail`, and postcode `00000` or `99999`, steer the saga down each
+failure path.
 
 Other targets: `make down`, `make reset` (also deletes volumes), `make logs S=catalog`, `make ps`.
 
@@ -97,12 +148,15 @@ read them. This setup is for local development only.
 python3.12 -m venv .venv && make dev-install
 make lint      # ruff (lint + format check) and mypy
 make test      # starts a throwaway Postgres on 127.0.0.1:55432, runs every package's suite
-make test-e2e  # the Milestone 1 journey through the gateway; needs `make up migrate seed`
+make test-e2e  # journeys through the gateway, incl. 50 orders for 10 units; needs `make up migrate seed`
 ```
 
 Integration tests run against real PostgreSQL. Each suite creates its own
 database and migrates it to head with Alembic. The migration tests also run
-`head → base → head` and `alembic check`.
+`head → base → head` and `alembic check`. Workflow tests run the real
+workflows and activities on Temporal's time-skipping test server (downloaded
+on first use), inject a failure at every step, and replay each history to
+check determinism.
 
 ### Repository layout
 
@@ -114,8 +168,9 @@ docker-compose.yml   Makefile   .env.example   pyproject.toml (ruff/mypy config)
 common/         smartretail_common + tests
 services/<svc>/      main.py, app/{router.py, core/, <entity>/, …}, alembic/, tests/
 ops/postgres/init/   databases, roles and grants
-scripts/keys.sh      RS256 key generation
-tests/e2e/           smoke test through the gateway
+scripts/keys.sh      RS256 key pair and the worker's client secret
+scripts/seed_demo.py demo products, stock and orders through the API
+tests/e2e/           journeys through the gateway
 ```
 
 Services are organised by entity. Each `app/<entity>/` holds its ORM model
@@ -127,7 +182,7 @@ routers and owns the `/api/v1` and entity prefixes, so every URL can be read
 there. Cross-entity infrastructure lives in `app/core/`. The ORM is never
 exposed directly. See [docs/file-structure.md](docs/file-structure.md).
 
-## API overview (Milestone 1)
+## API overview
 
 All routes are under `/api/v1` on the gateway. Errors are
 `application/problem+json` (RFC 9457). Lists are
@@ -140,14 +195,17 @@ All routes are under `/api/v1` on the gateway. Errors are
 | Merchants | `GET/PATCH /merchants/me`; `GET /merchants/{id}` (approved only, unless owner/admin); admin: `GET /merchants` |
 | Categories | `GET /categories` (`?view=tree\|flat`), `GET /categories/{id}`; admin: `POST`, `PATCH`, `DELETE` |
 | Products | `GET /products` (filters `category_id, merchant_id, q, min_price, max_price, status`; `sort`), `GET /products/me`, `GET /products/{id}`; merchant/admin: `POST /products`, `PATCH`/`DELETE /products/{id}`, `POST /products/{id}/status`, `GET /products/{id}/history` |
-| Variants & media | `POST /products/{id}/variants`, `PATCH`/`DELETE /variants/{id}`, `POST /products/{id}/media`, `DELETE /media/{id}` |
+| Publishing | merchant/admin: `POST /products/{id}/status {"status":"published"}` → `202`; `GET /products/{id}/publish-status` |
+| Variants & media | `POST /products/{id}/variants`, `PATCH`/`DELETE /variants/{id}`, `POST /products/{id}/media` (URL), `POST /products/{id}/media/upload` (multipart, ≤ 10 MiB), `DELETE /media/{id}` |
+| Orders | customer: `POST /orders` (`Idempotency-Key` required) → `202`; customer/admin: `GET /orders`, `GET /orders/{id}` (with timeline), `POST /orders/{id}/cancel`; merchant: `GET /orders/merchant` (own lines only); admin: `POST /orders/{id}/shipment/status`, `GET /orders/{id}/workflow` |
+| Inventory | public: `GET /inventory/{variant_id}`; merchant/admin: `GET /inventory`, `PUT /inventory/{variant_id}` (`If-Match`), `POST /inventory/{variant_id}/adjust` (`Idempotency-Key`), `GET /inventory/{variant_id}/movements` |
 
 Product rules:
 
-- Products start as `draft`. In Milestone 1 they can move between `draft`
-  and `inactive`, and to `archived`, which is terminal.
-- `published` returns `501` until the Temporal publishing workflow arrives
-  in Milestone 2.
+- Products start as `draft`. They move between `draft` and `inactive`, to
+  `archived` (terminal), and to `published` only through the publishing
+  workflow, via `publishing`. While a publish runs, writes to the product are
+  `409`. A change that would leave a published product incomplete is `409`.
 - Every product write must send the current `version`. The version
   increments on every change, including changes to variants and media.
 - A stale `version` returns `409`.
@@ -157,9 +215,10 @@ Product rules:
 ## Technology
 
 Python 3.12, FastAPI, SQLAlchemy 2 (async) with asyncpg, Alembic, Pydantic
-v2, PyJWT (RS256), argon2-cffi, httpx, PostgreSQL 16, Docker Compose, pytest,
-ruff and mypy. Kafka, Temporal, Celery/RabbitMQ, Redis, MongoDB, MinIO, the
-OpenTelemetry stack and pgvector join in later milestones (see
+v2, PyJWT (RS256), argon2-cffi, httpx, Temporal (Python SDK 1.9, server
+1.25), MinIO with Pillow, PostgreSQL 16, Docker Compose, pytest, ruff and
+mypy. Kafka, Celery/RabbitMQ, Redis, MongoDB, the OpenTelemetry stack and
+pgvector join in later milestones (see
 [RFC 0001](docs/rfcs/0001-platform-and-shared-infrastructure.md)).
 
 ## Milestone 1 decisions and deviations
@@ -175,11 +234,43 @@ what was chosen:
   suspend a profile.
 - **JWT leeway.** A single `JWT_LEEWAY_SECONDS` setting (default 10s)
   replaces the gateway and identity having separate values.
-- **Postgres databases.** Postgres creates only the M1 databases and roles.
-  Later milestones extend `ops/postgres/init/`.
+- **Postgres databases.** M1 created only its own databases and roles; each
+  milestone extends `ops/postgres/init/` (M2 added order, inventory and
+  Temporal's).
 - **Email addresses.** `.local` and `.test` addresses are accepted, so the
   seed accounts from RFC 0003 validate.
 - **Archived products.** Writes to an archived product return
   `409 product-archived`.
-- **Deferred to Milestone 3.** These are deliberately absent for now:
-  `/metrics`, tracing, rate limiting, the outbox and events.
+- **Deferred to Milestone 3.** `/metrics`, tracing, rate limiting and event
+  publishing. (The outbox rows themselves arrived in Milestone 2.)
+
+## Milestone 2 decisions and deviations
+
+Each is a row in the owning RFC's decision register (§3.2.1).
+
+- **One worker per owning service** (PLT-D33). `catalog-worker` and
+  `order-worker` run from their service's image instead of one shared
+  `temporal-worker`: every service's package is `app`, so one process could
+  not import two of them, and one database role per process is then true by
+  construction. This answers RFC 0001's Q-PLT-1.
+- **Publishing activities call the service layer in-process** (CAT-D27), not
+  catalog's internal routes, since the worker is catalog's own process.
+- **MinIO image** (PLT-D34). MinIO no longer publishes images; the stack uses
+  `bitnamilegacy/minio:2025.7.23`, which also creates the bucket at start.
+- **Existing volumes** (PLT-D35). `make up` re-runs the idempotent database
+  init, so an M1 volume gains the M2 databases without `make reset`.
+- **Service-client secret** (IDN-D25). Identity accepts a `sha256:` digest of
+  the 256-bit worker secret, so `make keys` can generate it with `openssl`.
+- **Order task queue** is `order-lifecycle` (ORD-D28), the platform's name.
+- **Schema brought forward**: `search_document` and `outbox.client_id` in
+  catalog (CAT-D28), `notified_at`, `origin_client_id` and the idempotency
+  expiry index in order (ORD-D29). The ORD-1 refund path is implemented now,
+  because the M2 saga needs it (ORD-D30).
+- **Inventory** keeps transitions in `state_machine.py` (INV-D26), checks a
+  reserve replay under the stock locks (INV-D27), skips the fast reject for an
+  order that already holds reservations (INV-D28), and follows the order
+  workflow's retry policies (INV-D29).
+- **Still to come, as phased**: presigned media URLs (CAT-D29), events on
+  Kafka, the Redis idempotency fast path, the HMAC carrier webhook, and
+  `resume_unstarted_orders` — until then an order accepted while Temporal is
+  down stays `pending` (ORD-D33).
