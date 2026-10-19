@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "UserRegistered",
+  "namespace": "smartretail.events.payload",
+  "doc": "RFC 0003 §3.1.2.3 (IDN-15): a new account. merchant_status is set for a merchant (always pending at registration).",
+  "fields": [
+    {"name": "user_id", "type": "string"},
+    {"name": "role", "type": "string"},
+    {"name": "full_name", "type": "string"},
+    {"name": "registered_at", "type": "string"},
+    {"name": "merchant_status", "type": ["null", "string"], "default": null}
+  ]
+}

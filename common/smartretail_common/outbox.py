@@ -3,8 +3,8 @@
 One identical ``outbox`` table in every producing service. A row is written
 with :func:`write_outbox` inside the transaction that makes the state change,
 so a rolled-back change leaves no row and no committed change lacks one.
-``outbox-relay`` (Milestone 3) is the only reader and the only writer of
-``published_at``; until it exists rows accumulate unread.
+``outbox-relay`` (``smartretail_common.events.relay``) is the only reader and
+the only writer of ``published_at``.
 
 Importing this module registers the table on the shared ``Base.metadata``,
 so only services that import it (directly or via their ``app/models.py``)
@@ -23,6 +23,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from smartretail_common.context import get_request_id
 from smartretail_common.db import Base, CreatedAt
+from smartretail_common.events.serde import validate_payload
 
 
 class OutboxEvent(CreatedAt, Base):
@@ -50,6 +51,33 @@ class OutboxEvent(CreatedAt, Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+RELAY_ROLE = "outbox_relay"
+
+# PLT-3: the relay's role reads the backlog, marks rows published and deletes
+# old published rows, and nothing else; column-level UPDATE is enough for
+# SELECT … FOR UPDATE. Granted by each producer's migration because the init
+# script runs before the table exists. Conditional, so a database without the
+# role (a test server) still migrates.
+RELAY_GRANT_SQL = """
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'outbox_relay') THEN
+    GRANT SELECT, DELETE ON outbox TO outbox_relay;
+    GRANT UPDATE (published_at) ON outbox TO outbox_relay;
+  END IF;
+END $$;
+"""
+
+RELAY_REVOKE_SQL = """
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'outbox_relay') THEN
+    REVOKE ALL ON outbox FROM outbox_relay;
+  END IF;
+END $$;
+"""
+
+
 def write_outbox(
     session: AsyncSession,
     *,
@@ -65,7 +93,15 @@ def write_outbox(
 
     The caller owns the transaction: nothing is flushed or committed here.
     ``correlation_id`` defaults to the request id of the current request.
+
+    The payload is validated against the topic's Avro schema here, at write
+    time (PLT-4): a payload the relay could not serialise fails inside the
+    business transaction, where it rolls back with the state change, instead
+    of becoming a poison row. An event type outside the catalogue is refused
+    the same way (``UnknownEvent``).
     """
+    stored = to_jsonable_python(payload)
+    validate_payload(event_type, stored)
     event_id = uuid.uuid4()
     session.add(
         OutboxEvent(
@@ -73,7 +109,7 @@ def write_outbox(
             event_type=event_type,
             aggregate_type=aggregate_type,
             aggregate_id=aggregate_id,
-            payload=to_jsonable_python(payload),
+            payload=stored,
             correlation_id=correlation_id or get_request_id(),
             causation_id=causation_id,
             client_id=client_id,

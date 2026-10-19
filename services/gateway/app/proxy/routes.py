@@ -34,7 +34,9 @@ async def proxy(request: Request, path: str) -> Response:
             settings.gateway_max_upload_bytes if rule.upload else settings.gateway_max_body_bytes
         ),
         read_timeout=(
-            settings.gateway_upload_read_timeout_s
+            settings.gateway_stream_read_timeout_s
+            if rule.stream
+            else settings.gateway_upload_read_timeout_s
             if rule.upload
             else settings.gateway_upstream_read_timeout_s
         ),

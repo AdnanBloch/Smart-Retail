@@ -44,7 +44,14 @@ def merge(
         },
         "servers": [{"url": public_url}],
         "paths": {},
-        "components": {"schemas": {}},
+        "components": {
+            "schemas": {},
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
+            },
+        },
+        # Optional bearer auth, so Swagger's Authorize button sends the token everywhere.
+        "security": [{"bearerAuth": []}, {}],
         "tags": [],
     }
     for service, document in sorted(documents.items()):
@@ -68,6 +75,7 @@ def merge(
         "get": {
             "tags": ["gateway"],
             "summary": "Liveness",
+            "security": [],
             "responses": {"200": {"description": "OK"}},
         }
     }
@@ -75,6 +83,7 @@ def merge(
         "get": {
             "tags": ["gateway"],
             "summary": "Readiness",
+            "security": [],
             "responses": {"200": {"description": "Ready"}, "503": {"description": "Not ready"}},
         }
     }

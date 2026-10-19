@@ -2,7 +2,10 @@ import pytest
 
 from app.proxy.routing import ROUTES, Policy, RouteRule, RouteTable
 
-UPSTREAMS = {n: f"http://{n}" for n in ("identity", "catalog", "order", "inventory")}
+UPSTREAMS = {
+    n: f"http://{n}"
+    for n in ("identity", "catalog", "order", "inventory", "notification", "analytics", "assistant")
+}
 TABLE = RouteTable(ROUTES, UPSTREAMS)
 
 

@@ -15,14 +15,26 @@ dependencies = [
     "asyncpg>=0.30,<0.31",
     "pyjwt[crypto]>=2.10,<2.11",
     "httpx>=0.28,<0.29",
+    # The outbox writer validates payloads against the Avro schemas (PLT-4).
+    "fastavro>=1.9,<2",
 ]
 
 [project.optional-dependencies]
 # smartretail_common.temporal: services that own or start a workflow.
 temporal = ["temporalio>=1.9,<1.10"]
+# smartretail_common.events producer/consumer/relay: the Kafka client (librdkafka).
+events = ["confluent-kafka>=2.5,<2.7"]
+# smartretail_common.celery_app: Celery over RabbitMQ.
+celery = ["celery>=5.4,<5.5"]
+# smartretail_common.redis: rate limits, pub/sub fan-out, tickets.
+redis = ["redis[hiredis]>=5.2,<6"]
 
 [tool.setuptools.packages.find]
 include = ["smartretail_common*"]
+
+# The event catalogue and its Avro schemas are data shipped with the package.
+[tool.setuptools.package-data]
+smartretail_common = ["py.typed", "events/catalogue.json", "events/schemas/*.avsc"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

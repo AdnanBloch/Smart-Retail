@@ -143,6 +143,30 @@ Domain wording follows the mapping in [RFC 0000](0000-architecture.md): *course 
 
 ### 3.1. Specification
 
+**Diagram index.**
+
+| Kind | Diagram | Section |
+| --- | --- | --- |
+| Component | Topology: API, agent, indexer-worker, celery-worker, stores, providers | [§3.1.1](#311-architectural-changes) |
+| Flow | Chunk model (chunking strategy) | [§3.1.1.2](#3112-domain-model) |
+| Flow | Search pipeline, per query | [§3.1.1.2](#3112-domain-model) |
+| Flow | Customer graph | [§3.1.1.2](#3112-domain-model) |
+| Flow | Vague-query handling | [§3.1.1.2](#3112-domain-model) |
+| Flow | Merchant generation graph | [§3.1.1.2](#3112-domain-model) |
+| Flow | Indexing logic per event | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Flow | Token budgets | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Sequence | Flow 3 — assistant query | [§3.1.1](#311-architectural-changes) |
+| Sequence | Indexing handler with the failure path | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Sequence | Reindex / backfill | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Sequence | Bulk generation | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Sequence | `POST /search/semantic` | [§3.1.2.1](#3121-endpoints) |
+| Sequence | `POST /assistant/generate` | [§3.1.2.1](#3121-endpoints) |
+| Sequence | `POST /assistant/chat` event order and failure paths | [§3.1.2.1](#3121-endpoints) |
+| State | `index_state.status` | [§3.1.1.3](#3113-state-machines) |
+| State | Generation / interaction lifecycle | [§3.1.1.3](#3113-state-machines) |
+| State | Bulk generation job | [§3.1.1.3](#3113-state-machines) |
+| Data | `assistant_db` tables | [`assistant_db`](#assistant_db) |
+
 #### 3.1.1. Architectural changes
 
 **Topology.**
@@ -157,7 +181,7 @@ flowchart TB
     client["client"] -->|"HTTP / SSE"| gateway["gateway :8000"]
     gateway -->|"SSE"| api
     catalog["catalog"] --> catOutbox["catalog outbox"] --> relay["outbox-relay"] --> kafka[("Kafka")]
-    kafka -->|"catalog.product.published<br/>catalog.product.updated<br/>catalog.product.unpublished"| indexer["indexer-worker<br/>(assistant code, §3.1.1.4, runtime RFC 0001)<br/>1 read search_document<br/>2 render → chunk<br/>3 hash → cache lookup<br/>4 embed misses (batched)<br/>5 upsert/prune + index_state"]
+    kafka -->|"catalog.product.published<br/>catalog.product.updated<br/>catalog.product.unpublished"| indexer["indexer-worker<br/>search/consumers/ (§3.1.1.4, runtime RFC 0001)<br/>1 read search_document<br/>2 render → chunk<br/>3 hash → cache lookup<br/>4 embed misses (batched)<br/>5 upsert/prune + index_state"]
     indexer --> db[("assistant_db (PostgreSQL 16 + pgvector)<br/>product_chunks · embedding_cache · index_state · query_log<br/>conversations · messages<br/>generations · token_budgets · bulk_generation_jobs · prompt_templates<br/>outbox · processed_events")]
     api --> db
     agent -->|"live hydration (read-only public APIs)"| live["catalog · inventory"]
@@ -165,7 +189,7 @@ flowchart TB
     indexer --> provider
     db -->|"outbox → outbox-relay"| kafkaOut[("Kafka: assistant.interaction")]
     kafkaOut --> analytics["analytics"]
-    celery["celery-worker<br/>queue: assistant_bulk"] -->|"bulk generation, budget reconciliation, sweeps"| db
+    celery["celery-worker<br/>search/, chat/, generations/, core/ tasks/<br/>queue: assistant_bulk"] -->|"bulk generation, budget reconciliation, sweeps"| db
 ```
 
 **Flow 3 — Assistant query** (the third critical flow in [RFC 0000](0000-architecture.md#3116-critical-flows)).
@@ -256,6 +280,8 @@ Two rejected candidates land here: **`search`** (no owned state — the index is
 
 Planned entities ([file-structure.md §5](../file-structure.md#5-per-service-differences)): `search/` (`product_chunks`, `embedding_cache`, `index_state`, `query_log`), `chat/` (`conversations`, `messages`), `generations/` (`generations`, `token_budgets`, `bulk_generation_jobs`) and `prompts/` (`prompt_templates`). `app/router.py` owns `/api/v1` and the entity prefixes: `search/v1` is mounted at `/search`; `chat/v1` and `generations/v1` are both mounted at `/assistant`, since the public URLs share that prefix. `prompts/` has no HTTP surface, so it has no `v1/`.
 
+Consumers, tasks and clients sit under the entity that alone uses them ([ARC-D27](0000-architecture.md#321-decision-register), AST-D29): the indexer handler is `search/consumers/`, the embedding provider `search/clients/`, and each Celery task lives with the table it changes (`search/tasks/`, `chat/tasks/`, `generations/tasks/`). The `catalog`, `inventory` and LLM clients are called by two or more entities, so they are `core/clients/`; the retention sweeps on `outbox` and `processed_events` touch shared tables no entity owns, so they are `core/tasks/`. There is no app-level `clients/`, `consumers/` or `tasks/`.
+
 ```
 services/assistant/
 ├── main.py                    create_application(); the service is also the indexer-worker entry point (RFC 0001)
@@ -275,7 +301,12 @@ services/assistant/
 │   │   ├── enums.py           ContentType (shared by generations/ and prompts/)
 │   │   ├── safety.py          sanitisation, injection scan, output filter (E8) — used by search/, chat/, generations/
 │   │   ├── schemas.py
-│   │   └── utils.py
+│   │   ├── utils.py
+│   │   ├── clients/           used by two or more entities, so shared here (AST-D29)
+│   │   │   ├── catalog.py     live lookups (search/, chat/) and ownership reads (generations/) (R5 / A13)
+│   │   │   ├── inventory.py   live availability lookups (search/, chat/)
+│   │   │   └── llm.py         LLMProvider protocol + real/cassette/scripted-fake (chat/, generations/) (E11)
+│   │   └── tasks/             retention sweeps on the shared outbox and processed_events tables, which no entity owns
 │   ├── health/routes.py
 │   ├── search/                product_chunks, embedding_cache, index_state, query_log
 │   │   ├── models.py
@@ -288,6 +319,11 @@ services/assistant/
 │   │   ├── enums.py           ChunkType, IndexStatus, SearchMode
 │   │   ├── utils.py           index_state transition table (AST-7), RRF arithmetic; no I/O
 │   │   ├── dependencies.py
+│   │   ├── clients/
+│   │   │   └── embeddings.py  EmbeddingProvider protocol + real/disk-cached/fake (D10); only search/ embeds
+│   │   ├── consumers/
+│   │   │   └── product_events.py  thin handler → indexing_repo.py (run by indexer-worker)
+│   │   ├── tasks/             Celery: run_reindex, anonymise_query_log, evict_embedding_cache, check_index_model
 │   │   └── v1/
 │   │       ├── routes.py      /api/v1/search/*
 │   │       └── schemas.py
@@ -303,6 +339,7 @@ services/assistant/
 │   │   │   ├── graph.py       customer graph + merchant generation graph
 │   │   │   └── streaming.py   astream_events → typed SSE events (E3, E5)
 │   │   ├── dependencies.py
+│   │   ├── tasks/             Celery: sweep_anonymous_conversations
 │   │   └── v1/
 │   │       ├── routes.py      /api/v1/assistant/chat*, /conversations*, /messages/{id}/feedback
 │   │       └── schemas.py
@@ -314,20 +351,13 @@ services/assistant/
 │   │   ├── enums.py           BulkJobStatus
 │   │   ├── utils.py           BulkJobStatus transition table; no I/O
 │   │   ├── dependencies.py
+│   │   ├── tasks/             Celery: run_bulk_generation, reconcile_token_budgets
 │   │   └── v1/
 │   │       ├── routes.py      /api/v1/assistant/generate*, /generations*, /usage*
 │   │       └── schemas.py
-│   ├── prompts/               prompt_templates (no HTTP surface, so no v1/)
-│   │   ├── models.py
-│   │   └── repo.py            active-version lookup and rendering
-│   ├── clients/
-│   │   ├── catalog.py         live lookups and ownership reads (R5 / A13)
-│   │   ├── inventory.py       live availability lookups
-│   │   ├── embeddings.py      EmbeddingProvider protocol + real/disk-cached/fake (D10)
-│   │   └── llm.py             LLMProvider protocol + real/cassette/scripted-fake (E11)
-│   ├── consumers/
-│   │   └── product_events.py  thin handler → search/indexing_repo.py
-│   └── tasks/                 Celery: bulk generation, reindex, reconciliation, sweeps
+│   └── prompts/               prompt_templates (no HTTP surface, so no v1/)
+│       ├── models.py
+│       └── repo.py            active-version lookup and rendering
 ├── eval/                      retrieval set (30 queries), answer sets (25 conv.,
 │                              8 vague, adversarial, injection)
 └── tests/                     unit/<entity>/, integration/<entity>/, test_migrations.py
@@ -522,7 +552,7 @@ flowchart TB
 
 **Cost tracking and the cached-response path.** Every LLM call records `prompt_tokens`, `completion_tokens`, `model`, and `cost_usd` (from a configured per-model price table) on its `messages` / `generations` row and accumulates into `token_budgets` and `conversations.total_tokens`. The cached-response path from Q6 (0000) is **exact-match only** (Q7 (0005)): see AST-10.
 
-**Vocabularies** ([RFC 0000 S4](0000-architecture.md#3131-schema-conventions-s1s15)), every value, each in the `enums.py` of the entity that owns it: `app/search/enums.py` (`ChunkType`, `IndexStatus`, `SearchMode`), `app/chat/enums.py` (`MessageRole`, `Intent`, `FinishReason`), `app/generations/enums.py` (`BulkJobStatus`); `ContentType`, shared by `generations/` and `prompts/`, is in `app/core/enums.py`:
+**Vocabularies** ([RFC 0000 S4](0000-architecture.md#3131-schema-conventions-s1s15)), every value, each in the `enums.py` of the entity that owns it: `app/v1/search/enums.py` (`ChunkType`, `IndexStatus`, `SearchMode`), `app/v1/chat/enums.py` (`MessageRole`, `Intent`, `FinishReason`), `app/v1/generations/enums.py` (`BulkJobStatus`); `ContentType`, shared by `generations/` and `prompts/`, is in `app/core/enums.py`:
 
 | Enum | Values | Column(s) | Read policy |
 | --- | --- | --- | --- |
@@ -539,7 +569,7 @@ flowchart TB
 
 ##### 3.1.1.3. State machines
 
-Three machines. Each persisted machine is enforced by an explicit transition table in its entity's `utils.py` (`app/search/utils.py`, `app/generations/utils.py`), applied by that entity's repo (S4); the column is `text`, and the type decorator is a backstop, not the gate. The sources fix the *values* of `IndexStatus` and the *transitions* of `BulkJobStatus`; the `index_state` transition table and the generation lifecycle below are **AST-7**, derived from the indexing pipeline and the SSE contract.
+Three machines. Each persisted machine is enforced by an explicit transition table in its entity's `utils.py` (`app/v1/search/utils.py`, `app/v1/generations/utils.py`), applied by that entity's repo (S4); the column is `text`, and the type decorator is a backstop, not the gate. The sources fix the *values* of `IndexStatus` and the *transitions* of `BulkJobStatus`; the `index_state` transition table and the generation lifecycle below are **AST-7**, derived from the indexing pipeline and the SSE contract.
 
 **1. `index_state.status` (`IndexStatus`)** — per product. `(new)` means no row exists.
 
@@ -731,7 +761,7 @@ sequenceDiagram
 
 `make reindex` runs the same task as a one-shot command, without the HTTP step.
 
-**Celery tasks** (hosted by `celery-worker`, [RFC 0001](0001-platform-and-shared-infrastructure.md)). Bulk generation has its own queue so a 200-product job cannot starve interactive chat. Task and queue names are **AST-11**.
+**Celery tasks** (hosted by `celery-worker`, [RFC 0001](0001-platform-and-shared-infrastructure.md)). Bulk generation has its own queue so a 200-product job cannot starve interactive chat. Task and queue names are **AST-11**. Each task body lives with the table it changes (AST-D29): `search/tasks/` (reindex, query-log anonymisation, cache eviction, model check), `chat/tasks/` (anonymous-conversation sweep), `generations/tasks/` (bulk generation, budget reconciliation), and `core/tasks/` for the two sweeps on the shared `outbox` and `processed_events` tables. The names below are set explicitly, so the module a task lives in is not part of its name.
 
 | Task | Queue | Schedule / trigger | Effect |
 | --- | --- | --- | --- |
@@ -1649,7 +1679,7 @@ Ordered so retrieval quality is measurable before it is optimised (the evaluatio
 
 #### 3.2.1. Decision register
 
-This RFC already carries ID'd decisions (D1–D12, E1–E14, AST-1–AST-18). They keep their IDs; the register gives one row per significant design decision, and the Decision cell names the existing IDs it covers (“= D1”). Register IDs are `AST-Dn`, distinct from the consolidation decisions `AST-n` in [§3.2.2](#322-consolidation-decisions-and-rationale).
+This RFC already carries ID'd decisions (D1–D12, E1–E14, AST-1–AST-18). They keep their IDs; the register gives one row per significant design decision, and the Decision cell names the existing IDs it covers (“= D1”). Register IDs are `AST-Dn`, distinct from the consolidation decisions `AST-n` in [§3.2.2](#322-consolidation-decisions-and-rationale). The register itself was added after [mentor review 2026-10-06 §2](../reviews/mentor-reviews.md#2-a-reason-for-every-decision); rows a review changed say so at the end of *Why* ([ARC-D36](0000-architecture.md#321-decision-register)).
 
 | ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
 | --- | --- | --- | --- | --- |
@@ -1680,7 +1710,21 @@ This RFC already carries ID'd decisions (D1–D12, E1–E14, AST-1–AST-18). Th
 | AST-D25 | Every interaction emits `assistant.interaction` through the outbox; `analytics` computes the Part B metrics (= E13, AST-6) | Reuses the existing analytics pipeline rather than building a second one. The event is written in the same transaction as the row ([§3.1.2.3](#3123-events-produced)) | Metrics computed inside `assistant` | — |
 | AST-D26 | Prompts are versioned rows in `prompt_templates`, seeded from `ops/prompts/`, with one active row per `(content_type, name)` enforced by a constraint (AST-16) | A prompt change alters behaviour like code and must be attributable to a version and reviewable in a diff | Prompts hard-coded in the service | Q4 (0006) resolves how the version is recorded per message |
 | AST-D27 | Anonymous chat is allowed: session-scoped by `session_id`, 24-hour TTL, stricter rate limits (Q5 (0005), AST-13) | A shopping assistant that requires login is not used | Login-gated chat. Persistent anonymous profiles | Abuse exceeds what rate limits and IP budgets contain |
-| AST-D28 | Entity-first module layout: `search/`, `chat/`, `generations/`, `prompts/`, each HTTP contract in `<entity>/v1/` ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Binding platform layout. A table has one shape, so only the HTTP contract is versioned ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)) | Version-first `app/v1/<entity>/`. Split `app/<entity>/` + `app/api/v1/` (see RFC 0000) | A v2 contract needs to change a table shape |
+| AST-D28 | Entity-first module layout: `search/`, `chat/`, `generations/`, `prompts/`, each HTTP contract in `<entity>/v1/` ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Binding platform layout. A table has one shape, so only the HTTP contract is versioned ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)). *Changed after [mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) — previously layer-first: `app/api/v1/` handlers per route group, `services/` (retrieval, agent, llm, prompts, budgets, safety, clients), `models/`, `schemas/`, `domain/enums.py`.* | Version-first `app/v1/<entity>/`. Split `app/<entity>/` + `app/api/v1/` (see RFC 0000) | A v2 contract needs to change a table shape |
+| AST-D29 | Under [ARC-D27](0000-architecture.md#321-decision-register), consumers, tasks and clients live under the entity that alone uses them: `search/consumers/` (indexer), `search/clients/embeddings.py`, and `tasks/` split across `search/`, `chat/` and `generations/` by the table each task changes. The `catalog`, `inventory` and LLM clients are `core/clients/` because two or more entities call them; the `outbox` and `processed_events` sweeps are `core/tasks/` because those tables belong to no entity | One folder answers what an entity does and what it calls, and the shared remainder is shared by fact (search, chat and generations all hydrate or generate), not forecast ([§3.1.1.1](#3111-responsibility-and-boundaries), [§3.1.1.4](#3114-workflows-and-async-jobs)). *Changed after [mentor review 2026-10-12 §2](../reviews/mentor-reviews.md#2-every-file-in-its-entity-folder) — previously app-level `clients/`, `consumers/` and `tasks/`.* | App-level `clients/`, `consumers/`, `tasks/` (a second, layer-first tree beside the entities, which ARC-D23 rejected); every client under `search/` (chat and generations would import another entity's internals); one copy of each client per entity (three copies of the same HTTP client) | `chat/` starts embedding directly (the embedding client moves to `core/clients/`), or a shared client gets a single user (it moves into that entity) |
+| AST-D30 | **(Milestone 3 implementation)** The LLM provider is Claude through the official `anthropic` SDK (`AsyncAnthropic`): `claude-sonnet-5-5` answers and generates, `claude-haiku-5-5` classifies (`LLM_MODEL`, `LLM_CLASSIFIER_MODEL`). Requests use only `model`, `max_tokens`, `system`, `messages`; `messages.stream` for SSE, `messages.create` otherwise. `stop_reason` maps `end_turn`/`stop_sequence` → `stop`, `max_tokens` → `length`, `refusal` → `refused`. `LLM_MAX_TOKENS` defaults to 4096 and the classifier bound to 1024, because both models think adaptively by default and thinking counts against `max_tokens`. The classifier's JSON is validated and falls back to deterministic rules on any parse or provider failure; `Intent` gains `smalltalk` (passthrough, S4) so a greeting skips retrieval. Closes Q1 (0005) | A mid-tier model bounds cost per answer and a small model keeps the per-message classification call cheap (§3.3). Minimal parameters keep the provider swap (E11) to one class, and the rule fallback means routing never fails on the provider. A 1024-token bound with adaptive thinking would truncate answers mid-sentence. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | OpenAI (`openai` SDK): the account in hand is Anthropic. LangChain provider adapters: a second abstraction over the SDK for two calls. Extended-thinking and fallback parameters: not needed for grounded short answers, and they tie the code to newer API surface | Answer quality or cost per interaction disappoints against the answer evaluation (AST-D40), or a model is retired |
+| AST-D31 | **(Milestone 3 implementation)** Embeddings: `voyage-3.5` over HTTP (`input_type` document/query, 1024 dims) as the real provider, and `hashing-v1` — deterministic hashed word, bigram and character-trigram features in 1024 dims, L2-normalised — as the default for local runs and CI. The vector columns are `vector(1024)`. Supersedes the `text-embedding-3-small` / 1536 choice of AST-D8 (Q1 (0004)); HNSW parameters unchanged. Startup refuses `EMBEDDING_PROVIDER=voyage` without `VOYAGE_API_KEY` and any `EMBEDDING_DIMENSION` other than 1024 | Anthropic has no embeddings endpoint, and Voyage is the provider Anthropic recommends; 1024 is its native size and halves storage against 1536. A deterministic local embedding keeps the whole pipeline real (pgvector, HNSW, RRF, cache) with no key, and texts sharing vocabulary score higher, so tests can assert ranking. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | OpenAI embeddings: a second vendor account. Local sentence-transformers: ~400 MB image and CPU latency (Q3 (0004)). A random fake: no ranking can be asserted | Retrieval quality is measured (AST-D40) and another model scores better, or a dimension change is worth a migration and a reindex |
+| AST-D32 | **(Milestone 3 implementation)** The only non-real implementations are deterministic doubles: `ScriptedProvider` (templated answers from structured hints, cites `[product:<id>]`, streams word by word, approximate token counts, cost 0, failure and delay injection) and `hashing-v1`. The cassette LLM provider and the disk-cached embedding provider of D10 / E11 are **deferred** | Every graph branch, the mid-stream and pre-token failure paths and client disconnect are reachable on demand without a key, which is what the test plan needs. Cassettes need recorded real traffic, which needs the key and the evaluation sets first. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Record cassettes now: no key in CI, and recordings would pin prompts that are still changing | The answer evaluation (AST-D40) needs replayable real responses |
+| AST-D33 | **(Milestone 3 implementation)** Token counts for chunk sizing, context bounds and the scripted provider are **approximate** (one per word or punctuation mark, plus one per four characters beyond eight). `tiktoken` is **deferred**; billed usage always comes from the provider's reported counts | `tiktoken` tokenises for OpenAI models, not for Claude or Voyage, so it would be precise about the wrong tokenizer. Within ~20% is enough for 256/512-token windows and a 6000-token context bound. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | `tiktoken`: wrong tokenizer, extra dependency. Anthropic `count_tokens`: a network call per chunk | Chunk sizes or context bounds are found to overshoot provider limits |
+| AST-D34 | **(Milestone 3 implementation)** Token budgets are **Postgres only**: a pre-stream check per scope (`user:<uuid>` or `ip:<sha256>`, plus `global`) and one atomic `INSERT … ON CONFLICT DO UPDATE` charge per scope in the transaction that writes the message or generation. The Redis fast path and the `reconcile_token_budgets` task of AST-D21 / AST-9 are **deferred** | One store, one transaction: the charge commits or rolls back with the message and the outbox row, and nothing needs reconciling. At this traffic two indexed point reads per request are cheap. Check-then-charge can overshoot by one request, which the aggregate invariant already allows. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Redis counters + Beat reconciliation: two stores to keep consistent for no measured need | Budget reads show up in request latency, or traffic grows by an order of magnitude |
+| AST-D35 | **(Milestone 3 implementation)** The exact-match response cache (AST-10, AST-D22, `RESPONSE_CACHE_TTL_S`) is **deferred** | Budgets already bound cost; the cache only saves repeated first-turn questions, and correctness (live re-hydration, prompt-version keys) needs the prompt-version column that Q4 (0006) leaves open. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Ship the cache now: a correctness surface with no measured saving | Logged first-turn questions show material repetition |
+| AST-D36 | **(Milestone 3 implementation)** Backfill and reindex: products published before the indexer existed are backfilled by the indexer itself — a **new consumer group reads the compacted `catalog.product.published` topic from the earliest offset** (`auto.offset.reset=earliest`). Every indexed payload is kept as `index_state.source_document`, and `python -m app.search.reindex` / the `run_reindex` task rebuild chunks from it (scoped by product or merchant), one transaction per product with a cursor; a full run holds a Postgres advisory lock, so a second is `409`. `index_state` also gains `merchant_id` (the merchant view of `/search/index/{id}`). Hydration's catalog `404` marks a product `removed` (fail closed). The paged catalog listing of AST-4 / AST-Q1 is **deferred** | No catalog API change is needed (R1 holds), the compacted topic already holds the latest state of every published product, and a reindex after a chunking or model change costs zero embedding calls for unchanged text (D6). *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | A catalog listing endpoint now: an RFC 0004 change for a path the topic already covers. Reading `catalog_db`: violates R1 | The topic's retention or compaction stops guaranteeing every published product |
+| AST-D37 | **(Milestone 3 implementation)** Bulk generation and reindex run on assistant's own Celery worker (`assistant-celery`, Beat embedded) on the durable queue **`assistant.bulk`**, following the per-service `<service>.<queue>` convention (PLT-D36) instead of `assistant_bulk` on a shared worker. Tasks: `generate_bulk_content`, `run_reindex`, plus Beat `sweep_processed_events` (daily), `sweep_anonymous_conversations` (hourly, 24 h) and `anonymise_query_log` (daily, 90 days). `bulk_generation_jobs` gains `idempotency_key`, `request_hash`, `inputs` (a snapshot of the parameters and each product's facts at submission, so the worker needs no merchant token) and `item_errors`; unique `(merchant_id, idempotency_key)` is the durable claim (closes AST-Q4), and `generations` has a partial unique `(bulk_job_id, product_id)` so a redelivered task never generates an item twice | Every service's package is `app`, so one worker cannot import two services' tasks; a separate worker also confines the provider keys (PLT-12). A database-unique claim survives Redis loss. The snapshot means ownership is checked once, at submission, with the merchant's own token. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Shared `celery-worker` with an `assistant_bulk` queue: cannot import two `app` packages. Ownership re-check per item in the worker: needs a merchant token the worker does not have | A bulk job must reflect product edits made after submission |
+| AST-D38 | **(Milestone 3 implementation)** Streaming: the customer graph is a compiled LangGraph `StateGraph` (guard → load_memory → classify → retrieve / compare / resolve_follow_up → hydrate → assemble_context, or clarify / smalltalk / refuse) that **plans** the turn and ends with an `LLMRequest` or a templated answer; generation streams **outside** the graph straight from the provider. A producer task feeds a queue that the SSE response drains: `status`, `sources` (always, before the first token), `token`…, `usage`, `done`; a `: keepalive` comment every 5 s of silence; disconnect detection cancels the producer, which cancels the provider stream and persists the partial answer (`finish_reason: error`). Plain `StreamingResponse`, no `sse-starlette`. Amends E3 (no `astream_events`) | Cancelling a provider stream directly is deterministic; cancelling it through graph event streaming is not something the framework guarantees. Nodes stay pure functions of state (E2) and every branch is testable without streaming. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Generation as a graph node with `astream_events`: cancellation and the persist-on-disconnect path pass through framework internals. `sse-starlette`: one more dependency for framing that is ten lines | A tool-calling step makes generation multi-turn inside the graph |
+| AST-D39 | **(Milestone 3 implementation)** Conversation memory is the **last `MEMORY_WINDOW_TURNS` (6) turns verbatim** plus the current retrieval; the rolling summary of E9 / AST-D20 is **deferred** (`conversations.summary` stays null) | A summary needs an extra model call every six turns and its quality is unmeasured without the conversation set; context assembly already drops the oldest turns first when over budget. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Summarise now: cost and an untested prompt | The conversation set (AST-D40) shows answers losing early context |
+| AST-D40 | **(Milestone 3 implementation)** The retrieval set (`make evaluate`) and the answer sets (`make evaluate-answers`) of D11 / E14 / AST-D13 are **deferred** | They need the seed corpus and real models to mean anything; the hashing embedding and scripted provider cannot be tuned against. Unit and integration tests cover behaviour, not quality. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Write the sets against the doubles: numbers that measure nothing | Real provider keys are in use, before any tuning |
+| AST-D41 | **(Milestone 3 implementation)** The Prometheus series of AST-14 (§3.1.1.7) are **deferred**; structured logs carry the same facts (outcome, chunks, cache hits, embedded count, finish reason, latency, TTFT), and `/search/index/status` reports counts by status, pending lag, last error and cache hits | The platform's metrics stack is not in Milestone 3; the facts are already recorded per row (`query_log`, `messages`, `generations`) and in logs. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Hand-rolled counters without the collector: nothing scrapes them | The observability milestone lands |
+| AST-D42 | **(Milestone 3 implementation)** Rate limits (20 searches/min per IP, 10 / 3 messages/min, 20 generations/hour) are **deferred to `gateway`**; inside `assistant` the controls are the token budgets, the input guard, the message-length bound and the concurrent-stream cap (`503` + `Retry-After`) | Rate limiting is an edge concern owned by RFC 0002; budgets bound cost, which is the risk this service owns. *Added by the Milestone 3 implementation, [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13).* | Per-instance in-memory limiters: wrong under more than one replica | Abuse is observed before the gateway limits ship |
 
 #### 3.2.2. Consolidation decisions and rationale
 
@@ -2193,12 +2237,25 @@ Layers per [RFC 0000](0000-architecture.md): unit (no I/O), integration (real Po
   | Streaming | p95 time-to-first-token | | |
 
 - **Definition of done.** Goals G1–G10 (0004) and G1–G11 (0005) verified by their stated checks; `make up-all && make migrate && make seed && make reindex && make test && make evaluate && make evaluate-answers` green from a clean clone; both records above filled in; README AI section, prompt inventory, and cost model written; this RFC moved to **DONE** with review outcomes folded in.
+- **Amendment log.**
+
+  | Date | Section | Change | Reason |
+  | --- | --- | --- | --- |
+  | Oct 6, 2026 | All | `libs/common` renamed `common/` in every reference | [Mentor review 2026-10-06 §1](../reviews/mentor-reviews.md#1-shared-package-folder) |
+  | Oct 11, 2026 | §3.2.1 | Added the decision register (AST-D1–AST-D28); D1–D12, E1–E14 and AST-1–AST-18 kept and referenced | [Mentor review 2026-10-06 §2](../reviews/mentor-reviews.md#2-a-reason-for-every-decision) |
+  | Oct 11, 2026 | §3.1.1, §3.1.1.2, §3.1.1.3, §3.1.1.4, §3.1.2.1, §3.1.3 | Converted the ASCII topology, Flow 3, chunk model, search pipeline, both graphs, indexing logic and token-budget flow to Mermaid; added the vague-query flow, the three state machines, the indexing, reindex, bulk-generation and endpoint sequences, and the `erDiagram` | [Mentor review 2026-10-06 §4](../reviews/mentor-reviews.md#4-diagrams) |
+  | Oct 11, 2026 | §3.1.1.1, §3.1.1.3, §3.1.3 | Layer-first layout (`api/v1/`, `services/`, `models/`, `schemas/`, `domain/`) replaced by entity-first `search/`, `chat/`, `generations/`, `prompts/` with `<entity>/v1/` (AST-D28) | [Mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) |
+  | Oct 12, 2026 | §3.1.1, §3.1.1.1, §3.1.1.4, §3.2.1 | AST-D29: the indexer consumer and embedding client moved under `search/`; tasks split across `search/`, `chat/`, `generations/`; shared clients and shared-table sweeps in `core/` | [Mentor review 2026-10-12 §2](../reviews/mentor-reviews.md#2-every-file-in-its-entity-folder) |
+  | Oct 12, 2026 | §3.1, §3.2.1, §11 | Added the diagram index; review-changed register rows marked with the review and the previous decision; this log | [Mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review), [§4](../reviews/mentor-reviews.md#4-diagram-coverage-per-service) |
+  | Oct 15, 2026 | §3.2.1 | Added AST-D30–AST-D42: Claude models and token bounds, voyage-3.5 / hashing-v1 embeddings with `vector(1024)` (supersedes AST-D8's model and dimension), scripted double only, approximate token counting, Postgres-only budgets, response cache deferred, topic backfill and source-document reindex, `assistant.bulk` on `assistant-celery` with durable idempotency, streaming outside the graph, memory window only, evaluation sets, metrics and edge rate limits deferred | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
+  | Oct 15, 2026 | §3.1.1.2, §3.1.3 | As built: `Intent` gains `smalltalk`; `index_state` gains `merchant_id` and `source_document`; `query_log` gains `degraded`; `generations` gains `finish_reason` and a partial unique `(bulk_job_id, product_id)`; `bulk_generation_jobs` gains `idempotency_key`, `request_hash`, `inputs`, `item_errors`, `updated_at` and unique `(merchant_id, idempotency_key)`; vector columns are `vector(1024)`; migration 0004 also creates `outbox` with the relay grant | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
+  | Oct 15, 2026 | §3.1.1.4, §3.1.1.6 | As built: Celery queue `assistant.bulk` (was `assistant_bulk`); `EMBEDDING_PROVIDER` `hashing` \| `voyage`, `LLM_PROVIDER` `scripted` \| `anthropic`, `LLM_MAX_TOKENS` 4096; `reconcile_token_budgets`, `evict_embedding_cache` and the HNSW drop/rebuild around a large backfill deferred | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
 
 ---
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against the numbered decisions (the register rows AST-D1–AST-D28 in §3.2.1, and D1–D12, E1–E14, AST-1–AST-18), the open questions in §3.3.1, the chunking strategy and graph design in §3.1.1.2, the `‡`/`†` schema cells in §3.1.3, or the rejected alternatives in §5, so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against the numbered decisions (the register rows AST-D1–AST-D42 in §3.2.1, and D1–D12, E1–E14, AST-1–AST-18), the open questions in §3.3.1, the chunking strategy and graph design in §3.1.1.2, the `‡`/`†` schema cells in §3.1.3, or the rejected alternatives in §5, so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

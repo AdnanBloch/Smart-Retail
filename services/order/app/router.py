@@ -6,7 +6,7 @@ prefix, so the full path of any endpoint can be read here.
 
 from fastapi import APIRouter
 
-from app.orders.v1 import routes as orders_v1
+from app.v1.orders import routes as orders_v1
 
 router = APIRouter()
 

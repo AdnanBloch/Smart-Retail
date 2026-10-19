@@ -8,10 +8,10 @@ means adding ``<entity>/v2/`` and one ``include_router`` line below.
 
 from fastapi import APIRouter
 
-from app.categories.v1 import routes as categories_v1
-from app.media.v1 import routes as media_v1
-from app.products.v1 import routes as products_v1
-from app.variants.v1 import routes as variants_v1
+from app.v1.categories import routes as categories_v1
+from app.v1.media import routes as media_v1
+from app.v1.products import routes as products_v1
+from app.v1.variants import routes as variants_v1
 
 router = APIRouter()
 

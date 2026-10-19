@@ -17,6 +17,9 @@ ALLOW_LIST: dict[str, str] = {
     "expired": "auth.py: the InvalidToken detail for an expired JWT, not ReservationStatus",
     "ready": "health.py: the readiness endpoint's status, not MediaProcessingStatus",
     "failed": "health.py: a readiness check's result, not an order, payment or media status",
+    # Generic words the assistant's enums (M3) happen to share.
+    "error": "the structured-log field name for an exception, not assistant's FinishReason",
+    "user": "auth.py: the JWT token type (user vs service, M1), not assistant's MessageRole",
 }
 
 

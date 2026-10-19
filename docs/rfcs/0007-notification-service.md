@@ -109,21 +109,40 @@ Recording a notification is not delivering one, and the design turns on one cons
 
 ### 3.1. Specification
 
+**Diagram index.**
+
+| Kind | Diagram | Section |
+| --- | --- | --- |
+| Component | Service components: consumer, routers, stream, worker, stores | [§3.1.1](#311-architectural-changes) |
+| Flow | Consumer decision flow per event | [The consumer](#the-consumer) |
+| Flow | Choosing the replay floor | [The SSE stream](#the-sse-stream) |
+| Flow | Per-connection frame filter | [The SSE stream](#the-sse-stream) |
+| Sequence | Consume to frame, across replicas | [The consumer](#the-consumer) |
+| Sequence | Stream ticket, open and catch-up | [The SSE stream](#the-sse-stream) |
+| Sequence | `origin_first` promotion sweep | [The SSE stream](#the-sse-stream) |
+| Sequence | Dispatch with its two triggers | [Celery tasks](#celery-tasks) |
+| Sequence | Batched ack | [`POST /notifications/ack`](#post-notificationsack) |
+| State | Notification lifecycle (concurrent facts) | [§3.1.1.3](#3113-state-machines) |
+| State | Delivery attempt | [§3.1.1.3](#3113-state-machines) |
+| State | Stream cursor | [§3.1.1.3](#3113-state-machines) |
+| State | Stream connection | [§3.1.1.3](#3113-state-machines) |
+| Data | `notification_db` tables | [`notification_db`](#notification_db) |
+
 #### 3.1.1. Architectural changes
 
 ```mermaid
 flowchart TB
     kafka[["Kafka smartretail.order, payment, shipment, inventory, identity topics<br/>consumer group notification, keyed by aggregate_id"]]
     subgraph svc["notification (:8005, N replicas)"]
-        consumer["consumers/<br/>dedupe (processed_events), resolve recipient,<br/>derive type, channels, scope, render template,<br/>INSERT notifications (at-most-one), COMMIT"]
-        api["notifications/v1/routes.py<br/>list, read, read-all, unread-count, ack, admin"]
-        streamapi["stream/v1/routes.py<br/>stream-ticket, stream"]
+        consumer["notifications/consumers/<br/>dedupe (processed_events), resolve recipient,<br/>derive type, channels, scope, render template,<br/>INSERT notifications (at-most-one), COMMIT"]
+        api["v1/notifications/routes.py<br/>list, read, read-all, unread-count, ack, admin"]
+        streamapi["v1/stream/routes.py<br/>stream-ticket, stream"]
         stream["stream/<br/>ticket redeem, cursor or cold start,<br/>bounded catch-up, SUBSCRIBE, frames"]
     end
     db[("notification_db (PG 16)<br/>notifications, delivery_attempts,<br/>push_subscriptions, stream_cursors,<br/>processed_events")]
     redis[("Redis<br/>nt:user pub/sub, nt:ticket, nt:conns,<br/>nt:client presence, rl:*")]
     rabbit[["RabbitMQ queues notifications and maintenance"]]
-    worker["celery-worker + Beat<br/>dispatch_notification, promote_undelivered_notifications,<br/>sweep_stale_stream_cursors, redispatch_undispatched_notifications"]
+    worker["celery-worker + Beat<br/>notifications/tasks/, stream/tasks/<br/>dispatch_notification, promote_undelivered_notifications,<br/>sweep_stale_stream_cursors, redispatch_undispatched_notifications"]
     gateway["gateway (:8000)<br/>no buffering on text/event-stream"]
     client["client (EventSource)"]
 
@@ -169,7 +188,7 @@ flowchart TB
 - **NTF-5 — Dispatch retry policy.** `dispatch_notification` retries up to 5 times with exponential backoff (2 s base, ×2, capped at 300 s, full jitter), `acks_late=True`, and records one `delivery_attempts` row per attempt.
 - **NTF-6 — An orphan sweep backs up the post-commit enqueue.** A crash (or a RabbitMQ outage) between the consumer's commit and its enqueue would otherwise leave a dispatched-channel row with no attempt, forever. `redispatch_undispatched_notifications` (Beat, every 5 minutes) re-enqueues such rows; the task is idempotent, so a double enqueue is harmless.
 - **NTF-7 — `payment.*` and non-customer-visible shipment transitions are consumed but produce no notification.** The event catalogue lists `notification` as a consumer of `payment.succeeded` / `payment.failed`, but `NotificationType` has no payment value: the customer-visible outcome of a payment is `order.confirmed` or `order.failed`, emitted by the same workflow, and notifying both would be the duplicate the service exists to prevent. Likewise `shipment.status_changed` to `created` produces nothing; `shipped`, `in_transit` and `delivered` produce `shipment_update`. The events are still recorded in `processed_events`, so replay is uniform.
-- **NTF-8 — Minimum payload fields are a contract `notification` places on producers** (§3.1.2.4). No archived RFC fixes event payloads; the fields `notification` renders from are listed so producers design against them.
+- **NTF-8 — Minimum payload fields are a contract `notification` places on producers** (§3.1.2.4). No archived RFC fixes event payloads; the fields `notification` renders from are listed so producers design against them. *Aligned to the registered Avro schemas on Oct 15, 2026 (NTF-D33).*
 - **NTF-9 — An `origin_first` notification whose origin device is not present at consume time is widened immediately.** The consumer checks `nt:client:{user_id}:{origin_client_id}` before insert; absent, the row is inserted with `promoted_at = now()` and published as `all_devices`. This is the reading of the "C20 retreat" (§3.1.3): the presence key exists precisely so the common case of an offline origin does not wait out the 45-second grace.
 - **NTF-10 — The stream subscribes before it catches up.** The archive's ordering (catch-up, then `SUBSCRIBE`) has a window in which a notification committed between the catch-up query and the subscription is neither replayed nor received live. The handler `SUBSCRIBE`s first, buffers live messages into the connection queue while the catch-up runs, then drains the buffer, skipping any `id` already sent. The client already de-duplicates by `id` (the visibility trap), so this adds no new client obligation.
 - **NTF-11 — `unread_count` travels in the Pub/Sub message.** The consumer computes the recipient's in-app unread count once, after commit, and includes it in the message, so a delivering replica emits the `unread_count` frame without a query per connection. Mark-read and read-all publish a bare `{kind: "unread_count"}` message on the same channel, so every device's badge moves when one device reads.
@@ -191,8 +210,8 @@ flowchart TB
 | Per-`(user, device)` SSE replay floor | `stream_cursors` |
 | Consumer dedupe | `processed_events` |
 | Stream tickets, per-user connection counts, presence hints, the per-user fan-out channel | Redis `nt:*` (§3.1.3) |
-| Templates for the six `NotificationType`s | code, `app/notifications/templates/` |
-| The SSE stream contract and frame vocabulary | code, `app/stream/` (`app/stream/v1/` for the HTTP contract) |
+| Templates for the six `NotificationType`s | code, `app/v1/notifications/templates/` |
+| The SSE stream contract and frame vocabulary | code, `app/v1/stream/` (`app/v1/stream/` for the HTTP contract) |
 
 **Does not own.**
 
@@ -233,7 +252,7 @@ Since the ownership test was applied, the service has also acquired the per-devi
 | S4 | Four `DomainEnum` vocabularies (§3.1.1.2) |
 | S8 | `payload jsonb` holds the source envelope — never filtered except by the NTF-1 expression index, which is a uniqueness guard, not a query path |
 
-**Module layout** ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service); entity-first per [file-structure §4–§5](../file-structure.md#4-service-layout-every-service)). The entities are `notifications/` (`notifications`, `delivery_attempts`), `subscriptions/` (`push_subscriptions`) and `stream/` (`stream_cursors` and the SSE machinery); `consumers/` and `tasks/` are the service's additions to the template.
+**Module layout** ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service); entity-first per [file-structure §4–§5](../file-structure.md#4-service-layout-every-service)). The entities are `notifications/` (`notifications`, `delivery_attempts`), `subscriptions/` (`push_subscriptions`) and `stream/` (`stream_cursors` and the SSE machinery). The Kafka consumer and the Celery tasks live under the entity whose rows they write ([ARC-D27](0000-architecture.md#321-decision-register), NTF-D25): `notifications/consumers/`, `notifications/tasks/` (dispatch, promotion, redispatch) and `stream/tasks/` (the cursor sweep). There is no app-level `consumers/` or `tasks/`.
 
 ```
 services/notification/
@@ -258,6 +277,8 @@ services/notification/
 │   │   ├── enums.py              NotificationType, NotificationChannel, DeliveryStatus, NotificationDeliveryScope
 │   │   ├── utils.py              scope derivation, channel table, DeliveryStatus transition table; no I/O
 │   │   ├── templates/            one module per NotificationType
+│   │   ├── consumers/            thin handlers per topic → recording_repo.py
+│   │   ├── tasks/                Celery task bodies (hosted by celery-worker): dispatch, promote, redispatch → *_repo.py
 │   │   ├── adapters/
 │   │   │   ├── base.py           NotificationAdapter protocol
 │   │   │   ├── email_log.py      logging email adapter
@@ -269,20 +290,19 @@ services/notification/
 │   ├── subscriptions/
 │   │   ├── models.py             PushSubscription (specified, unused)
 │   │   └── repo.py               PushSubscriptionRepo, read by adapters/web_push.py; no v1/ until an endpoint exists
-│   ├── stream/
-│   │   ├── models.py             StreamCursor
-│   │   ├── cursor_repo.py        cold start, greatest() upsert with clamp, last_seen_at
-│   │   ├── tickets.py            mint / redeem (GETDEL)
-│   │   ├── catchup.py            floor, bounded query, truncation
-│   │   ├── fanout.py             PUBLISH / SUBSCRIBE, message schema
-│   │   ├── connection.py         per-connection queue, heartbeat, presence, cap
-│   │   ├── frames.py             typed frame serialisers
-│   │   ├── utils.py              per-connection frame filter; no I/O
-│   │   └── v1/
-│   │       ├── routes.py         stream-ticket, stream (HTTP only; delegates to the modules above)
-│   │       └── schemas.py
-│   ├── consumers/                thin handlers per topic → notifications/recording_repo.py
-│   └── tasks/                    Celery task bodies (hosted by celery-worker) → notifications/*_repo.py, stream/cursor_repo.py
+│   └── stream/
+│       ├── models.py             StreamCursor
+│       ├── cursor_repo.py        cold start, greatest() upsert with clamp, last_seen_at
+│       ├── tickets.py            mint / redeem (GETDEL)
+│       ├── catchup.py            floor, bounded query, truncation
+│       ├── fanout.py             PUBLISH / SUBSCRIBE, message schema
+│       ├── connection.py         per-connection queue, heartbeat, presence, cap
+│       ├── frames.py             typed frame serialisers
+│       ├── utils.py              per-connection frame filter; no I/O
+│       ├── tasks/                sweep_stale_stream_cursors (hosted by celery-worker) → cursor_repo.py
+│       └── v1/
+│           ├── routes.py         stream-ticket, stream (HTTP only; delegates to the modules above)
+│           └── schemas.py
 └── tests/  unit/<entity>/  integration/<entity>/
 ```
 
@@ -312,7 +332,7 @@ Both entity routers mount under `/notifications`. Literal segments (`/unread-cou
 | I7 | `client_id` is always stored and queried under an authenticated `user_id` | Every query takes `user_id` from the verified token or the redeemed ticket |
 | I8 | A read notification stays read; `read_at` is written once | `SET read_at = coalesce(read_at, now())` |
 
-**Vocabularies** (S4; `app/notifications/enums.py`, imported by `stream/` for the scope filter).
+**Vocabularies** (S4; `app/v1/notifications/enums.py`, imported by `stream/` for the scope filter).
 
 | `DomainEnum` | Values | Column(s) | Read policy |
 | --- | --- | --- | --- |
@@ -353,14 +373,14 @@ Scope applies to the `in_app` row only; dispatched channels have no devices and 
 
 | Type | `title` | `body` (fields from `payload`) |
 | --- | --- | --- |
-| `welcome` | "Welcome to SmartRetail" | "Your {role} account is ready." |
-| `order_confirmed` | "Order confirmed" | "Order {order_ref} for {total} {currency} is confirmed." |
-| `order_failed` | "Order could not be completed" | "Order {order_ref} failed: {failure_reason_text}. You have not been charged." when the payment was not captured; otherwise the reason text alone |
-| `order_cancelled` | "Order cancelled" | "Order {order_ref} was cancelled{by_whom}." |
-| `shipment_update` | "Your order has shipped" / "…is on its way" / "…has been delivered" (by status) | "Order {order_ref} is now {status}{carrier_ref}." |
-| `stockout` | "Out of stock" | "{product_name} ({sku}) is out of stock." |
+| `welcome` | "Welcome to SmartRetail" | "Hi {full_name}, your {role} account is ready." |
+| `order_confirmed` | "Order confirmed" | "Order {order_number} for {total} {currency} is confirmed." plus "Tracking number: {tracking_number}." when present |
+| `order_failed` | "Order could not be completed" | "Order {order_number} failed: {failure_reason_text}." then "You have not been charged." when `payment_status` is `none`, `pending` or `failed`, or "Your payment has been refunded." when it is `refunded` |
+| `order_cancelled` | "Order cancelled" | "Order {order_number} was cancelled{by_whom}." plus the refund sentence when `payment_status` is `refunded` |
+| `shipment_update` | "Your order has shipped" / "…is on its way" / "…has been delivered" (by `to_status`) | "Order {order_number} is now {status}{ (tracking {tracking_number})}." |
+| `stockout` | "Out of stock" (`depleted`, `reservation_refused`) / "Running low on stock" (`low_stock`) | "{sku} is out of stock." / "{sku} is running low: {available} left (threshold {low_stock_threshold})." / "{sku} could not cover an order: {requested} requested, {available} available." |
 
-`order_ref` is the first eight characters of the order id. `failure_reason_text` maps the order's `failure_reason` code to a sentence; an unknown code renders as the code, never fails the render. A template that raises is a poison message (C6) — it goes to DLQ, and the render functions are unit-tested per type so that never happens in practice.
+*Amended Oct 15, 2026 (NTF-D33):* the order is referred to by its `order_number` (the customer-facing reference every order event carries) rather than the first eight characters of its id, and `stockout` renders the `sku` because `inventory.stockout` carries no product name. `failure_reason_text` maps order's `OrderFailureReason` code (RFC 0005 ORD-5) to a phrase; an unknown code renders as the code, never fails the render. A template that raises is a poison message (C6) — it goes to DLQ, and the render functions are unit-tested per type so that never happens in practice.
 
 ##### 3.1.1.3. State machines
 
@@ -803,6 +823,8 @@ A real email provider needs a user email address, which `identity` owns: it woul
 | `sweep_stale_stream_cursors` | `maintenance` | Beat, daily | Delete `stream_cursors` rows with `last_seen_at` older than 90 days; then, per user with more than 20 rows, delete all but the 20 newest by `last_seen_at` |
 | `redispatch_undispatched_notifications` (NTF-6) | `maintenance` | Beat, every 5 min | For rows with `channel <> 'in_app'`, no `delivery_attempts` row, created between 2 minutes and 24 hours ago → `dispatch_notification.delay(id)`. Also re-enqueues rows whose newest attempt is `pending` and older than the hard time limit, while fewer than 5 attempts exist |
 
+Task bodies live with the entity whose rows they write: the first two and the redispatch sweep in `notifications/tasks/`, the cursor sweep in `stream/tasks/` (NTF-D25).
+
 Separate queues so a burst of media processing cannot starve notification delivery ([RFC 0001](0001-platform-and-shared-infrastructure.md) owns routing). The `processed_events` retention sweep is shared infrastructure ([RFC 0000](0000-architecture.md#3132-shared-tables--outbox-and-processed_events)).
 
 **Dispatch, with its two triggers** (NTF-5, NTF-6):
@@ -1070,13 +1092,15 @@ Consumer group `notification`; dedupe by `processed_events (consumer_group, even
 
 | Topic | Key | Producer | Effect | Payload fields `notification` requires (NTF-8) |
 | --- | --- | --- | --- | --- |
-| `identity.user.registered` | `user_id` | `identity` ([RFC 0003](0003-identity-service.md#3123-events-produced)) | `welcome` | `user_id`, `role` |
-| `order.confirmed` | `order_id` | `order` ([RFC 0005](0005-order-service.md#3123-events-produced)) | `order_confirmed` | `order_id`, `customer_id`, `total`, `currency` |
-| `order.failed` | `order_id` | `order` | `order_failed` | `order_id`, `customer_id`, `failure_reason`, `payment_captured` (bool) |
-| `order.cancelled` | `order_id` | `order` | `order_cancelled` | `order_id`, `customer_id`, `cancelled_by` (`customer` \| `merchant` \| `admin` \| `system`) |
-| `payment.succeeded` / `payment.failed` | `order_id` | `order` | none — dedupe only (NTF-7) | — |
-| `shipment.status_changed` | `order_id` | `order` | `shipment_update` for `shipped`, `in_transit`, `delivered`; none for `created` | `order_id`, `customer_id`, `shipment_status`, `carrier_reference` (nullable) |
-| `inventory.stockout` | `variant_id` | `inventory` ([RFC 0006](0006-inventory-service.md#3123-events-produced)) | `stockout` to the merchant | `variant_id`, `merchant_id`, `product_name`, `sku` |
+| `identity.user.registered` | `user_id` | `identity` ([RFC 0003](0003-identity-service.md#3123-events-produced)) | `welcome` | `user_id`, `role`, `full_name` |
+| `order.confirmed` | `order_id` | `order` ([RFC 0005](0005-order-service.md#3123-events-produced)) | `order_confirmed` | `customer_id`, `order_number`, `total`, `currency`; `tracking_number` (nullable) |
+| `order.failed` | `order_id` | `order` | `order_failed` | `customer_id`, `order_number`, `failure_reason` (nullable `OrderFailureReason` code), `payment_status` |
+| `order.cancelled` | `order_id` | `order` | `order_cancelled` | `customer_id`, `order_number`, `cancelled_by` (nullable: `customer` \| `merchant` \| `admin` \| `system`), `payment_status` |
+| `payment.succeeded` / `payment.failed` | `order_id` | `order` | none — dedupe only (NTF-7, NTF-D36) | — |
+| `shipment.status_changed` | `order_id` | `order` | `shipment_update` for `shipped`, `in_transit`, `delivered`; none for `created` | `customer_id`, `order_number`, `to_status`, `tracking_number` (nullable) |
+| `inventory.stockout` | `variant_id` | `inventory` ([RFC 0006](0006-inventory-service.md#3123-events-produced)) | `stockout` to the merchant | `merchant_id`, `sku`, `trigger`, `available`, `low_stock_threshold`, `requested` (nullable) |
+
+*Amended Oct 15, 2026 (NTF-D33):* the column above was written before the producers' Avro schemas existed. It now lists the fields of the registered schemas (`common/smartretail_common/events/schemas/`) that the templates actually read: orders carry `order_number`; `order.failed` carries `payment_status` rather than a `payment_captured` flag; `shipment.status_changed` carries `to_status` and `tracking_number`; `inventory.stockout` carries `sku` and `trigger` and no product name.
 
 Missing a required field is a poison message (DLQ), because rendering a notification to the wrong person or with no content is worse than not rendering it. Unknown extra fields are ignored (Avro `BACKWARD`). Retry and DLQ per C6; outage handling per NTF-14. Replay (G3) is safe: every effect is behind both dedupe mechanisms, and `PUBLISH`/enqueue happen only for rows actually inserted.
 
@@ -1261,7 +1285,7 @@ Constraint: unique `(user_id, client_id)` — the whole table is an upsert targe
 | `stream_cursors` | unique `(user_id, client_id)` | Upsert target |
 | `stream_cursors` | `(last_seen_at)` | Retention sweep and the per-user cap |
 
-Every enum-valued column is `text` with a `COMMENT ON COLUMN` pointing at `app/notifications/enums.py` (S4). No `CHECK` constraints on vocabularies.
+Every enum-valued column is `text` with a `COMMENT ON COLUMN` pointing at `app/v1/notifications/enums.py` (S4). No `CHECK` constraints on vocabularies.
 
 ###### Shared tables carried
 
@@ -1351,7 +1375,7 @@ If the schedule slips, the reducible scope is fixed in advance (Q13): T16a + T16
 
 #### 3.2.1. Decision register
 
-This RFC already numbers its decisions (C4–C23 from the archive, NTF-1–NTF-16 new here). The register gives one row per significant decision and does not renumber them: a row that restates an existing ID says so in the Decision cell (“= C16”), and rows without one (NTF-D1, NTF-D2, NTF-D6, NTF-D20, NTF-D22, NTF-D23, NTF-D24) are decisions that until now were stated only in prose. The full reasoning stays in the linked sections.
+This RFC already numbers its decisions (C4–C23 from the archive, NTF-1–NTF-16 new here). The register gives one row per significant decision and does not renumber them: a row that restates an existing ID says so in the Decision cell (“= C16”), and rows without one (NTF-D1, NTF-D2, NTF-D6, NTF-D20, NTF-D22, NTF-D23, NTF-D24) are decisions that until now were stated only in prose. The full reasoning stays in the linked sections. The register itself was added after [mentor review 2026-10-06 §2](../reviews/mentor-reviews.md#2-a-reason-for-every-decision). Rows a review changed say so at the end of *Why* ([ARC-D36](0000-architecture.md#321-decision-register)).
 
 | ID | Decision | Why | Alternatives rejected (and why) | Revisit if |
 | --- | --- | --- | --- | --- |
@@ -1378,7 +1402,19 @@ This RFC already numbers its decisions (C4–C23 from the archive, NTF-1–NTF-1
 | NTF-D21 | = NTF-12. A ticket without `client_id` opens an ephemeral stream: no cursor row, never an origin, never receives `origin_only` frames | A missing or stripped `X-Client-Id` must never fail a request (C21) ([§3.1.1](#311-architectural-changes)) | Reject the stream; mint a server-side id (the server does not get to assume one) | Most clients turn out to be ephemeral |
 | NTF-D22 | `push_subscriptions` and the `push` channel value are specified now; the adapter is not registered | Makes the offline half of delivery an adapter swap rather than a redesign, without owning VAPID keys or a service worker ([§2.2](#22-non-goals)) | Leave push out of the schema entirely: a later migration and redesign | A client with a service worker exists |
 | NTF-D23 | Connection hygiene: bounded 100-message queue that closes on overflow, 3 streams per user, 20 s heartbeat, jittered `retry:`, drain on shutdown | Closing is lossless because reconnect catches up by `seq`; unbounded buffering is how push systems die under load ([§6.1](#61-scalability-and-fault-tolerance)) | Unbounded per-connection buffering; per-connection count keys (a `SCAN` on open, NTF-Q8) | `nt:conns` false `429`s are seen in practice (NTF-Q8) |
-| NTF-D24 | Entity-first layout: `notifications/`, `subscriptions/`, `stream/`, plus `consumers/` and `tasks/` | The binding template in [file-structure §4–§5](../file-structure.md#4-service-layout-every-service): only the HTTP contract is versioned (`<entity>/v1/`), and repos are the one place rules live, called by routes, consumers and tasks alike ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Layer-first `api/`, `services/`, `models/`: scatters one entity across folders and cannot version the contract alone | The template changes in [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) |
+| NTF-D24 | Entity-first layout: `notifications/`, `subscriptions/`, `stream/`, each HTTP contract in `<entity>/v1/`; where the consumer and tasks live is NTF-D25 | The binding template in [file-structure §4–§5](../file-structure.md#4-service-layout-every-service): only the HTTP contract is versioned (`<entity>/v1/`), and repos are the one place rules live, called by routes, consumers and tasks alike ([§3.1.1.1](#3111-responsibility-and-boundaries)). *Changed after [mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) — previously layer-first: `app/api/v1/`, `models/`, `schemas/`, `services/`, with templates in `app/templates/`.* | Layer-first `api/`, `services/`, `models/`: scatters one entity across folders and cannot version the contract alone | The template changes in [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) |
+| NTF-D25 | Under [ARC-D27](0000-architecture.md#321-decision-register), the Kafka consumer is `notifications/consumers/`; Celery tasks sit under the entity whose rows they write — `notifications/tasks/` (dispatch, promotion, redispatch) and `stream/tasks/` (cursor sweep); `core/` keeps only config, db, logger, errors, dependencies and shared schemas | The consumer writes only `notifications` rows through `recording_repo.py`, and each task changes one entity's table, so one folder answers what an entity does and what runs against it. *Changed after [mentor review 2026-10-12 §2](../reviews/mentor-reviews.md#2-every-file-in-its-entity-folder) — previously app-level `consumers/` and `tasks/`.* | App-level `consumers/` and `tasks/` (a second, layer-first tree beside the entities, which ARC-D23 rejected); one `tasks/` under `notifications/` for all four (puts the cursor sweep away from the table it deletes from) | A consumer or task starts writing to two entities' tables — it moves to `core/` and this row records why |
+| NTF-D26 | (Milestone 3 implementation) Scoped delivery is deferred: every frame goes to every connected device of the user. `origin_client_id` and `delivery_scope` are still derived (I2) and stored on every row; the `nt:client:*` presence key, NTF-9's promote-at-insert, the per-connection scope filter and `promote_undelivered_notifications` are not built. The `origin` flag on a frame still tells the originating device it was the origin | Scope only ever narrows *toasts* (C21), so broadcasting is the safe direction: nothing is lost, a second device merely toasts too. Storing the scope now means enabling it later is code only, with no migration or backfill, and there is no client yet on which to judge the toast UX. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously T16h in M3.* | Build all of C21 now: a presence key, a Beat promoter every 15 s and a filter whose only observable benefit needs a second real device | A client exists and G5d is a milestone gate, or a second device's toasts are reported as noise |
+| NTF-D27 | (Milestone 3 implementation) No `WebPushAdapter` file; the `push` vocabulary value and the `push_subscriptions` table exist (NTF-D22), and the adapter registry has `email` and `sms` only | An adapter with no VAPID keys, no service worker and no subscription endpoint cannot be exercised, so it would be untested code. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously "specified" as `adapters/web_push.py`.* | A stub adapter that raises: registry noise with no behaviour | A client with a service worker exists (§3.1.5, "push adapter") |
+| NTF-D28 | (Milestone 3 implementation) The §3.1.1.7 metrics, spans and `/metrics` endpoint are deferred; the service emits structured JSON logs with `event_id`, `notification_id`, `client_id`, `attempt`. `/health/ready` checks `notification_db` and Redis only, not the broker or consumer lag | The platform's OTel and Prometheus wiring is not in `common` yet; instrumenting one service ahead of it would invent conventions RFC 0001 owns. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously T10 (part) in M3.* | Hand-rolled Prometheus counters in this service: a second metrics convention to unwind | RFC 0001's observability task lands; `notification_undelivered_age_seconds` is the first instrument to add |
+| NTF-D29 | (Milestone 3 implementation) Reconnect-storm, capacity and through-the-gateway latency tests are deferred. The mechanisms exist — the 3-stream cap, the jittered `retry:` on `hello` and on shutdown, the bounded queue — and are tested functionally against a real uvicorn server | Load figures (~10k sockets per replica) are estimates that only a load rig can confirm; functional tests prove each mechanism behaves. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously part of T16c/T16d.* | A load test in the unit suite: slow, flaky and not a measurement | Before any production use, or the gateway's SSE path changes |
+| NTF-D30 | (Milestone 3 implementation) SSE is Starlette's `StreamingResponse` with `text/event-stream`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`, and a small typed frame serialiser (`stream/frames.py`); not `sse-starlette` | The frame contract is six events and a comment; a dependency adds its own ping and disconnect handling that would duplicate the heartbeat, slot refresh and JWT-expiry loop this stream needs. Cleanup runs in a shielded `finally`, so a disconnect always releases the slot and the subscription. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously §4 listed `sse-starlette`.* | `sse-starlette` (§4): a second heartbeat and less control over close semantics | The assistant stream ([RFC 0009](0009-assistant-service.md)) adopts `sse-starlette` and one SSE implementation should serve both |
+| NTF-D31 | (Milestone 3 implementation) Redis Pub/Sub fan-out is built and mandatory, not the Q13 fallback: the consumer runs as its own process (`notification-consumer`), so the replica holding a stream is never the one consuming, and every in-app frame travels `PUBLISH` → `SUBSCRIBE` | With the consumer split from the API, a single-replica in-process push would deliver nothing; making fan-out the only path means the cross-replica test (G5a) exercises the same code as production. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously fan-out was reducible to M4 under Q13.* | Consumer inside the API process with in-process delivery: couples consumption to HTTP replicas and still needs fan-out for any second replica | Never, while the consumer is a separate process |
+| NTF-D32 | (Milestone 3 implementation) One Celery queue, `notification.notifications`, for dispatch and every sweep; Beat embedded in the worker (`-B`) | Queues separate workloads that can starve each other; here dispatch and three small sweeps share one worker and the sweeps run daily or every 5 minutes. One queue per service matches the platform's `<service>.<queue>` rule (PLT-D36). *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously `notifications` and `maintenance` queues.* | A second `notification.maintenance` queue and worker: a container for a few rows a day | A real provider makes dispatch slow enough that a sweep waits behind it |
+| NTF-D33 | (Milestone 3 implementation) NTF-8 and the templates are aligned to the registered Avro schemas: `order_number` rather than an `order_ref` cut from the id; `order.failed`'s `payment_status` rather than `payment_captured`; `shipment.status_changed`'s `to_status`/`tracking_number`; `inventory.stockout`'s `sku`/`trigger` (no product name). A missing required field raises `KeyError` and the event is dead-lettered | The schemas, not this RFC, are the contract producers ship; templates that read fields no producer sends would DLQ every event. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously the §3.1.2.4 field list written before the schemas.* | Ask producers to add the RFC's fields: duplicates (`order_ref`), or a projection `inventory` does not hold (product name) | A template needs a field no schema carries — the producer's schema changes first, `BACKWARD`-compatibly |
+| NTF-D34 | (Milestone 3 implementation) The after-commit step re-reads the event's rows by `payload->>'event_id'` (the NTF-1 index's leading column), then publishes `in_app` rows and enqueues `email`/`sms` rows; every failure is logged and swallowed | The base calls `after_commit(envelope)` only after `HANDLED`, with no handle on what the handler inserted; the indexed re-read is one query and needs no state across the commit. On an NTF-1 replay (dedupe row gone, rows present) it re-publishes and re-enqueues, both harmless: clients de-duplicate by `id` and dispatch no-ops on a `sent` attempt. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously "for each row inserted".* | Carrying inserted ids from handler to `after_commit` in process memory: state that leaks on a dead-lettered event | Replays become frequent enough that duplicate frames are noticed |
+| NTF-D35 | (Milestone 3 implementation) One `FanoutHub` per process holds one Redis `PubSub` connection; the first local stream of a user `SUBSCRIBE`s `nt:user:{id}` and waits for Redis's confirmation (NTF-10), the last one `UNSUBSCRIBE`s; a single reader task routes messages to per-connection bounded queues. If that connection fails, every local stream ends with a `retry:` hint and reconnects through catch-up | One socket per replica instead of one per stream keeps Redis connections flat as streams grow; waiting for the subscribe confirmation is what makes subscribe-before-catch-up exact. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously unspecified per connection.* | A `PubSub` per stream: one Redis connection per open socket | One reader task becomes a bottleneck at measured load (NTF-D29) |
+| NTF-D36 | (Milestone 3 implementation) `payment.succeeded` and `payment.failed` have no-op handlers rather than none | The consumer base returns `IGNORED` and records nothing for a type without a handler; a no-op handler makes the base record the event in `processed_events`, so dedupe and replay are uniform across every subscribed type, as NTF-7 requires. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) — previously implicit in NTF-7.* | Leave them unhandled: replay statistics and dedupe differ by type | A payment notification type is introduced (it would then duplicate the order outcome, NTF-7) |
 
 **Why a service at all.** It passes all four parts of the ownership test: it alone writes notifications, delivery attempts and device cursors; it protects at-most-one per `(event, user, channel)`; its requirements (templates, channels, preferences, push) move for reasons unrelated to orders or stock; and its profile — bursty, fully async, failure-tolerant, connection-holding — is unlike any neighbour's. Folding it into `order` would put SSE connections and email retries inside the service with the strongest consistency need, and make a notification outage a checkout risk.
 
@@ -1692,12 +1728,25 @@ IDs from the archive are kept; the source RFC is named because archive/0003 and 
 - **The one sentence to keep.** The row is the notification; the frame is a courtesy. Every design choice above — at-most-once fan-out, bounded catch-up, cold start, scoping, the ack as a report — is licensed by that and would be wrong without it.
 - **On the lifecycle.** "Delivered" here always means "a client reported rendering it". A notification with `delivered_at IS NULL` is not failed; it may well be read. The admin view and `notification_undelivered_age_seconds` are how the difference is observed.
 - **On reading the archive.** archive/0003's C1–C14 (relay, Avro, Celery split, OTel, Redis jobs, profiles) are platform decisions and live in [RFC 0001](0001-platform-and-shared-infrastructure.md); only C4, C6, C7 and C11 are restated here, as they bind this consumer. The archived comment note referred to decisions C1–C20 and questions Q1–Q13; the current ranges are C1–C23 and Q1–Q18.
+- **Amendment log.**
+
+  | Date | Section | Change | Reason |
+  | --- | --- | --- | --- |
+  | Oct 6, 2026 | All | `libs/common` renamed `common/` in every reference | [Mentor review 2026-10-06 §1](../reviews/mentor-reviews.md#1-shared-package-folder) |
+  | Oct 11, 2026 | §3.2.1 | Added the decision register (NTF-D1–NTF-D24); existing C*/NTF-* IDs kept and referenced | [Mentor review 2026-10-06 §2](../reviews/mentor-reviews.md#2-a-reason-for-every-decision) |
+  | Oct 11, 2026 | §3.1.1, §3.1.1.3, §3.1.1.4, §3.1.2.1, §3.1.3 | Converted the ASCII architecture diagram to Mermaid; added the state, sequence, decision-flow and `erDiagram` diagrams | [Mentor review 2026-10-06 §4](../reviews/mentor-reviews.md#4-diagrams) |
+  | Oct 11, 2026 | §3.1.1.1, §3.1.1.2, §3.1.3 | Layer-first layout (`api/v1/`, `services/`, `models/`) replaced by entity-first `notifications/`, `subscriptions/`, `stream/` with `<entity>/v1/` (NTF-D24) | [Mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) |
+  | Oct 12, 2026 | §3.1.1, §3.1.1.1, §3.1.1.4, §3.2.1 | NTF-D25: the consumer moved to `notifications/consumers/`, the Celery tasks to `notifications/tasks/` and `stream/tasks/`; no app-level `consumers/` or `tasks/` | [Mentor review 2026-10-12 §2](../reviews/mentor-reviews.md#2-every-file-in-its-entity-folder) |
+  | Oct 12, 2026 | §3.1, §3.2.1, §11 | Added the diagram index; review-changed register rows marked with the review and the previous decision; this log | [Mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review), [§4](../reviews/mentor-reviews.md#4-diagram-coverage-per-service) |
+  | Oct 15, 2026 | §3.2.1 | Milestone 3 implementation: register rows NTF-D26–NTF-D36 — scoped delivery, promotion and the presence key deferred (frames broadcast; scope still stored); no Web Push adapter; metrics/OTel and reconnect-storm tests deferred; fan-out mandatory with the consumer as its own process; one Celery queue; `StreamingResponse` instead of `sse-starlette`; one `PubSub` per replica; the after-commit re-read by `event_id`; no-op `payment.*` handlers | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
+  | Oct 15, 2026 | §3.1.1.2, §3.1.2.4, NTF-8 | Templates and the NTF-8 field list aligned to the registered Avro schemas (`order_number`, `payment_status`, `to_status`, `tracking_number`, `sku`, `trigger`) (NTF-D33) | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
+  | Oct 15, 2026 | §3.1.1.6 | As implemented: the database URL is the platform's `DATABASE_URL`, not `NOTIFICATION_DATABASE_URL`; `DISPATCH_MAX_RETRIES` (5) is the attempt ceiling — the fifth failed attempt is the last row written; adds `NOTIFICATION_FAKE_SMS_FAILURE_RATE`, `DISPATCH_STALE_PENDING_SECONDS` (60) and `STREAM_SUBSCRIBE_TIMEOUT_SECONDS` (2); the `PROMOTION_*` and `STREAM_PRESENCE_TTL_SECONDS` settings are unused until NTF-D26 is lifted; `POST /ack` accepts `up_to_seq` and `ids` as optional | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
 
 ---
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against the numbered decisions (C15–C23, NTF-1–NTF-16), the open questions (Q11–Q18, NTF-Q1–NTF-Q8), or the rejected alternatives in §5, so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against the numbered decisions (C15–C23, NTF-1–NTF-16), a decision-register row (NTF-D1–NTF-D36), the open questions (Q11–Q18, NTF-Q1–NTF-Q8), or the rejected alternatives in §5, so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

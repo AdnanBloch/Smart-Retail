@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartretail-notification"
+version = "0.1.0"
+description = "SmartRetail notification service (RFC 0007): event-driven notifications, dispatch, SSE push"
+requires-python = ">=3.12"
+dependencies = [
+    "smartretail-common",
+    "fastapi>=0.115,<0.116",
+    "uvicorn[standard]>=0.32,<0.35",
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.30,<0.31",
+    "alembic>=1.14,<1.15",
+    "pydantic>=2.10,<2.11",
+    "pydantic-settings>=2.6,<3",
+    "pyjwt[crypto]>=2.10,<2.11",
+    "redis[hiredis]>=5.2,<6",
+    "anyio>=4",
+]
+
+[tool.setuptools]
+# Dependencies only; the app/ source is copied into the image directly.
+packages = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+# Coverage gate (RFC 0001, review 2026-10-06 §5): `make cov`; CI fails below 85%.
+[tool.coverage.run]
+branch = true
+concurrency = ["greenlet", "thread"]
+source = ["app", "main"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.coverage.html]
+directory = "htmlcov"

@@ -8,7 +8,7 @@ from smartretail_common.testing import provision_test_database, truncate_all
 from tests.conftest import make_settings
 
 SERVICE_DIR = str(Path(__file__).resolve().parents[2])
-TABLES = ["refresh_sessions", "merchant_profiles", "users"]
+TABLES = ["refresh_sessions", "merchant_profiles", "users", "outbox"]
 
 
 @pytest.fixture(scope="session")

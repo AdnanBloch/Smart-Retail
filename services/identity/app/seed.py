@@ -13,8 +13,8 @@ from sqlalchemy import select
 from app.core.config import Settings
 from app.core.enums import MerchantStatus, UserRole
 from app.core.security import PasswordHasher
-from app.merchants.utils import unique_slug
 from app.models import MerchantProfile, User
+from app.v1.merchants.utils import unique_slug
 from smartretail_common.db import Database
 from smartretail_common.logging import configure_logging
 

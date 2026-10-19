@@ -1,0 +1,35 @@
+{
+  "type": "record",
+  "name": "PaymentFailed",
+  "namespace": "smartretail.events.payload",
+  "fields": [
+    {
+      "name": "order_id",
+      "type": "string"
+    },
+    {
+      "name": "customer_id",
+      "type": "string"
+    },
+    {
+      "name": "reason",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "amount",
+      "type": "string"
+    },
+    {
+      "name": "currency",
+      "type": "string"
+    },
+    {
+      "name": "failed_at",
+      "type": "string"
+    }
+  ]
+}

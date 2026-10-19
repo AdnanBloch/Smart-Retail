@@ -145,6 +145,9 @@ def test_edge_behaviour(client: httpx.Client) -> None:
         "catalog": "ok",
         "order": "ok",
         "inventory": "ok",
+        "notification": "ok",
+        "analytics": "ok",
+        "assistant": "ok",
     }
     doc = client.get("/openapi.json").json()
     assert "/api/v1/products" in doc["paths"] and "/api/v1/auth/login" in doc["paths"]

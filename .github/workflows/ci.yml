@@ -47,6 +47,9 @@ jobs:
           - services/gateway
           - services/inventory
           - services/order
+          - services/notification
+          - services/analytics
+          - services/assistant
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -57,6 +60,13 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7.4
+        # Same address `make test-db` uses.
+        ports: ["56379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,12 +74,49 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m venv .venv && make dev-install
+      # Service containers cannot pass --replSet to mongod, so analytics starts its own.
+      - name: MongoDB replica set for analytics' integration tests
+        if: matrix.package == 'services/analytics'
+        run: make test-mongo
       # --cov applies [tool.coverage] from the package's pyproject: branch
       # coverage, fail_under = 85. Workflow suites download Temporal's
       # time-skipping test server on first use.
       - name: pytest with coverage gate
         working-directory: ${{ matrix.package }}
         run: ${{ github.workspace }}/.venv/bin/python -m pytest -q --cov --cov-report=term
+
+  # C5: an incompatible schema change fails here, not in a consumer at runtime.
+  # main's schemas are registered first, then the branch's are checked against them.
+  schemas:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    env:
+      # Compose interpolates the whole file; these are unused by the two containers.
+      SERVICE_CLIENT_SECRET: ci
+      SERVICE_CLIENT_SECRET_SHA256: ci
+      JWT_ACTIVE_KID: ci
+      # core too: outbox-relay depends on postgres (not started, --no-deps).
+      COMPOSE: docker compose --profile core --profile events
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: worktree of main
+        run: git worktree add ../base origin/main
+      - name: start Kafka and Schema Registry
+        run: $COMPOSE up -d --wait kafka schema-registry
+      - run: $COMPOSE build -q outbox-relay
+      - name: register main's schemas
+        run: |
+          if [ -d ../base/common/smartretail_common/events ]; then
+            $COMPOSE run --rm --no-deps -v "$PWD/scripts:/scripts:ro" \
+              -v "$(realpath ../base)/common:/base:ro" -e PYTHONPATH=/base \
+              outbox-relay python /scripts/topics.py --schemas-only
+          else
+            echo "main has no event schemas yet: nothing to be compatible with"
+          fi
+      - name: check this branch's schemas are BACKWARD-compatible
+        run: $COMPOSE run --rm --no-deps -v "$PWD/scripts:/scripts:ro" outbox-relay python /scripts/topics.py --check
 
   audit:
     runs-on: ubuntu-latest

@@ -36,6 +36,10 @@ class Settings(BaseServiceSettings, DatabaseSettings):
     media_max_pixels: int = 40_000_000
     media_derived_sizes: str = "thumb:150,medium:600,large:1200"
     media_url_ttl_seconds: int = 3600
+    # process_media on Celery's catalog.media queue (0002-Q7); inline when false.
+    catalog_media_via_celery: bool = False
+    # Under the activity's 5-minute start-to-close, so a lost task is retried in time.
+    media_job_timeout_seconds: float = 240
 
     @property
     def allowed_content_types(self) -> frozenset[str]:

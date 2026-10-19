@@ -270,6 +270,19 @@ Each is a row in the owning RFC's decision register (§3.2.1).
   reserve replay under the stock locks (INV-D27), skips the fast reject for an
   order that already holds reservations (INV-D28), and follows the order
   workflow's retry policies (INV-D29).
+- **Stack rationale** (ARC-D28–ARC-D35). Why FastAPI, Python 3.12,
+  SQLAlchemy with `asyncpg`, Pydantic, Alembic, `httpx`, Uvicorn and Docker
+  Compose were chosen, and what was rejected for each
+  ([mentor review 2026-10-12 §1](docs/reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack)).
+- **Everything in its entity folder** (ARC-D27, CAT-D32, ORD-D34). Workflows,
+  clients and providers moved under `products/` and `orders/`, and the
+  `Idempotency-Key` model into `orders/`. The workers now start with
+  `python -m app.<entity>.workflows.worker`
+  ([§2](docs/reviews/mentor-reviews.md#2-every-file-in-its-entity-folder)).
+- **Review traceability** (ARC-D36). A decision a review changed says so in its
+  register row, with what it was before. Every RFC has an amendment log that
+  links the review behind each change
+  ([§3](docs/reviews/mentor-reviews.md#3-every-change-traced-to-its-review)).
 - **Still to come, as phased**: presigned media URLs (CAT-D29), events on
   Kafka, the Redis idempotency fast path, the HMAC carrier webhook, and
   `resume_unstarted_orders` — until then an order accepted while Temporal is

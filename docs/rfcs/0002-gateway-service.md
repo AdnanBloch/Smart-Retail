@@ -117,6 +117,23 @@ Duplicating these into eight services multiplies both code and drift; hiding the
 
 ### 3.1. Specification
 
+**Diagram index.** Every diagram in this RFC, by kind. The gateway has no persisted entity, so its one state diagram is the in-memory stream lifecycle, and its data diagram shows caches and counters rather than tables.
+
+| Kind | Diagram | Section |
+| --- | --- | --- |
+| Component | Position in the topology | [§3.1.1.1](#3111-responsibility-and-boundaries) |
+| Component | Internal components | [§3.1.1.1](#3111-responsibility-and-boundaries) |
+| Flow | Request pipeline, stages 1–10 | [§3.1.1.1](#3111-responsibility-and-boundaries) |
+| Flow | Auth-policy decision | [§3.1.1.2](#3112-domain-model) |
+| Flow | Upstream response handling | [§3.1.2.1](#3121-endpoints) |
+| Sequence | Public key refresh (JWKS mode) | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Sequence | Fixed-window rate limit | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Sequence | OpenAPI aggregation | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Sequence | Proxied, authenticated request | [§3.1.2.1](#3121-endpoints) |
+| Sequence | SSE pass-through with client disconnect | [§3.1.2.1](#3121-endpoints) |
+| State | Proxied stream lifecycle | [§3.1.1.3](#3113-state-machines) |
+| Data | Route table, key cache, rate-limit counters and headers | [§3.1.3](#313-dataschema-changes) |
+
 #### 3.1.1. Architectural changes
 
 ##### 3.1.1.1. Responsibility and boundaries
@@ -944,6 +961,42 @@ It does shape two envelope fields indirectly, by what it forwards: the `correlat
 
 The `rl:*` keyspace was first listed with a uniform 60s TTL; the per-hour `generate` class needs its window as its TTL, so the TTL is "the class window". Redis is flushed freely in development — the only effect is that windows restart.
 
+**Data diagram.** The gateway owns no tables; this is the data it reads, caches and forwards ([GW-D29](#321-decision-register)). Process-memory state is per replica and rebuilt at start-up; the Redis counters are shared across replicas; headers live for one request.
+
+```mermaid
+flowchart LR
+    subgraph inbound["Inbound request (read)"]
+        hin["Authorization: Bearer JWT<br/>X-Request-ID, traceparent, tracestate<br/>X-Client-Id<br/>X-Forwarded-For (trusted proxies only)<br/>stripped: X-User-*, X-Internal-*, hop-by-hop"]
+        tick["?ticket= (stream route; redacted from logs)"]
+        login["login body, at most 16 KiB<br/>email, hashed for login_email"]
+    end
+    subgraph memory["Process memory, per replica"]
+        rt["RouteTable (immutable after start-up)<br/>RouteRule: prefix, methods, auth_policy, roles,<br/>rate_classes, timeout_class, body_limit, stream"]
+        ups["Upstream: name to base_url<br/>one pooled httpx client each<br/>empty base_url = not deployed (503)"]
+        keys["Key cache: kid to RS256 public key<br/>refresh every JWT_JWKS_CACHE_TTL_S (300 s),<br/>on unknown kid at most every JWT_JWKS_MIN_REFRESH_S (30 s)"]
+        oas["OpenAPI cache: merged document<br/>+ last good section per upstream<br/>GATEWAY_OPENAPI_CACHE_TTL_S (60 s)"]
+    end
+    subgraph redis["Redis (shared, disposable)"]
+        rl["rl:{scope}:{identifier} = integer count<br/>TTL = class window: 60 s, 3600 s for generate<br/>identifier: client IP, email hash, sub, sub:X-Client-Id"]
+    end
+    subgraph outbound["Upstream request (set or forwarded)"]
+        hout["Authorization unchanged<br/>X-Request-ID = trace id<br/>traceparent from the edge span<br/>X-Client-Id if well-formed<br/>X-Forwarded-For, -Proto, -Host<br/>path and body unchanged"]
+    end
+    identity["identity<br/>GET /api/v1/auth/jwks"]
+    files["JWT_PUBLIC_KEY_PATH<br/>mounted public key"]
+
+    hin --> rt
+    rt --> ups
+    hin -->|"verify, kid lookup"| keys
+    identity -.->|"key set, replaced atomically"| keys
+    files -.->|"start-up, file mode"| keys
+    hin -->|"client IP, sub"| rl
+    login -->|"sha256, first 32 hex"| rl
+    tick --> ups
+    hin --> hout
+    ups --> hout
+```
+
 **Migrations:** none. **Constraints and indexes:** none. There is no `erDiagram` for this service: it has no tables.
 
 #### 3.1.4. Breaking changes
@@ -1044,7 +1097,11 @@ The gateway decisions already ID'd GW-1 … GW-22 in [§3.1.1.1](#3111-responsib
 | GW-D25 | = GW-15. Aggregated OpenAPI is merged on demand, cached briefly, namespaced per service, and degrades per upstream | One docs page; a down upstream must not fail `/docs` ([§3.1.1.4](#3114-workflows-and-async-jobs)) | A separate docs tool; failing the whole document | — |
 | GW-D26 | = GW-16. Readiness depends only on the gateway itself, not on upstreams or Redis | Partial Compose profiles are normal; one failed service must not take the whole surface down ([§3.2.2](#322-reasoning)) | Readiness requires every upstream | — |
 | GW-D27 | = GW-19. CORS is an explicit allow-list (no `*`, no credentials), answered at the edge and applied to error responses | A `401` or `429` without CORS headers is an opaque network error to a browser | Per-service CORS; `*` | — |
-| GW-D28 | Entity-first layout with no `v<N>/` folders: `core/`, `health/`, `docs/`, `proxy/`; route table in `proxy/routing.py` | The gateway owns no API contract — paths are table rows forwarded unchanged — and no store, so no `models.py`, `repo.py` or `alembic/` ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Versioned folders per concern — would version a contract the gateway does not own | The gateway ever serves an API of its own beyond operational routes |
+| GW-D28 | Entity-first layout with no `v<N>/` folders: `core/`, `health/`, `docs/`, `proxy/`; route table in `proxy/routing.py` | The gateway owns no API contract — paths are table rows forwarded unchanged — and no store, so no `models.py`, `repo.py` or `alembic/` ([§3.1.1.1](#3111-responsibility-and-boundaries)). *Changed after [mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) — previously layer-first: `app/api/handlers/`, `configs/`, `infrastructure/`, `middleware/`, `clients/`.* | Versioned folders per concern — would version a contract the gateway does not own | The gateway ever serves an API of its own beyond operational routes |
+| GW-D29 | The gateway's data is documented as a data diagram of its route table, key cache, rate-limit counters and forwarded headers, not an ER diagram ([§3.1.3](#313-dataschema-changes)) | It owns no tables, so an `erDiagram` would be empty, but a reviewer still needs to see what state it keeps and where it lives. *Added after [mentor review 2026-10-12 §4](../reviews/mentor-reviews.md#4-diagram-coverage-per-service).* | An empty ER section (hides the Redis and cache state); no data section (the gap the review found) | The gateway gains persistent state |
+| GW-D30 | A third timeout class, `stream` (`GATEWAY_STREAM_READ_TIMEOUT_S=120`), for server-sent events (`/notifications/stream`, `/assistant/chat`, `/assistant/generate`); the timeout is now applied **per request** (`build_request(timeout=…)`), which also makes the `upload` class (GW-14) take effect — before, the client's default read timeout applied to every route (Milestone 3 implementation) | A 10 s read timeout cuts an SSE stream whose keepalive is every 20 s; the upload timeout was configured but never reached the request. *Added after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) §6.* | One long timeout for every route (hides hung upstreams on ordinary calls) | Streams move to a dedicated edge (e.g. a WebSocket gateway) |
+| GW-D31 | A malformed `X-Client-Id` (not `[A-Za-z0-9_-]{8,64}`) is dropped, never rejected; validation lives in `smartretail_common.client_id` and services re-check it (Milestone 3 implementation) | The header only narrows where a notification is shown first (C21); refusing a request over it would make an advisory header a failure mode | Rejecting with 400 (breaks clients over a hint) | — |
+| GW-D32 | Routes for `notification` (8005), `analytics` (8006) and `assistant` (8007) are added; `/api/v1/notifications/stream` is PUBLIC at the edge because it authenticates with a single-use ticket in the service (an `EventSource` cannot send headers) (Milestone 3 implementation) | The role sets are coarse early rejection, looser than or equal to each service's own checks (GW-1) | Verifying the ticket at the gateway (the gateway would need Redis and the ticket format) | — |
 
 #### 3.2.2. Reasoning
 
@@ -1375,13 +1432,24 @@ No `sse-starlette`: the gateway relays upstream bytes and never constructs an SS
 - **On superseded sketches.** An early topology sketch showed the gateway injecting `X-User-*` headers and routing a `/api/v1/catalog` prefix. Both are superseded — by GW-5 and by the surface map respectively — and recorded here so a reader of the archive does not reintroduce them.
 - **On the analytics coarse check.** The architecture summary described `/api/v1/analytics/*` as `admin`-only at the gateway. The analytics endpoint table admits merchants to four merchant-scoped endpoints. Under GW-1 the gateway must not be stricter than the service, so the coarse rule is `admin` on the admin-only endpoints and `merchant`, `admin` on the rest.
 - **On what the gateway must never become.** The test for any proposed gateway feature is whether it needs a row. If it does, it is a service feature.
+- **Amendment log.**
+
+  | Date | Section | Change | Reason |
+  | --- | --- | --- | --- |
+  | Oct 11, 2026 | All | References to the shared package changed from `libs/common` to `common` | [Mentor review 2026-10-06 §1](../reviews/mentor-reviews.md#1-shared-package-folder) |
+  | Oct 11, 2026 | §3.2.1 | Added the decision register (GW-D1–GW-D28); GW-1…GW-22 keep their IDs and are cross-referenced | [Mentor review 2026-10-06 §2](../reviews/mentor-reviews.md#2-a-reason-for-every-decision) |
+  | Oct 11, 2026 | §3.1.1.1, §3.2.1 | Layer-first module layout replaced by concern folders `core/`, `health/`, `docs/`, `proxy/` with no `v<N>/` folders (GW-D28) | [Mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) |
+  | Oct 11, 2026 | §3.1.1.1–§3.1.1.4, §3.1.2.1 | ASCII topology converted to Mermaid; added the component, pipeline, auth-policy and upstream-response flowcharts, the stream state diagram and the key-refresh, rate-limit, OpenAPI, proxied-request and SSE sequences | [Mentor review 2026-10-06 §4](../reviews/mentor-reviews.md#4-diagrams) |
+  | Oct 12, 2026 | §3.1, §3.1.3, §3.2.1 | Added the diagram index and the data diagram of the gateway's in-memory and Redis state and forwarded headers (GW-D29) | [Mentor review 2026-10-12 §4](../reviews/mentor-reviews.md#4-diagram-coverage-per-service) |
+  | Oct 12, 2026 | §3.2.1, §11 | Rows changed by a review (GW-D28, GW-D29) name the review and the previous decision; this amendment log added | [Mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review) |
+  | Oct 15, 2026 | §3.1.2.1, §3.2.1 | GW-D30–GW-D32: `stream` timeout class and per-request timeouts (fixes the upload class), `X-Client-Id` shape check, routes for notification, analytics and assistant | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
 - **Definition of done.** Goals GW-G1–GW-G10 verified by their stated checks; the measured SSE latency tests green through the gateway; the route table matching every owning RFC's endpoint list; this RFC moved to **DONE** with review outcomes folded in.
 
 ---
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against the numbered decisions (GW-1–GW-22, and A5/A8/C12/C13/C19/C21 as they apply at the edge), the open questions (Q5, GW-Q1–GW-Q6), the route table in §3.1.2.1, or the rejected alternatives in §5, so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against the numbered decisions (GW-1–GW-22, a register row GW-D1–GW-D29, and A5/A8/C12/C13/C19/C21 as they apply at the edge), the open questions (Q5, GW-Q1–GW-Q6), the route table in §3.1.2.1, or the rejected alternatives in §5, so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

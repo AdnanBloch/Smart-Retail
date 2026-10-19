@@ -10,7 +10,7 @@ FROM base AS builder
 COPY common /src/common
 COPY services/catalog/pyproject.toml /src/services/catalog/pyproject.toml
 RUN python -m venv /venv \
- && /venv/bin/pip install --no-cache-dir /src/common /src/services/catalog
+ && /venv/bin/pip install --no-cache-dir "/src/common[events,celery]" /src/services/catalog
 
 FROM base AS runtime
 RUN useradd --uid 10001 --create-home app

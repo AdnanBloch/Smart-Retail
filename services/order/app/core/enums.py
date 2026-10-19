@@ -1,14 +1,10 @@
-"""Vocabularies of request-level machinery (RFC 0005 §3.1.1.2). The only place
-these values live (R8); order vocabularies are in ``app/orders/enums.py``."""
+"""Vocabularies shared by more than one order module (RFC 0005 §3.1.1.2).
+
+The only place these values live (R8). Order vocabularies, including the
+``Idempotency-Key`` states, are in ``app/v1/orders/enums.py``.
+"""
 
 from enum import StrEnum
-
-from smartretail_common.enums import DomainEnum
-
-
-class IdempotencyState(DomainEnum):
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
 
 
 class CallerRole(StrEnum):

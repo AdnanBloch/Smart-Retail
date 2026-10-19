@@ -1,0 +1,58 @@
+{
+  "type": "record",
+  "name": "OrderFailed",
+  "namespace": "smartretail.events.payload",
+  "fields": [
+    {
+      "name": "order_id",
+      "type": "string"
+    },
+    {
+      "name": "customer_id",
+      "type": "string"
+    },
+    {
+      "name": "order_number",
+      "type": "string"
+    },
+    {
+      "name": "failure_reason",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "failed_step",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "payment_status",
+      "type": "string"
+    },
+    {
+      "name": "currency",
+      "type": "string"
+    },
+    {
+      "name": "total",
+      "type": "string"
+    },
+    {
+      "name": "merchant_ids",
+      "type": {
+        "type": "array",
+        "items": "string"
+      }
+    },
+    {
+      "name": "failed_at",
+      "type": "string"
+    }
+  ]
+}

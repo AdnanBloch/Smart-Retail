@@ -10,7 +10,7 @@ from smartretail_common.auth import JwtVerifier
 from smartretail_common.testing import provision_test_database, truncate_all
 
 SERVICE_DIR = str(Path(__file__).resolve().parents[2])
-TABLES = ["reservations", "stock_movements", "stock_items", "outbox"]
+TABLES = ["reservations", "stock_movements", "stock_items", "outbox", "processed_events"]
 
 
 @pytest.fixture(scope="session")

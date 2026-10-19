@@ -1,0 +1,59 @@
+{
+  "type": "record",
+  "name": "ShipmentStatusChanged",
+  "namespace": "smartretail.events.payload",
+  "fields": [
+    {
+      "name": "order_id",
+      "type": "string"
+    },
+    {
+      "name": "customer_id",
+      "type": "string"
+    },
+    {
+      "name": "order_number",
+      "type": "string"
+    },
+    {
+      "name": "from_status",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "to_status",
+      "type": "string"
+    },
+    {
+      "name": "shipment_reference",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "tracking_number",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "carrier_event_id",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "occurred_at",
+      "type": "string"
+    }
+  ]
+}

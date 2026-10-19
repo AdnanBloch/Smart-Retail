@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SmartRetail API</title>
+  <link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui.css">
+  <style>
+    #sr-auth {
+      position: fixed; top: 8px; right: 12px; z-index: 1000;
+      font: 13px/1.4 sans-serif; padding: 6px 10px; border-radius: 6px;
+      background: #f3f4f6; color: #374151; border: 1px solid #d1d5db;
+    }
+    #sr-auth.on { background: #ecfdf5; color: #065f46; border-color: #6ee7b7; }
+    #sr-auth a { margin-left: 8px; color: inherit; cursor: pointer; text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div id="sr-auth">Not signed in · run POST /api/v1/auth/login</div>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script>
+  <script>
+    // Docs-only convenience (RFC 0002 GW-15): a successful login or refresh made from this
+    // page authorizes it, and the access token is refreshed a minute before it expires.
+    // Identity rotates refresh tokens, so every refresh response replaces the stored one.
+    const SCHEME = "bearerAuth";
+    const KEY_REFRESH = "sr.docs.refresh";
+    const KEY_EXPIRES = "sr.docs.expiresAt";
+    const KEY_ACCESS = "sr.docs.access";
+    const badge = document.getElementById("sr-auth");
+    let timer = null;
+
+    const store = {
+      get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+      set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
+      del: (k) => { try { localStorage.removeItem(k); } catch { /* storage unavailable */ } },
+    };
+
+    function claims(token) {
+      try {
+        const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+        return JSON.parse(atob(part));
+      } catch { return {}; }
+    }
+
+    function render() {
+      const access = store.get(KEY_ACCESS);
+      const expiresAt = Number(store.get(KEY_EXPIRES) || 0);
+      if (!access) {
+        badge.className = "";
+        badge.textContent = "Not signed in · run POST /api/v1/auth/login";
+        return;
+      }
+      const c = claims(access);
+      const left = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+      const mmss = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+      badge.className = "on";
+      badge.textContent = `Signed in as ${c.role || "?"} (${(c.sub || "").slice(0, 8)}) · expires in ${mmss}`;
+      const out = document.createElement("a");
+      out.textContent = "Sign out";
+      out.onclick = signOut;
+      badge.appendChild(out);
+    }
+
+    function clearTokens() {
+      clearTimeout(timer);
+      [KEY_REFRESH, KEY_EXPIRES, KEY_ACCESS].forEach(store.del);
+      ui.authActions.logout([SCHEME]);
+      render();
+    }
+
+    function applyTokens(pair) {
+      const expiresAt = Date.now() + pair.expires_in * 1000;
+      ui.preauthorizeApiKey(SCHEME, pair.access_token);
+      store.set(KEY_ACCESS, pair.access_token);
+      store.set(KEY_REFRESH, pair.refresh_token);
+      store.set(KEY_EXPIRES, String(expiresAt));
+      clearTimeout(timer);
+      timer = setTimeout(refreshNow, Math.max(5000, expiresAt - Date.now() - 60000));
+      render();
+    }
+
+    async function refreshNow() {
+      const refresh_token = store.get(KEY_REFRESH);
+      if (!refresh_token) return clearTokens();
+      try {
+        const r = await fetch("/api/v1/auth/refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token }),
+        });
+        if (!r.ok) throw new Error(`refresh ${r.status}`);
+        applyTokens(await r.json());
+      } catch (err) {
+        console.warn("docs auto-refresh failed; signed out", err);
+        clearTokens();
+      }
+    }
+
+    async function signOut() {
+      const refresh_token = store.get(KEY_REFRESH);
+      if (refresh_token) {
+        await fetch("/api/v1/auth/logout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token }),
+        }).catch(() => {});
+      }
+      clearTokens();
+    }
+
+    function responseInterceptor(res) {
+      const path = new URL(res.url, location.href).pathname;
+      if (res.ok && /\/api\/v1\/auth\/(login|refresh)$/.test(path) && res.body && res.body.access_token) {
+        applyTokens(res.body);
+      } else if (res.ok && path.endsWith("/api/v1/auth/logout")) {
+        clearTokens();
+      }
+      return res;
+    }
+
+    const ui = SwaggerUIBundle({
+      url: "/openapi.json",
+      dom_id: "#swagger-ui",
+      layout: "BaseLayout",
+      deepLinking: true,
+      showExtensions: true,
+      showCommonExtensions: true,
+      persistAuthorization: true,
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+      responseInterceptor,
+      onComplete: () => { if (store.get(KEY_REFRESH)) refreshNow(); else render(); },
+    });
+    window.ui = ui;
+    window.refreshNow = refreshNow;
+    setInterval(render, 1000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,70 @@
+{
+  "type": "record",
+  "name": "Envelope",
+  "namespace": "smartretail.events",
+  "doc": "RFC 0000 \u00a73.1.2.4. Every message on every topic is this record with a topic-specific 'payload'. Money, payload timestamps and ids inside the payload are strings, exactly as the outbox stores them (PLT-D36).",
+  "fields": [
+    {
+      "name": "event_id",
+      "type": {
+        "type": "string",
+        "logicalType": "uuid"
+      }
+    },
+    {
+      "name": "event_type",
+      "type": "string"
+    },
+    {
+      "name": "event_version",
+      "type": "int"
+    },
+    {
+      "name": "occurred_at",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-micros"
+      }
+    },
+    {
+      "name": "producer",
+      "type": "string"
+    },
+    {
+      "name": "correlation_id",
+      "type": "string"
+    },
+    {
+      "name": "causation_id",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "actor_id",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "client_id",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "traceparent",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    }
+  ]
+}

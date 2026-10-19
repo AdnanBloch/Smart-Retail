@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartretail-analytics"
+version = "0.1.0"
+description = "SmartRetail analytics service (RFC 0008): event-fed metric rollups on MongoDB"
+requires-python = ">=3.12"
+dependencies = [
+    "smartretail-common",
+    "fastapi>=0.115,<0.116",
+    "uvicorn[standard]>=0.32,<0.35",
+    "pydantic>=2.10,<2.11",
+    "pydantic-settings>=2.6,<3",
+    "pyjwt[crypto]>=2.10,<2.11",
+    # AsyncMongoClient (ANL-D28): PyMongo's native asyncio API; Motor is end-of-life.
+    "pymongo>=4.13,<5",
+    "anyio>=4",
+]
+
+[tool.setuptools]
+# Dependencies only; the app/ source is copied into the image directly.
+packages = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+# Coverage gate (RFC 0001, review 2026-10-06 §5): `make cov`; CI fails below 85%.
+[tool.coverage.run]
+branch = true
+concurrency = ["thread"]
+source = ["app", "main"]
+# Process entry points: `python -m` wiring, exercised by the e2e suite.
+omit = ["app/v1/metrics/consumers/__main__.py", "app/v1/metrics/cli/__main__.py"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "if __name__ == .__main__.:"]
+
+[tool.coverage.html]
+directory = "htmlcov"

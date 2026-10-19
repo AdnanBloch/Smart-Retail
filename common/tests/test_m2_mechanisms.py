@@ -22,6 +22,8 @@ from smartretail_common.auth import (
     require_scope,
 )
 from smartretail_common.context import set_request_id
+from smartretail_common.events.registry import UnknownEvent
+from smartretail_common.events.serde import SerializationError
 from smartretail_common.idempotency import (
     IdempotencyKeyInvalid,
     IdempotencyKeyRequired,
@@ -63,23 +65,61 @@ class _Session:
         self.added.append(obj)
 
 
+def _payment_failed(order_id: uuid.UUID) -> dict[str, object]:
+    return {
+        "order_id": order_id,
+        "customer_id": uuid.uuid4(),
+        "reason": None,
+        "amount": Decimal("1.50"),
+        "currency": "USD",
+        "failed_at": "2026-10-14T00:00:00Z",
+    }
+
+
+def test_write_outbox_refuses_a_payload_that_does_not_match_its_schema() -> None:
+    # PLT-4: rejected inside the business transaction, never a poison row later.
+    session = _Session()
+    bad = {**_payment_failed(uuid.uuid4()), "amount": 1.5}  # a float, not a string
+    with pytest.raises(SerializationError):
+        write_outbox(
+            session,  # type: ignore[arg-type]
+            event_type="payment.failed",
+            aggregate_type="order",
+            aggregate_id=uuid.uuid4(),
+            payload=bad,
+        )
+    assert session.added == []
+
+
+def test_write_outbox_refuses_an_event_outside_the_catalogue() -> None:
+    with pytest.raises(UnknownEvent):
+        write_outbox(
+            _Session(),  # type: ignore[arg-type]
+            event_type="thing.happened",
+            aggregate_type="thing",
+            aggregate_id=uuid.uuid4(),
+            payload={},
+        )
+
+
 def test_write_outbox_adds_a_row_to_the_callers_transaction() -> None:
     set_request_id("req-1")
     session = _Session()
     aggregate = uuid.uuid4()
+    payload = _payment_failed(aggregate)
     event_id = write_outbox(
         session,  # type: ignore[arg-type]
-        event_type="thing.happened",
-        aggregate_type="thing",
+        event_type="payment.failed",
+        aggregate_type="order",
         aggregate_id=aggregate,
-        payload={"amount": Decimal("1.50"), "id": aggregate},
+        payload=payload,
         client_id="web",
     )
     [row] = session.added
     assert isinstance(row, OutboxEvent)
     assert row.event_id == event_id and row.aggregate_id == aggregate
     # Decimals and UUIDs become JSON strings (S2): never floats.
-    assert row.payload == {"amount": "1.50", "id": str(aggregate)}
+    assert row.payload["amount"] == "1.50" and row.payload["order_id"] == str(aggregate)
     assert row.correlation_id == "req-1" and row.client_id == "web"
     assert row.published_at is None
 
@@ -88,10 +128,10 @@ def test_outbox_correlation_id_can_be_explicit() -> None:
     session = _Session()
     write_outbox(
         session,  # type: ignore[arg-type]
-        event_type="e",
-        aggregate_type="a",
+        event_type="payment.failed",
+        aggregate_type="order",
         aggregate_id=uuid.uuid4(),
-        payload={},
+        payload=_payment_failed(uuid.uuid4()),
         correlation_id="wf-corr",
         causation_id="cause",
     )

@@ -19,6 +19,7 @@ CUSTOMER = "customer"
 CATALOG_WRITERS = frozenset({MERCHANT, ADMIN})
 STOCK_MANAGERS = frozenset({MERCHANT, ADMIN})
 ORDER_READERS = frozenset({CUSTOMER, ADMIN})
+ANALYTICS_READERS = frozenset({MERCHANT, ADMIN})
 
 
 class Policy(StrEnum):
@@ -37,6 +38,8 @@ class RouteRule:
     roles: frozenset[str] = field(default_factory=frozenset)
     # GW-14: the larger body limit and the `upload` timeout class.
     upload: bool = False
+    # GW-D30: the `stream` timeout class, for server-sent events.
+    stream: bool = False
 
     @property
     def segments(self) -> tuple[str, ...]:
@@ -68,9 +71,10 @@ def _r(
     roles: frozenset[str] | set[str] = frozenset(),
     *,
     upload: bool = False,
+    stream: bool = False,
 ) -> RouteRule:
     methods_set = frozenset(methods.split(","))
-    return RouteRule(pattern, methods_set, upstream, policy, frozenset(roles), upload)
+    return RouteRule(pattern, methods_set, upstream, policy, frozenset(roles), upload, stream)
 
 
 P = Policy
@@ -131,6 +135,43 @@ ROUTES: tuple[RouteRule, ...] = (
     _r("/api/v1/inventory/{id}", "PUT", "inventory", P.BEARER, STOCK_MANAGERS),
     _r("/api/v1/inventory/{id}/adjust", "POST", "inventory", P.BEARER, STOCK_MANAGERS),
     _r("/api/v1/inventory/{id}/movements", "GET", "inventory", P.BEARER, STOCK_MANAGERS),
+    # notification (RFC 0007 §3.1.2.1). The stream authenticates by single-use
+    # ticket in the service, so it is PUBLIC here (an EventSource cannot send headers).
+    _r("/api/v1/notifications", "GET", "notification", P.BEARER),
+    _r("/api/v1/notifications/unread-count", "GET", "notification", P.BEARER),
+    _r("/api/v1/notifications/read-all", "POST", "notification", P.BEARER),
+    _r("/api/v1/notifications/ack", "POST", "notification", P.BEARER),
+    _r("/api/v1/notifications/stream-ticket", "POST", "notification", P.BEARER),
+    _r("/api/v1/notifications/stream", "GET", "notification", P.PUBLIC, stream=True),
+    _r("/api/v1/notifications/admin", "GET", "notification", P.BEARER, {ADMIN}),
+    _r("/api/v1/notifications/{id}/read", "POST", "notification", P.BEARER),
+    # analytics (RFC 0008 §3.1.2.1)
+    _r("/api/v1/analytics/overview", "GET", "analytics", P.BEARER, {ADMIN}),
+    _r("/api/v1/analytics/orders", "GET", "analytics", P.BEARER, ANALYTICS_READERS),
+    _r("/api/v1/analytics/revenue", "GET", "analytics", P.BEARER, ANALYTICS_READERS),
+    _r("/api/v1/analytics/products/popular", "GET", "analytics", P.BEARER, ANALYTICS_READERS),
+    _r("/api/v1/analytics/inventory/stockouts", "GET", "analytics", P.BEARER, ANALYTICS_READERS),
+    _r("/api/v1/analytics/failures", "GET", "analytics", P.BEARER, {ADMIN}),
+    # assistant (RFC 0009 §3.1.2.1)
+    _r("/api/v1/search/semantic", "POST", "assistant", P.OPTIONAL),
+    _r("/api/v1/search/similar/{id}", "GET", "assistant", P.OPTIONAL),
+    _r("/api/v1/search/index/status", "GET", "assistant", P.BEARER, {ADMIN}),
+    _r("/api/v1/search/index/reindex", "POST", "assistant", P.BEARER, {ADMIN}),
+    _r("/api/v1/search/index/{id}", "GET", "assistant", P.BEARER, CATALOG_WRITERS),
+    _r("/api/v1/assistant/chat", "POST", "assistant", P.OPTIONAL, stream=True),
+    _r("/api/v1/assistant/chat/sync", "POST", "assistant", P.OPTIONAL),
+    _r("/api/v1/assistant/conversations", "GET", "assistant", P.BEARER, {CUSTOMER}),
+    _r("/api/v1/assistant/conversations/{id}", "GET,DELETE", "assistant", P.BEARER, {CUSTOMER}),
+    _r("/api/v1/assistant/messages/{id}/feedback", "POST", "assistant", P.BEARER, {CUSTOMER}),
+    _r("/api/v1/assistant/generate", "POST", "assistant", P.BEARER, {MERCHANT}, stream=True),
+    _r("/api/v1/assistant/generate/sync", "POST", "assistant", P.BEARER, {MERCHANT}),
+    _r("/api/v1/assistant/generate/bulk", "POST", "assistant", P.BEARER, {MERCHANT}),
+    _r("/api/v1/assistant/generate/jobs/{id}", "GET", "assistant", P.BEARER, {MERCHANT}),
+    _r("/api/v1/assistant/generate/jobs/{id}/cancel", "POST", "assistant", P.BEARER, {MERCHANT}),
+    _r("/api/v1/assistant/generations", "GET", "assistant", P.BEARER, {MERCHANT}),
+    _r("/api/v1/assistant/generations/{id}/applied", "POST", "assistant", P.BEARER, {MERCHANT}),
+    _r("/api/v1/assistant/usage", "GET", "assistant", P.BEARER),
+    _r("/api/v1/assistant/usage/admin", "GET", "assistant", P.BEARER, {ADMIN}),
     # Internal routes are service-to-service only and never routed (RFC 0000).
     _r("/internal/**", "GET,POST,PUT,PATCH,DELETE", "", P.BLOCKED),
 )

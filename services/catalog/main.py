@@ -9,10 +9,10 @@ from app.core.config import Settings, get_settings
 from app.core.db import create_database
 from app.core.logger import init_logger
 from app.health import routes as health
-from app.media.storage import MediaStorage, MinioStorage
-from app.products.publishing_repo import PublishStarter
 from app.router import router
-from app.workflows.client import TemporalPublishStarter
+from app.v1.media.storage import MediaStorage, MinioStorage
+from app.v1.products.publishing_repo import PublishStarter
+from app.v1.products.workflows.client import TemporalPublishStarter
 from smartretail_common.app import install_platform
 from smartretail_common.auth import JwtVerifier
 from smartretail_common.temporal import TemporalClientFactory

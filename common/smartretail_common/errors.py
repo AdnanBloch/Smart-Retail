@@ -155,7 +155,9 @@ _HTTP_SLUGS = {
 }
 
 
-def _is_connection_error(exc: BaseException) -> bool:
+def is_connection_error(exc: BaseException) -> bool:
+    """True for a store that is unreachable, not a request that is wrong: the
+    API maps it to 503 and the consumer base waits instead of dead-lettering (NTF-14)."""
     # asyncpg surfaces refused connections and DNS failures as OSError.
     if isinstance(exc, OperationalError | InterfaceError | OSError | TimeoutError):
         return True
@@ -199,7 +201,7 @@ def install_error_handlers(app: FastAPI) -> None:
         )
 
     async def on_unhandled(request: Request, exc: Exception) -> JSONResponse:
-        if _is_connection_error(exc):
+        if is_connection_error(exc):
             logger.warning("dependency unavailable", exc_info=exc)
             return problem_response(
                 status=503,

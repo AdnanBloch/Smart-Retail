@@ -1,10 +1,14 @@
 """Merged OpenAPI document and Swagger UI. Never proxied, exempt from auth."""
 
+from pathlib import Path
+
 from fastapi import APIRouter, Request
-from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse
 
 router = APIRouter(include_in_schema=False)
+
+# Swagger UI with auto-authorize on login and silent token refresh (see the page's script).
+_SWAGGER_HTML = (Path(__file__).parent / "swagger.html").read_text(encoding="utf-8")
 
 
 @router.get("/openapi.json")
@@ -14,4 +18,4 @@ async def get_openapi(request: Request) -> JSONResponse:
 
 @router.get("/docs")
 async def get_docs() -> HTMLResponse:
-    return get_swagger_ui_html(openapi_url="/openapi.json", title="SmartRetail API")
+    return HTMLResponse(_SWAGGER_HTML)

@@ -107,6 +107,26 @@ Goal IDs `G2` and `G4` are carried from [archive/0001](archive/0001-foundation-a
 
 ### 3.1. Specification
 
+**Diagram index.** Every diagram in this RFC, by kind.
+
+| Kind | Diagram | Section |
+| --- | --- | --- |
+| Component | Components and their callers | [§3.1.1.1](#3111-responsibility-and-boundaries) |
+| Flow | Verifier key resolution by `kid` | [§3.1.2.1](#3121-endpoints) |
+| Flow | Refresh decision | [§3.1.2.1](#3121-endpoints) |
+| Flow | `PATCH /users/{user_id}` rules | [§3.1.2.1](#3121-endpoints) |
+| Sequence | Signing-key rotation | [§3.1.1.2](#3112-domain-model) |
+| Sequence | Outbox publication of identity events | [§3.1.1.4](#3114-workflows-and-async-jobs) |
+| Sequence | Registration | [§3.1.2.1](#3121-endpoints) |
+| Sequence | Login | [§3.1.2.1](#3121-endpoints) |
+| Sequence | Refresh | [§3.1.2.1](#3121-endpoints) |
+| Sequence | Merchant status change | [§3.1.2.1](#3121-endpoints) |
+| Sequence | Service token (client credentials) | [§3.1.2.1](#3121-endpoints) |
+| State | `MerchantStatus` | [§3.1.1.3](#3113-state-machines) |
+| State | `RefreshSession` lifecycle | [§3.1.1.3](#3113-state-machines) |
+| Data | `identity_db` store overview and event flow | [§3.1.3](#store-overview--identity_db) |
+| Data | `erDiagram` of `users`, `merchant_profiles`, `refresh_sessions` | [§3.1.3](#store-overview--identity_db) |
+
 #### 3.1.1. Architectural changes
 
 ##### 3.1.1.1. Responsibility and boundaries
@@ -270,7 +290,7 @@ There is no `consumers/` package: `identity` consumes no events (§3.1.2.4).
 | `UserRole` | `customer`, `merchant`, `admin` | `users.role` |
 | `MerchantStatus` | `pending`, `approved`, `suspended` | `merchant_profiles.status` |
 
-Non-persisted vocabularies (plain `StrEnum`, not columns): `TokenType` — `access`, `service` (the `typ` claim, §3.1.2.1), in `app/auth/enums.py`; `LoginOutcome` — `success`, `invalid_credentials`, `inactive`, `suspended`, `rate_limited` (metric label only).
+Non-persisted vocabularies (plain `StrEnum`, not columns): `TokenType` — `access`, `service` (the `typ` claim, §3.1.2.1), in `app/v1/auth/enums.py`; `LoginOutcome` — `success`, `invalid_credentials`, `inactive`, `suspended`, `rate_limited` (metric label only).
 
 **Credentials — Argon2id parameters (IDN-1).** [archive/0001](archive/0001-foundation-and-core-services.md) §6.2 specifies "Argon2id with library defaults". They are pinned here explicitly so a library upgrade cannot silently change them; the values are argon2-cffi 23.x's defaults, which are the RFC 9106 low-memory profile:
 
@@ -365,7 +385,7 @@ sequenceDiagram
 
 ##### 3.1.1.3. State machines
 
-**`MerchantStatus`** — `merchant_profiles.status`. Initial state `pending` (column default). The transition table `MERCHANT_TRANSITIONS` in `app/merchants/utils.py` is authoritative (S4); any pair not listed → `409` problem `…/errors/invalid-merchant-transition`.
+**`MerchantStatus`** — `merchant_profiles.status`. Initial state `pending` (column default). The transition table `MERCHANT_TRANSITIONS` in `app/v1/merchants/utils.py` is authoritative (S4); any pair not listed → `409` problem `…/errors/invalid-merchant-transition`.
 
 ```mermaid
 stateDiagram-v2
@@ -759,7 +779,7 @@ flowchart TD
 | `GET` | `/api/v1/merchants` | bearer | Query: `status`, `q`, `limit`, `offset` — the approval queue is `?status=pending` (IDN-14) | `200` page envelope of profiles | `403` |
 | `POST` | `/api/v1/merchants/{merchant_id}/status` | bearer | `{status, reason?}` | `200` profile. Emits `identity.merchant.status_changed` unless a no-op | `403`; `404`; `409` `…/errors/invalid-merchant-transition`; `422` |
 
-`/me` is declared before `/{merchant_id}` in `merchants/v1/routes.py` so `me` is never parsed as an id. `slug` is derived from `business_name` at creation (lower-case, ASCII-folded, hyphenated) with a `-2`, `-3`… suffix on collision; unique by index.
+`/me` is declared before `/{merchant_id}` in `v1/merchants/routes.py` so `me` is never parsed as an id. `slug` is derived from `business_name` at creation (lower-case, ASCII-folded, hyphenated) with a `-2`, `-3`… suffix on collision; unique by index.
 
 `catalog` does **not** call `GET /merchants/{merchant_id}` on its read path — that would be a second synchronous cross-service call, and A13/R5 allow exactly one (`order → catalog`). Clients call it, or `catalog` relies on its event-fed projection.
 
@@ -1108,7 +1128,7 @@ This register lists every significant `identity` decision. Where a decision alre
 | IDN-D13 | Registration keeps `409` on a duplicate email | The honest error a user needs; without email delivery there is no "check your email" alternative ([§3.3](#33-tradeoffs)) | Always-`202` flow: needs email delivery (IDN-Q4) | Email delivery exists |
 | IDN-D14 | `admin` is never self-assignable: seed or promotion by an admin only; the last active admin cannot be demoted or deactivated (= I3, IDN-8) | Every other privilege boundary is only as strong as this one ([§3.2.2](#322-rationale-in-detail)) | Self-chosen role at registration: anonymous path to `admin` | — |
 | IDN-D15 | `MerchantStatus` = `pending` → `approved` / `suspended`, with suspension as the rejection path and no `rejected` value; transitions only via `MERCHANT_TRANSITIONS`; a repeat is a no-op | `pending` is only ever initial; one table is the single source of truth (S4) ([§3.1.1.3](#3113-state-machines)) | Native Postgres `ENUM` or `CHECK`: no inverse for `ADD VALUE`, and weaker than the table (Alt 9) | A real rejection state is needed by the product |
-| IDN-D16 | Suspension refuses token issuance (login `403`, refresh `401`) and revokes sessions; the status is also a claim and an event | Two freshness needs: the claim gates writes for ≤ 15 min, the event-fed `catalog` projection hides products at once (archive/0003 Q6) ([§3.2.2](#322-rationale-in-detail)) | `catalog` calling `GET /merchants/<built-in function id>`: a second synchronous cross-service call, forbidden by A13/R5 | — |
+| IDN-D16 | Suspension refuses token issuance (login `403`, refresh `401`) and revokes sessions; the status is also a claim and an event | Two freshness needs: the claim gates writes for ≤ 15 min, the event-fed `catalog` projection hides products at once (archive/0003 Q6) ([§3.2.2](#322-rationale-in-detail)) | `catalog` calling `GET /merchants/{id}`: a second synchronous cross-service call, forbidden by A13/R5 | — |
 | IDN-D17 | A role change creates a `pending` profile (to merchant) or suspends it (away from merchant), and always revokes the user's sessions (= IDN-7) | Keeps I5 (every merchant has a profile) and makes the new role take effect at the next login ([§3.1.2.1](#3121-endpoints)) | Deleting the profile: violates S5 soft-delete | A role-change event gets a consumer (IDN-Q6) |
 | IDN-D18 | Non-approved merchants return `404` on the public profile route to non-owners (= IDN-13) | The profile route must not reveal pending or suspended merchants ([§3.1.2.1](#3121-endpoints)) | `200` with status: exposes unapproved merchants publicly | — |
 | IDN-D19 | Two events, `user.registered` and `merchant.status_changed`, written through `identity_db.outbox`; `identity` consumes nothing (= A10, IDN-15) | The event is part of the state-change transaction, so it cannot be lost ([§3.1.2.3](#3123-events-produced)) | Publish from the handler after commit: a crash loses the event (Alt 12) | A consumer needs a new identity fact (IDN-Q6) |
@@ -1116,8 +1136,9 @@ This register lists every significant `identity` decision. Where a decision alre
 | IDN-D21 | `merchant` is not its own service, and `identity` is not split into `auth` and `user-profile` | Profiles share the `users` aggregate and its invariants; a split puts a distributed transaction inside registration ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Split services (Alt 8, ownership-test row 17) | Merchant data gains its own invariants or load profile |
 | IDN-D22 | Login rate limits (5/min per IP and per email) are enforced at the gateway and fail open | Edge limiting belongs to the gateway; availability over protection is a platform decision; Argon2id cost is the floor ([§6.2](#62-security-considerations)) | Limiting inside `identity` only: kept as the fallback for the per-email half (IDN-Q8) | IDN-Q8 is resolved the other way |
 | IDN-D23 | Expired-session sweep deletes rows 30 days past expiry or revocation; unique index on `token_hash` (= IDN-9, IDN-16) | Bounds `refresh_sessions` growth while keeping reuse detection for late replays; every refresh looks up by hash ([§3.1.1.4](#3114-workflows-and-async-jobs), [§3.1.3](#313-dataschema-changes)) | No sweep: unbounded table. Immediate delete: replays become "unknown" instead of reuse | — |
-| IDN-D24 | Entity-first layout: `auth/`, `users/`, `merchants/` each with models, repos and `v1/{routes,schemas}.py`; shared enums in `core/enums.py` | Only the HTTP contract can be versioned; one folder per entity keeps its rules together ([§3.1.1.1](#3111-responsibility-and-boundaries); [review §3](../reviews/2026-10-06-mentor-review.md#3-entity-first-service-layout-with-versions)) | Version-first `app/v1/<entity>/`: v2 would duplicate the ORM. Hybrid split tree: an entity in two places | — |
+| IDN-D24 | Entity-first layout: `auth/`, `users/`, `merchants/` each with models, repos and `v1/{routes,schemas}.py`; shared enums in `core/enums.py` | Only the HTTP contract can be versioned; one folder per entity keeps its rules together ([§3.1.1.1](#3111-responsibility-and-boundaries); [review §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions)). *Changed after [mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) — previously layer-first: `app/api/v1/` handlers, `core/`, `domain/` enums and transition table.* | Version-first `app/v1/<entity>/`: v2 would duplicate the ORM. Hybrid split tree: an entity in two places | — |
 | IDN-D25 | `SERVICE_CLIENTS` accepts a `sha256:<hex>` digest of the client secret as well as an Argon2id hash; `make keys` writes a random 256-bit secret and its digest (Milestone 2 implementation) | A slow KDF protects low-entropy passwords; a 256-bit random secret cannot be brute-forced whatever the hash, and a digest lets `make keys` produce it with `openssl` alone instead of a Python toolchain on the host | Argon2id only (needs `argon2` wherever the secret is generated). Plaintext secrets in config (contradicts IDN-4) | Client secrets become human-chosen |
+| IDN-D26 | identity gets its `outbox` (migration `0006_outbox`) and writes `identity.user.registered` in the registration transaction, with the registering device's validated `X-Client-Id` (IDN-T4); `identity.merchant.status_changed` stays deferred until its writer, the merchant status endpoint (IDN-T5), exists (Milestone 3 implementation) | notification's welcome message and analytics' customer and merchant counts consume the registration fact. Emitting status changes from the role-change path alone would put a partial fact stream on a compacted topic | Notification polling identity (R5 forbids it). Emitting `merchant.status_changed` now from one of its two writers (an incomplete fact history) | IDN-T5 is built |
 
 #### 3.2.2. Rationale in detail
 
@@ -1447,12 +1468,24 @@ Target: 100% of the role matrix, ~80% on the repos (`*_repo.py`, `repo.py`). Int
 - **On sources that disagreed.** (1) Internal callers: archive/0000 said user tokens are forwarded and no separate service trust model is needed; archive/0002 and archive/0006 §3.1.2 introduced client-credentials service tokens. Resolved in favour of the latter, which is the amendment archive/0000 itself anticipated; forwarding the user's token is kept for request-scoped synchronous calls. (2) Verifier keys: archive/0001 Q4 put the public key in each service's environment, archive/0000 serves JWKS; both are kept, environment as fallback. (3) Reuse detection: archive/0001 says "revokes the whole session family", but archive/0006's `refresh_sessions` has no family column; the table is copied exactly and reuse revokes all of the user's sessions, with the family column proposed as IDN-Q2.
 - **On what is not specified by any source and is proposed here.** Event payload fields, the service-token endpoint path and scopes, the merchant status endpoint, JWKS cache headers, key rotation procedure, Argon2id numeric parameters (the source said "library defaults"), and the identity metric names. Each is marked with an IDN ID so a reviewer can object to it specifically.
 - **On domain wording.** The source task list arrived phrased as "User & Course management" with "student / instructor" roles; Part A specifies retail commerce, so *student / instructor* read as *customer / merchant*, with `admin` as the third role Part A §1 requires.
+- **Amendment log.**
+
+  | Date | Section | Change | Reason |
+  | --- | --- | --- | --- |
+  | Oct 11, 2026 | All | References to the shared package changed from `libs/common` to `common` | [Mentor review 2026-10-06 §1](../reviews/mentor-reviews.md#1-shared-package-folder) |
+  | Oct 11, 2026 | §3.2.1 | Added the decision register (IDN-D1–IDN-D24); IDN-1…IDN-17 and platform IDs stay canonical | [Mentor review 2026-10-06 §2](../reviews/mentor-reviews.md#2-a-reason-for-every-decision) |
+  | Oct 11, 2026 | §3.1.1.1, §3.2.1 | Layer-first module layout replaced by entity folders `auth/`, `users/`, `merchants/` with `v1/` inside each (IDN-D24) | [Mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) |
+  | Oct 11, 2026 | §3.1.1.1–§3.1.1.4, §3.1.2.1, §3.1.3 | ASCII merchant state machine, login sequence and store overview converted to Mermaid; added the component diagram, `erDiagram`, refresh-session state diagram, key-rotation, outbox, registration, refresh, merchant-status and service-token sequences, and the key-resolution, refresh and user-patch flowcharts | [Mentor review 2026-10-06 §4](../reviews/mentor-reviews.md#4-diagrams) |
+  | Oct 11, 2026 | §3.2.1 | Added IDN-D25: `SERVICE_CLIENTS` accepts a `sha256:` digest of a random client secret | Milestone 2 implementation (README *Milestone 2 decisions and deviations*) |
+  | Oct 12, 2026 | §3.1 | Added the diagram index | [Mentor review 2026-10-12 §4](../reviews/mentor-reviews.md#4-diagram-coverage-per-service) |
+  | Oct 12, 2026 | §3.2.1, §11 | The row changed by a review (IDN-D24) names the review and the previous decision; this amendment log added | [Mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review) |
+  | Oct 15, 2026 | §3.1.2.3, §3.1.3, §3.2.1 | IDN-D26: outbox and `identity.user.registered` delivered; `merchant.status_changed` deferred | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
 
 ---
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against a numbered item — a decision (A*, 0001-A5, IDN-*, or a register row IDN-D*), an invariant (I1–I11), an open question (Q* with its source, IDN-Q*), a row of the role matrix, or a rejected alternative in §5 — so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against a numbered item — a decision (A*, 0001-A5, IDN-*, or a register row IDN-D1–IDN-D25), an invariant (I1–I11), an open question (Q* with its source, IDN-Q*), a row of the role matrix, or a rejected alternative in §5 — so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

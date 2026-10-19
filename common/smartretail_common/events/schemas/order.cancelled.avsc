@@ -1,0 +1,76 @@
+{
+  "type": "record",
+  "name": "OrderCancelled",
+  "namespace": "smartretail.events.payload",
+  "fields": [
+    {
+      "name": "order_id",
+      "type": "string"
+    },
+    {
+      "name": "customer_id",
+      "type": "string"
+    },
+    {
+      "name": "order_number",
+      "type": "string"
+    },
+    {
+      "name": "cancelled_by",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "reason",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "stage",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "payment_status",
+      "type": "string"
+    },
+    {
+      "name": "reservations_released",
+      "type": "boolean"
+    },
+    {
+      "name": "items",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "OrderCancelledItem",
+          "namespace": "smartretail.events.payload",
+          "fields": [
+            {
+              "name": "variant_id",
+              "type": "string"
+            },
+            {
+              "name": "quantity",
+              "type": "long"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "cancelled_at",
+      "type": "string"
+    }
+  ]
+}

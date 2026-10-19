@@ -1,0 +1,26 @@
+{
+  "_comment": "The event catalogue as data (RFC 0000 §3.1.2.3, PLT-26). One entry per topic. 'schema' is the payload schema file under schemas/, or null for an event with no producer yet (no schema registered; the outbox writer refuses it). Data, not Python, so event names never become string constants in common (R8).",
+  "prefix": "smartretail",
+  "partitions": 3,
+  "replication_factor": 1,
+  "retention_ms": 604800000,
+  "dlq_retention_ms": 2592000000,
+  "events": [
+    {"type": "identity.user.registered",         "key": "user_id",         "cleanup": "delete",  "schema": "identity.user.registered.avsc"},
+    {"type": "identity.merchant.status_changed", "key": "user_id",         "cleanup": "compact", "schema": null},
+    {"type": "catalog.product.published",        "key": "product_id",      "cleanup": "compact", "schema": "catalog.product.published.avsc"},
+    {"type": "catalog.product.updated",          "key": "product_id",      "cleanup": "delete",  "schema": "catalog.product.updated.avsc"},
+    {"type": "catalog.product.unpublished",      "key": "product_id",      "cleanup": "delete",  "schema": "catalog.product.unpublished.avsc"},
+    {"type": "order.created",                    "key": "order_id",        "cleanup": "delete",  "schema": "order.created.avsc"},
+    {"type": "order.confirmed",                  "key": "order_id",        "cleanup": "delete",  "schema": "order.confirmed.avsc"},
+    {"type": "order.failed",                     "key": "order_id",        "cleanup": "delete",  "schema": "order.failed.avsc"},
+    {"type": "order.cancelled",                  "key": "order_id",        "cleanup": "delete",  "schema": "order.cancelled.avsc"},
+    {"type": "payment.succeeded",                "key": "order_id",        "cleanup": "delete",  "schema": "payment.succeeded.avsc"},
+    {"type": "payment.failed",                   "key": "order_id",        "cleanup": "delete",  "schema": "payment.failed.avsc"},
+    {"type": "shipment.status_changed",          "key": "order_id",        "cleanup": "delete",  "schema": "shipment.status_changed.avsc"},
+    {"type": "inventory.reserved",               "key": "variant_id",      "cleanup": "delete",  "schema": "inventory.reserved.avsc"},
+    {"type": "inventory.released",               "key": "variant_id",      "cleanup": "delete",  "schema": "inventory.released.avsc"},
+    {"type": "inventory.stockout",               "key": "variant_id",      "cleanup": "delete",  "schema": "inventory.stockout.avsc"},
+    {"type": "assistant.interaction",            "key": "conversation_id", "cleanup": "delete",  "schema": "assistant.interaction.avsc"}
+  ]
+}

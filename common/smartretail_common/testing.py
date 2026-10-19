@@ -110,6 +110,28 @@ def mint_service_token(
 DEFAULT_TEST_ADMIN_URL = "postgresql://postgres:postgres@127.0.0.1:55432/postgres"
 
 
+DEFAULT_TEST_REDIS_URL = "redis://127.0.0.1:56379/0"
+
+
+def test_redis_url() -> str:
+    import os
+
+    return os.environ.get("TEST_REDIS_URL", DEFAULT_TEST_REDIS_URL)
+
+
+def redis_reachable(url: str | None = None) -> bool:
+    """For integration suites that skip without ``make test-db`` (which starts Redis too)."""
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url or test_redis_url())
+    try:
+        with socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port or 6379), 1):
+            return True
+    except OSError:
+        return False
+
+
 def test_admin_url() -> str:
     import os
 

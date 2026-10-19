@@ -20,6 +20,10 @@ class Settings(BaseServiceSettings, DatabaseSettings):
     inventory_sweeper_inprocess: bool = False
     inventory_sweeper_interval_seconds: float = 60
 
+    # The event pipeline (RFC 0001 §3.1.1.6); used by the consumer process.
+    kafka_bootstrap_servers: str = "kafka:9092"
+    schema_registry_url: str = "http://schema-registry:8081"
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -216,6 +216,9 @@ async def test_health_and_ready(client, upstreams) -> None:
         "catalog": "unreachable",
         "order": "ok",
         "inventory": "ok",
+        "notification": "ok",
+        "analytics": "ok",
+        "assistant": "ok",
     }
 
 
@@ -230,7 +233,11 @@ async def test_aggregated_openapi(client, upstreams) -> None:
     assert ref == "#/components/schemas/catalog.CatalogOut"
     assert doc["paths"]["/api/v1/catalog-thing"]["get"]["tags"][0] == "catalog"
     assert "x-upstreams-unavailable" not in doc
-    assert (await client.get("/docs")).status_code == 200
+    assert doc["components"]["securitySchemes"]["bearerAuth"]["scheme"] == "bearer"
+    assert {"bearerAuth": []} in doc["security"]
+    docs = await client.get("/docs")
+    assert docs.status_code == 200
+    assert "/openapi.json" in docs.text and "responseInterceptor" in docs.text
 
 
 async def test_openapi_degrades_when_upstream_down(client, upstreams) -> None:
@@ -238,3 +245,51 @@ async def test_openapi_degrades_when_upstream_down(client, upstreams) -> None:
     r = await client.get("/openapi.json")
     assert r.status_code == 200
     assert r.json()["x-upstreams-unavailable"] == ["identity"]
+
+
+# --- timeout classes and X-Client-Id (GW-14, GW-D30, GW-D31) ------------------------
+
+
+def _read_timeout(upstream) -> float:
+    return upstream.last.extensions["timeout"]["read"]
+
+
+async def test_each_route_gets_its_timeout_class(client, upstreams, settings) -> None:
+    await client.get("/api/v1/products")
+    assert _read_timeout(upstreams["catalog"]) == settings.gateway_upstream_read_timeout_s
+    await client.get("/api/v1/notifications/stream?ticket=t")
+    assert _read_timeout(upstreams["notification"]) == settings.gateway_stream_read_timeout_s
+    await client.post("/api/v1/assistant/chat", json={"message": "hi"})
+    assert _read_timeout(upstreams["assistant"]) == settings.gateway_stream_read_timeout_s
+
+
+async def test_the_upload_timeout_now_reaches_the_upstream(client, upstreams, settings) -> None:
+    await client.post(
+        "/api/v1/products/p/media/upload",
+        content=b"x",
+        headers={**token("merchant", extra={"merchant_id": "m"}), "Content-Type": "image/png"},
+    )
+    assert _read_timeout(upstreams["catalog"]) == settings.gateway_upload_read_timeout_s
+
+
+@pytest.mark.parametrize(
+    ("sent", "forwarded"),
+    [("web-tab-0001", "web-tab-0001"), ("bad id!", None), ("short", None), ("x" * 65, None)],
+)
+async def test_a_malformed_client_id_is_dropped_not_rejected(
+    client, upstreams, sent, forwarded
+) -> None:
+    r = await client.get("/api/v1/products", headers={"X-Client-Id": sent})
+    assert r.status_code == 200
+    assert upstreams["catalog"].last.headers.get("x-client-id") == forwarded
+
+
+async def test_new_service_routes_reach_their_upstreams(client, upstreams) -> None:
+    admin = token("admin")
+    merchant = token("merchant", extra={"merchant_id": "m"})
+    assert (await client.get("/api/v1/analytics/overview", headers=admin)).status_code == 200
+    assert (await client.get("/api/v1/analytics/overview", headers=merchant)).status_code == 403
+    assert (await client.get("/api/v1/analytics/revenue", headers=merchant)).status_code == 200
+    assert (await client.get("/api/v1/notifications", headers=merchant)).status_code == 200
+    assert (await client.post("/api/v1/search/semantic", json={})).status_code == 200
+    assert upstreams["assistant"].last.url.path == "/api/v1/search/semantic"

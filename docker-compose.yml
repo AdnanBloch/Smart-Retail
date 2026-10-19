@@ -2,6 +2,12 @@
 #   core      postgres, identity, catalog, gateway                        (Milestone 1)
 #   workflow  temporal, temporal-ui, minio, inventory, order,
 #             catalog-worker, order-worker                                (Milestone 2)
+#   events    kafka, schema-registry, rabbitmq, outbox-relay,
+#             inventory-consumer, catalog-celery, inventory-celery,
+#             order-celery, redis, notification, notification-consumer,
+#             notification-celery, mongo, analytics, analytics-consumer,
+#             analytics-celery                                            (Milestone 3)
+#   ai        assistant, indexer-worker, assistant-celery                 (Milestone 3)
 # Host-bound ports, all on 127.0.0.1: gateway 8000, Temporal UI 8080, MinIO
 # console 9001. Everything else is reachable on the Compose network only.
 
@@ -27,6 +33,45 @@ x-workflow-env: &workflow-env
   IDENTITY_TOKEN_URL: http://identity:8001/api/v1/auth/token
   SERVICE_CLIENT_ID: temporal-worker
   SERVICE_CLIENT_SECRET: ${SERVICE_CLIENT_SECRET:?run make keys}
+
+# The event pipeline and Celery (RFC 0001 §3.1.1.4–§3.1.1.7).
+x-events-env: &events-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  SCHEMA_REGISTRY_URL: http://schema-registry:8081
+  CELERY_BROKER_URL: amqp://${RABBITMQ_DEFAULT_USER:-smartretail}:${RABBITMQ_DEFAULT_PASS:-change-me-rabbitmq-password}@rabbitmq:5672/smartretail
+  REDIS_URL: redis://redis:6379/0
+
+x-notification-env: &notification-env
+  SERVICE_NAME: notification
+  PORT: "8005"
+  DATABASE_URL: postgresql+asyncpg://notification_role:${NOTIFICATION_DB_PASSWORD:-notification_local}@postgres:5432/notification_db
+
+x-analytics-env: &analytics-env
+  SERVICE_NAME: analytics
+  PORT: "8006"
+  ANALYTICS_MONGO_URI: mongodb://analytics:${ANALYTICS_MONGO_PASSWORD:-analytics_local}@mongo:27017/analytics_db?replicaSet=rs0
+  ANALYTICS_MONGO_DB: analytics_db
+  ANALYTICS_REPORTING_CURRENCY: ${ANALYTICS_REPORTING_CURRENCY:-USD}
+
+x-assistant-env: &assistant-env
+  SERVICE_NAME: assistant
+  PORT: "8007"
+  DATABASE_URL: postgresql+asyncpg://assistant_role:${ASSISTANT_DB_PASSWORD:-assistant_local}@postgres:5432/assistant_db
+  CATALOG_BASE_URL: http://catalog:8002
+  INVENTORY_BASE_URL: http://inventory:8004
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hashing}
+  VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+  LLM_PROVIDER: ${LLM_PROVIDER:-scripted}
+  LLM_MODEL: ${LLM_MODEL:-claude-sonnet-5-5}
+  LLM_CLASSIFIER_MODEL: ${LLM_CLASSIFIER_MODEL:-claude-haiku-5-5}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  DAILY_TOKEN_BUDGET_USER: ${DAILY_TOKEN_BUDGET_USER:-50000}
+  DAILY_TOKEN_BUDGET_GLOBAL: ${DAILY_TOKEN_BUDGET_GLOBAL:-2000000}
+
+# Consumers and Celery workers run one message or task at a time: a small pool.
+x-background-pool: &background-pool
+  DB_POOL_SIZE: "2"
+  DB_MAX_OVERFLOW: "2"
 
 x-catalog-env: &catalog-env
   SERVICE_NAME: catalog
@@ -55,6 +100,10 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     profiles: [core]
+    # Every service, worker, consumer and Celery process holds its own pool;
+    # the default 100 runs out under a checkout burst once the events profile
+    # is up. Background processes use small pools (x-background-pool).
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -62,7 +111,10 @@ services:
       CATALOG_DB_PASSWORD: ${CATALOG_DB_PASSWORD:-catalog_local}
       ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD:-order_local}
       INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD:-inventory_local}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:-notification_local}
+      ASSISTANT_DB_PASSWORD: ${ASSISTANT_DB_PASSWORD:-assistant_local}
       TEMPORAL_DB_PASSWORD: ${TEMPORAL_DB_PASSWORD:-temporal_local}
+      OUTBOX_RELAY_DB_PASSWORD: ${OUTBOX_RELAY_DB_PASSWORD:-outbox_relay_local}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./ops/postgres/init:/docker-entrypoint-initdb.d:ro
@@ -142,6 +194,9 @@ services:
       UPSTREAM_CATALOG_URL: http://catalog:8002
       UPSTREAM_ORDER_URL: http://order:8003
       UPSTREAM_INVENTORY_URL: http://inventory:8004
+      UPSTREAM_NOTIFICATION_URL: http://notification:8005
+      UPSTREAM_ANALYTICS_URL: http://analytics:8006
+      UPSTREAM_ASSISTANT_URL: http://assistant:8007
       GATEWAY_CORS_ALLOW_ORIGINS: ${GATEWAY_CORS_ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
       GATEWAY_PUBLIC_URL: ${GATEWAY_PUBLIC_URL:-http://localhost:8000}
       GATEWAY_MAX_BODY_BYTES: ${GATEWAY_MAX_BODY_BYTES:-1048576}
@@ -225,8 +280,9 @@ services:
       SERVICE_NAME: inventory
       PORT: "8004"
       DATABASE_URL: postgresql+asyncpg://inventory_role:${INVENTORY_DB_PASSWORD:-inventory_local}@postgres:5432/inventory_db
-      # The expiry sweeper runs in-process until Celery Beat exists (INV-10).
-      INVENTORY_SWEEPER_INPROCESS: "true"
+      # With the events profile, Celery Beat sweeps (inventory-celery). Set true
+      # to run the in-process sweeper instead; both at once is also safe (INV-10).
+      INVENTORY_SWEEPER_INPROCESS: ${INVENTORY_SWEEPER_INPROCESS:-false}
     volumes:
       - *public-key
     depends_on:
@@ -261,9 +317,13 @@ services:
       context: .
       dockerfile: services/catalog/Dockerfile
     profiles: [workflow]
-    command: ["python", "-m", "app.workflows.worker"]
+    command: ["python", "-m", "app.v1.products.workflows.worker"]
     environment:
       <<: [*service-env, *catalog-env, *workflow-env]
+      # process_media runs on catalog-celery when the events profile is up (0002-Q7);
+      # set false to run it inline in this worker.
+      CATALOG_MEDIA_VIA_CELERY: ${CATALOG_MEDIA_VIA_CELERY:-true}
+      CELERY_BROKER_URL: amqp://${RABBITMQ_DEFAULT_USER:-smartretail}:${RABBITMQ_DEFAULT_PASS:-change-me-rabbitmq-password}@rabbitmq:5672/smartretail
     volumes:
       - *public-key
     restart: on-failure
@@ -282,7 +342,7 @@ services:
       context: .
       dockerfile: services/order/Dockerfile
     profiles: [workflow]
-    command: ["python", "-m", "app.workflows.worker"]
+    command: ["python", "-m", "app.v1.orders.workflows.worker"]
     environment:
       <<: [*service-env, *order-env, *workflow-env]
     volumes:
@@ -296,6 +356,438 @@ services:
       temporal:
         condition: service_healthy
 
+  # --- events profile (Milestone 3) -----------------------------------------
+
+  kafka:
+    # KRaft single node (no ZooKeeper). Never published to the host.
+    image: confluentinc/cp-kafka:7.7.1
+    profiles: [events]
+    environment:
+      CLUSTER_ID: fVtABNK1VDW2YKExuHGtHA  # any 22-char base64 UUID; fixed so the volume is reusable
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # A typo'd topic name fails instead of creating a topic (`make topics` creates them).
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_LOG_RETENTION_HOURS: "168"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    profiles: [events]
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  rabbitmq:
+    # Celery's broker only, not an event bus (RFC 0001 §3.1.1.7).
+    image: rabbitmq:3.13-management
+    profiles: [events]
+    ports:
+      - "127.0.0.1:15672:15672"  # management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-smartretail}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-change-me-rabbitmq-password}
+      RABBITMQ_DEFAULT_VHOST: smartretail
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  redis:
+    # Fast, disposable state only — never a source of truth (RFC 0001 §3.1.1.8).
+    image: redis:7.4
+    profiles: [events]
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "256mb",
+              "--maxmemory-policy", "volatile-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  outbox-relay:
+    # One process, one loop per producing database (PLT-2), as role outbox_relay (PLT-3).
+    build:
+      context: .
+      dockerfile: workers/outbox_relay/Dockerfile
+    profiles: [events]
+    environment:
+      <<: *events-env
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      OUTBOX_SOURCES: >-
+        identity=postgresql+asyncpg://outbox_relay:${OUTBOX_RELAY_DB_PASSWORD:-outbox_relay_local}@postgres:5432/identity_db,
+        catalog=postgresql+asyncpg://outbox_relay:${OUTBOX_RELAY_DB_PASSWORD:-outbox_relay_local}@postgres:5432/catalog_db,
+        order=postgresql+asyncpg://outbox_relay:${OUTBOX_RELAY_DB_PASSWORD:-outbox_relay_local}@postgres:5432/order_db,
+        inventory=postgresql+asyncpg://outbox_relay:${OUTBOX_RELAY_DB_PASSWORD:-outbox_relay_local}@postgres:5432/inventory_db,
+        assistant=postgresql+asyncpg://outbox_relay:${OUTBOX_RELAY_DB_PASSWORD:-outbox_relay_local}@postgres:5432/assistant_db
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD-SHELL", "kill -0 1"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+
+  inventory-consumer:
+    # Consumer group `inventory`: catalog.product.published, order.cancelled (RFC 0006 §3.1.2.4).
+    build:
+      context: .
+      dockerfile: services/inventory/Dockerfile
+    profiles: [events]
+    command: ["python", "-m", "app.core.consumer"]
+    environment:
+      <<: [*service-env, *events-env, *background-pool]
+      SERVICE_NAME: inventory
+      DATABASE_URL: postgresql+asyncpg://inventory_role:${INVENTORY_DB_PASSWORD:-inventory_local}@postgres:5432/inventory_db
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD-SHELL", "kill -0 1"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+
+  catalog-celery:
+    # catalog's Celery worker: queue catalog.media (process_media). No Beat.
+    build:
+      context: .
+      dockerfile: services/catalog/Dockerfile
+    profiles: [events]
+    command: ["celery", "-A", "app.core.celery_app", "worker", "-Q", "catalog.media",
+              "--concurrency", "2", "--loglevel", "INFO"]
+    environment:
+      <<: [*service-env, *catalog-env, *events-env, *background-pool]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      # A broadcast ping plus interpreter start-up: more than the 3 s default.
+      interval: 30s
+      timeout: 20s
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -d celery@$$HOSTNAME -t 10 >/dev/null"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  inventory-celery:
+    # inventory's Celery worker with Beat embedded: queue inventory.maintenance.
+    build:
+      context: .
+      dockerfile: services/inventory/Dockerfile
+    profiles: [events]
+    command: ["celery", "-A", "app.core.celery_app", "worker", "-B", "-Q", "inventory.maintenance",
+              "--concurrency", "2", "-s", "/tmp/celerybeat-schedule", "--loglevel", "INFO"]
+    environment:
+      <<: [*service-env, *events-env, *background-pool]
+      SERVICE_NAME: inventory
+      DATABASE_URL: postgresql+asyncpg://inventory_role:${INVENTORY_DB_PASSWORD:-inventory_local}@postgres:5432/inventory_db
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      # A broadcast ping plus interpreter start-up: more than the 3 s default.
+      interval: 30s
+      timeout: 20s
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -d celery@$$HOSTNAME -t 10 >/dev/null"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  order-celery:
+    # order's Celery worker with Beat embedded: queue order.maintenance.
+    build:
+      context: .
+      dockerfile: services/order/Dockerfile
+    profiles: [events]
+    command: ["celery", "-A", "app.core.celery_app", "worker", "-B", "-Q", "order.maintenance",
+              "--concurrency", "1", "-s", "/tmp/celerybeat-schedule", "--loglevel", "INFO"]
+    environment:
+      <<: [*service-env, *order-env, *workflow-env, *events-env, *background-pool]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      # A broadcast ping plus interpreter start-up: more than the 3 s default.
+      interval: 30s
+      timeout: 20s
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -d celery@$$HOSTNAME -t 10 >/dev/null"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+
+  notification:
+    # RFC 0007: read API, stream tickets and the SSE stream (:8005).
+    build:
+      context: .
+      dockerfile: services/notification/Dockerfile
+    profiles: [events]
+    environment:
+      <<: [*service-env, *events-env, *notification-env]
+    volumes:
+      - *public-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8005/health/ready', timeout=2).status == 200 else 1)"]
+
+  notification-consumer:
+    # Consumer group `notification`: identity.user.registered, order.*, payment.*,
+    # shipment.status_changed, inventory.stockout (RFC 0007 §3.1.2.4).
+    build:
+      context: .
+      dockerfile: services/notification/Dockerfile
+    profiles: [events]
+    command: ["python", "-m", "app.core.consumer"]
+    environment:
+      <<: [*service-env, *events-env, *background-pool, *notification-env]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD-SHELL", "kill -0 1"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  notification-celery:
+    # notification's Celery worker with Beat embedded: queue notification.notifications.
+    build:
+      context: .
+      dockerfile: services/notification/Dockerfile
+    profiles: [events]
+    command: ["celery", "-A", "app.core.celery_app", "worker", "-B", "-Q", "notification.notifications",
+              "--concurrency", "2", "-s", "/tmp/celerybeat-schedule", "--loglevel", "INFO"]
+    environment:
+      <<: [*service-env, *events-env, *background-pool, *notification-env]
+      NOTIFICATION_FAKE_EMAIL_FAILURE_RATE: ${NOTIFICATION_FAKE_EMAIL_FAILURE_RATE:-0.0}
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      # A broadcast ping plus interpreter start-up: more than the 3 s default.
+      interval: 30s
+      timeout: 20s
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -d celery@$$HOSTNAME -t 10 >/dev/null"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  mongo:
+    # analytics_db (RFC 0008 ANL-1, ANL-D36): single-node replica set rs0, keyfile auth.
+    image: mongo:7.0
+    profiles: [events]
+    hostname: mongo
+    entrypoint: ["/ops/mongo/entrypoint.sh"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-change-me-mongo-root-password}
+      MONGO_REPLICA_SET: rs0
+      MONGO_ADVERTISED_HOST: mongo:27017
+      # Read by /ops/mongo/init-analytics.js (make mongo-init).
+      ANALYTICS_MONGO_PASSWORD: ${ANALYTICS_MONGO_PASSWORD:-analytics_local}
+    volumes:
+      - mongo-data:/data/db
+      - ./ops/mongo:/ops/mongo:ro
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/ops/mongo/healthcheck.sh"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  analytics:
+    build:
+      context: .
+      dockerfile: services/analytics/Dockerfile
+    profiles: [events]
+    environment:
+      <<: [*service-env, *analytics-env]
+    volumes:
+      - *public-key
+    restart: on-failure
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8006/health/ready', timeout=2).status == 200 else 1)"]
+
+  analytics-consumer:
+    # Group `analytics` (every topic with a schema) + group `analytics-dlq-observer`
+    # (^smartretail\..*\.dlq$), one process (RFC 0008 §3.1.2.4, ANL-D44).
+    build:
+      context: .
+      dockerfile: services/analytics/Dockerfile
+    profiles: [events]
+    command: ["python", "-m", "app.v1.metrics.consumers"]
+    environment:
+      <<: [*service-env, *events-env, *background-pool, *analytics-env]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD-SHELL", "kill -0 1"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+
+  analytics-celery:
+    # analytics' Celery worker with Beat embedded: queue analytics.maintenance.
+    build:
+      context: .
+      dockerfile: services/analytics/Dockerfile
+    profiles: [events]
+    command: ["celery", "-A", "app.core.celery_app", "worker", "-B", "-Q", "analytics.maintenance",
+              "--concurrency", "1", "-s", "/tmp/celerybeat-schedule", "--loglevel", "INFO"]
+    environment:
+      <<: [*service-env, *events-env, *background-pool, *analytics-env]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      # A broadcast ping plus interpreter start-up: more than the 3 s default.
+      interval: 30s
+      timeout: 20s
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -d celery@$$HOSTNAME -t 10 >/dev/null"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+
+  # --- ai profile (Milestone 3) ---------------------------------------------
+
+  assistant:
+    build:
+      context: .
+      dockerfile: services/assistant/Dockerfile
+    profiles: [ai]
+    environment:
+      <<: [*service-env, *events-env, *assistant-env]
+    volumes:
+      - *public-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8007/health/ready', timeout=2).status == 200 else 1)"]
+
+  indexer-worker:
+    # Consumer group `assistant-indexer`: catalog.product.* → product_chunks (RFC 0001 §3.1.1.5).
+    build:
+      context: .
+      dockerfile: services/assistant/Dockerfile
+    profiles: [ai]
+    command: ["python", "-m", "app.v1.search.consumers.worker"]
+    environment:
+      <<: [*service-env, *events-env, *assistant-env, *background-pool]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      test: ["CMD-SHELL", "kill -0 1"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+
+  assistant-celery:
+    # assistant's Celery worker with Beat embedded: queue assistant.bulk (bulk generation, reindex, sweeps).
+    build:
+      context: .
+      dockerfile: services/assistant/Dockerfile
+    profiles: [ai]
+    command: ["celery", "-A", "app.core.celery_app", "worker", "-B", "-Q", "assistant.bulk",
+              "--concurrency", "2", "-s", "/tmp/celerybeat-schedule", "--loglevel", "INFO"]
+    environment:
+      <<: [*service-env, *events-env, *assistant-env, *background-pool]
+    volumes:
+      - *public-key
+    restart: on-failure
+    healthcheck:
+      <<: *ready-check
+      # A broadcast ping plus interpreter start-up: more than the 3 s default.
+      interval: 30s
+      timeout: 20s
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping -d celery@$$HOSTNAME -t 10 >/dev/null"]
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
 volumes:
   postgres-data:
   minio-data:
+  kafka-data:
+  mongo-data:
+  rabbitmq-data:

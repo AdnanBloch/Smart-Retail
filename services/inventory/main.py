@@ -11,8 +11,8 @@ from app.core.config import Settings, get_settings
 from app.core.db import create_database
 from app.core.logger import init_logger
 from app.health import routes as health
-from app.reservations import sweeper
 from app.router import router
+from app.v1.reservations import sweeper
 from smartretail_common.app import install_platform
 from smartretail_common.auth import JwtVerifier
 

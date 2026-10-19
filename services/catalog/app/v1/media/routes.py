@@ -1,0 +1,29 @@
+"""``/api/v1/media``: remove one media item (RFC 0004 §3.1.2).
+
+Media is added under its product: ``POST /api/v1/products/{id}/media``.
+"""
+
+import uuid
+
+from fastapi import APIRouter, Depends, Query, Response, status
+
+from app.core.dependencies import require_catalog_writer
+from app.v1.media.dependencies import media_repo, media_storage
+from app.v1.media.repo import MediaRepo, delete_objects
+from app.v1.media.storage import MediaStorage
+from smartretail_common.auth import Principal
+
+router = APIRouter()
+
+
+@router.delete("/{media_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_media(
+    media_id: uuid.UUID,
+    version: int = Query(..., ge=1),
+    principal: Principal = Depends(require_catalog_writer),
+    repo: MediaRepo = Depends(media_repo),
+    storage: MediaStorage = Depends(media_storage),
+) -> Response:
+    keys = await repo.remove(principal, media_id, version)
+    await delete_objects(storage, keys)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

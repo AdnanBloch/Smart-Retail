@@ -77,7 +77,7 @@ Nothing here is implemented directly. Every component named below is specified b
 
 ## 2. Overview
 
-[Part A](../part-a.md) specifies an event-driven commerce backend: catalog, orders, inventory, fulfilment, notifications, and analytics, built on FastAPI, PostgreSQL, Redis, Celery/RabbitMQ, Kafka, and Temporal, with OpenTelemetry-based observability. [Part B](../part-b.md) adds a GenAI layer on top: semantic product retrieval and a conversational shopping assistant.
+[Part A](../part-a.md) specifies an event-driven commerce backend: catalog, orders, inventory, fulfilment, notifications, and analytics, built on FastAPI, PostgreSQL, Redis, Celery/RabbitMQ, Kafka, and Temporal, with OpenTelemetry-based observability. Part A names that stack; why each Python-side piece is the right one, and what was rejected for it, is recorded in [ARC-D28–ARC-D35](#321-decision-register). [Part B](../part-b.md) adds a GenAI layer on top: semantic product retrieval and a conversational shopping assistant.
 
 Those two documents describe the system by requirement. Neither says how many services there are or where a boundary falls, and neither specifies a table. Both describe capabilities. How those capabilities are grouped into deployable units, and how their data is modelled, is our design work — and it is the work the reviews will examine hardest, because everything else follows from it. Making those decisions piecemeal, one piece of work at a time, produces boundaries that are artefacts of the order the work happened in rather than of what the data actually looks like.
 
@@ -179,7 +179,7 @@ flowchart LR
 flowchart TB
     client(["Client<br/>HTTP / JSON / SSE"])
     gw["gateway :8000<br/>JWT verify · routing · correlation ID<br/>CORS · rate limit"]
-    client --> gw
+    client -- "HTTP / SSE" --> gw
 
     subgraph services["Services"]
         identity["identity :8001"]
@@ -190,35 +190,37 @@ flowchart TB
         analytics["analytics :8006"]
         assistant["assistant :8007<br/>RAG / SSE"]
     end
-    gw --> identity & catalog & order & inventory & notification & analytics & assistant
+    gw -- "HTTP" --> identity & catalog & order & inventory & analytics & assistant
+    gw -- "SSE" --> notification
+    order -- "HTTP: price snapshot" --> catalog
 
     pg[("PostgreSQL 16<br/>one instance, one logical database per service")]
     vec[("assistant_db<br/>Postgres + pgvector")]
     mongo[("MongoDB<br/>analytics_db")]
-    identity & catalog & order & inventory & notification --> pg
-    assistant --> vec
-    analytics --> mongo
+    identity & catalog & order & inventory & notification -- "SQL (own DB)" --> pg
+    assistant -- "SQL" --> vec
+    analytics -- "MongoDB" --> mongo
 
     relay["outbox-relay"]
     kafka{{"Kafka + Schema Registry<br/>the event backbone"}}
-    pg -. "outbox rows" .-> relay
-    vec -. "outbox rows" .-> relay
-    relay --> kafka
+    pg -. "SQL: poll outbox" .-> relay
+    vec -. "SQL: poll outbox" .-> relay
+    relay -- "Kafka produce, key = aggregate id" --> kafka
 
     indexer["indexer-worker"]
-    kafka --> notification & analytics & indexer & inventory & catalog
-    indexer --> vec
+    kafka -- "Kafka consume, own group" --> notification & analytics & indexer & inventory & catalog
+    indexer -- "SQL" --> vec
 
-    temporal["Temporal server<br/>+ temporal-worker"]
-    celery["RabbitMQ<br/>+ celery-worker"]
-    catalog & order -- "start workflow" --> temporal
-    temporal -- "activities, service token" --> inventory & catalog
-    notification --> celery
+    temporal["Temporal server<br/>+ catalog-worker, order-worker"]
+    celery["RabbitMQ<br/>+ per-service Celery workers"]
+    catalog & order -- "gRPC: start workflow" --> temporal
+    temporal -- "activities → HTTP, service token" --> inventory & catalog
+    notification & inventory & order -- "AMQP: tasks" --> celery
 
     otel["OTel Collector → Jaeger<br/>→ Prometheus / Grafana"]
 ```
 
-Every service also exports traces and metrics to the OTel Collector (not drawn, to keep the edges readable). Redis (rate limits · idempotency fast path · caches · notification pub/sub and SSE tickets · Celery results) and MinIO (media binaries) sit beside the services and are specified in RFC 0001.
+Every edge names its protocol (*added after [mentor review 2026-10-13 §6](../reviews/mentor-reviews.md#review-of-2026-10-13)*). [architecture-diagrams.md](../architecture-diagrams.md) has the same picture as built, and one component diagram per service; [messaging-and-consistency.md](../messaging-and-consistency.md) explains why Kafka, RabbitMQ/Celery and Temporal each carry the edges they do. Every service also exports traces and metrics to the OTel Collector (not drawn, to keep the edges readable). Redis (rate limits · idempotency fast path · caches · notification pub/sub and SSE tickets · Celery results) and MinIO (media binaries) sit beside the services and are specified in RFC 0001.
 
 `notification` additionally holds open SSE connections and fans out over Redis Pub/Sub so any replica can serve any client ([RFC 0007](0007-notification-service.md)). `catalog` consumes `identity.merchant.status_changed` to project merchant approval state ([RFC 0004](0004-catalog-service.md#3124-events-consumed)).
 
@@ -432,6 +434,8 @@ These bind every service. Service RFCs may add decisions (with their own prefixe
 
 ##### 3.1.1.6. Critical flows
 
+The flows below are the short form. [business-flows.md](../business-flows.md) walks through every business flow end to end with its failure and compensation paths (*added after [mentor review 2026-10-13 §5](../reviews/mentor-reviews.md#review-of-2026-10-13)*).
+
 *Flow 1 — Product publishing.*
 
 ```mermaid
@@ -577,7 +581,7 @@ If the relay crashes after producing but before setting `published_at`, the row 
 
 ##### 3.1.1.7. Module structure inside a service
 
-Boundaries are recursive: the same reasoning applies below the service line, which is what keeps a service from becoming a small monolith. Every service uses the same internal layout, so moving between them is not a re-orientation. Code is grouped **by entity**, and only the HTTP contract is versioned:
+Boundaries are recursive: the same reasoning applies below the service line, which is what keeps a service from becoming a small monolith. Every service uses the same internal layout, so moving between them is not a re-orientation. The **version comes first**: `app/v1/` holds every entity, complete, and a later version holds only the files it changes ([ARC-D23](#321-decision-register)):
 
 ```
   main.py              create_application(): settings, logging, DB, router
@@ -586,29 +590,38 @@ Boundaries are recursive: the same reasoning applies below the service line, whi
   ├── router.py        Includes routers only. Owns the /api/v<N> prefix and each
   │                    entity's prefix, so every URL is readable in one file.
   ├── models.py        Imports every entity's ORM models onto one metadata (Alembic, seed).
-  ├── core/            Cross-entity infrastructure: config, db, logger, dependencies,
-  │                    security, errors (DomainError subclasses), shared enums and schemas.
-  ├── health/routes.py Readiness checks for /health/ready.
-  ├── <entity>/        One folder per entity (products/, users/, ...).
-  │   ├── models.py    SQLAlchemy ORM. One shape per table: never versioned.
-  │   ├── repo.py      <Entity>Repo — the only layer permitted business rules.
-  │   │                Called by routes, Temporal activities, event consumers, CLI.
-  │   ├── dependencies.py  Builds the entity's repos for a request.
-  │   ├── utils.py     State machine (the transition table) and pure helpers.
-  │   └── v1/
-  │       ├── routes.py    HTTP only — parse, validate, call, serialise. No rules.
+  ├── core/            Cross-entity infrastructure only: config, db, logger, dependencies,
+  │                    security, errors (DomainError subclasses), enums and schemas
+  │                    used by more than one entity. Nothing one entity alone uses. Not versioned.
+  ├── health/routes.py Readiness checks for /health/ready. Not versioned.
+  ├── v1/              The base version: every entity, complete.
+  │   └── <entity>/    One folder per entity (products/, users/, ...).
+  │       ├── models.py    SQLAlchemy ORM. One shape per table: only ever here.
+  │       ├── repo.py      <Entity>Repo — the only layer permitted business rules.
+  │       │                Called by routes, Temporal activities, event consumers, CLI.
+  │       ├── dependencies.py  Builds the entity's repos for a request.
+  │       ├── enums.py     The entity's vocabularies (S4, R8).
+  │       ├── state_machine.py  The transition table, when the entity has a lifecycle.
+  │       ├── utils.py     Pure helpers.
+  │       ├── clients/     Outbound calls to other services that this entity makes.
+  │       ├── providers/   External-provider interfaces and fakes this entity uses (A9).
+  │       ├── workflows/   Temporal workflows and activities this entity owns.
+  │       ├── consumers/   Event handlers that change this entity — thin, like routes.
+  │       ├── tasks/       Celery tasks for this entity.
+  │       ├── routes.py    The handlers: HTTP only — parse, validate, call, serialise. No rules.
   │       └── schemas.py   Pydantic request/response models: the v1 contract.
-  ├── clients/         Outbound calls to other services (when it makes them).
-  ├── consumers/       Event handlers — thin, like routes.
-  ├── workflows/       Temporal workflows and activities.
-  └── tasks/           Celery tasks.
+  └── v2/              (when one exists) Only the files v2 changes:
+      └── <entity>/        routes.py, schemas.py, and repo.py if v2's rules differ.
+                           Everything else is imported from app.v1.<entity> by name.
   alembic/             This service's own migration history (S14).
-  tests/{unit,integration}/<entity>/
+  tests/{unit,integration}/v1/<entity>/   Mirrors app/: tests/unit/v1/orders/workflows/ …
 ```
 
-**Why the version sits inside the entity.** A table has one shape at a time, so its ORM model and the rules that guard it cannot be versioned; only the HTTP contract (paths, request and response bodies) can. A v2 is a new `<entity>/v2/` folder and one `include_router` line, and both versions call the same repo. Version-first (`app/v1/<entity>/`) would copy models and rules per version; a split `app/<entity>/` + `app/api/v1/<entity>/` would spread each entity over two trees ([ARC-D23](#321-decision-register)).
+**Everything an entity alone uses lives under it** ([ARC-D27](#321-decision-register)). A workflow, an outbound client, a provider fake or a consumer belongs to the entity whose state it changes: the order saga is `v1/orders/workflows/`, the publishing workflow `v1/products/workflows/`, the `Idempotency-Key` table `v1/orders/models.py`. `core/` keeps only what two or more entities share. When a second entity starts using something, it moves up to `core/` (or, if it has its own table and rules, becomes an entity) — that move is the signal, not a guess made in advance. `CallerRole` is deliberately one small copy per service rather than shared through `common`, because a role claim is a vocabulary and PLT-D24 keeps vocabularies out of `common`.
 
-**Routes.** Each `v<N>/routes.py` owns one `router = APIRouter()` and declares its handlers with decorators, with paths relative to the entity prefix and all HTTP metadata on the decorator (`@router.get("/{product_id}", response_model=ProductDetail)`). `app/router.py` builds `APIRouter(prefix="/api/v1")` and includes each entity router under its prefix and tag (`v1.include_router(products_v1.router, prefix="/products", tags=["products"])`); `main.py` mounts it. Declaration order inside a routes module is significant — a literal segment such as `/me` is declared before `/{id}`.
+**Why the version comes first.** A version is the unit that changes: its URLs, its handlers, its contract, and sometimes its business rules. Putting it first makes each version one folder, and the files in `v2/` are exactly what v2 changes. Nothing is copied: a later version imports what it keeps from `app.v1.<entity>` by name (`from app.v1.orders.models import Order`). Models are never versioned, because a table has one shape at a time, so they are always imported from v1. Temporal activities, consumers, Celery tasks and CLIs have no HTTP version; they live in `v1/<entity>/` and call v1's repos unless a later version's RFC row says otherwise. A version can be retired only after the files later versions import from it move to `core/` or to the next base. The previous layout put the version inside the entity (`<entity>/v1/`), which had no place for a per-version rule ([ARC-D23](#321-decision-register), [mentor review 2026-10-13](../reviews/2026-10-13-mentor-review.md#1-version-first-layout)).
+
+**Routes.** Each `v<N>/<entity>/routes.py` owns one `router = APIRouter()` and declares its handlers with decorators, with paths relative to the entity prefix and all HTTP metadata on the decorator (`@router.get("/{product_id}", response_model=ProductDetail)`). `app/router.py` builds `APIRouter(prefix="/api/v1")` and includes each entity router under its prefix and tag (`from app.v1.products import routes as products_v1`; `v1.include_router(products_v1.router, prefix="/products", tags=["products"])`); `main.py` mounts it. Declaration order inside a routes module is significant — a literal segment such as `/me` is declared before `/{id}`.
 
 The rule that matters: **routes do not touch the ORM, and repos do not construct HTTP responses.** That single seam is why a Temporal activity (B1) and an event consumer can reuse the same business rule as an endpoint, with one implementation and one set of tests. Each service RFC's §3.1.1.1 shows its own instance of this layout; repository layout and the shared base images are in [RFC 0001](0001-platform-and-shared-infrastructure.md).
 
@@ -948,8 +961,8 @@ context.configure(..., render_item=render_item, compare_type=True)
 
 ```python
 op.execute("COMMENT ON COLUMN orders.status IS "
-           "'DomainEnum OrderStatus — see services/order/app/orders/enums.py; "
-           "transitions in app/orders/state_machine.py'")
+           "'DomainEnum OrderStatus — see services/order/app/v1/orders/enums.py; "
+           "transitions in app/v1/orders/state_machine.py'")
 ```
 
 **What adding a value costs, end to end.** One line in the entity's `enums.py`, plus an edge in the transition table if the column has one. No Alembic revision, no `alembic upgrade head`, no deploy ordering constraint — the column already accepts the string. The OpenAPI enum, the round-trip test, and the seed script all follow from the same source. CI confirms it was genuinely migration-free: `alembic check` must report no pending diff.
@@ -1317,10 +1330,20 @@ Where a decision already has an archived ID (A1–A14, B*, C*, R*, S*, or anothe
 | ARC-D20 | `analytics` uses MongoDB | Append-only, per-metric documents of varying shape, and it must never contend with checkout for a pool or lock manager; gives Part A's NoSQL requirement a real workload ([§3.1.3.7](#3137-store-selection), [§3.2.2](#322-the-arguments)) | Another database on the Postgres instance (contends with checkout; leaves the NoSQL requirement as a token table) | — |
 | ARC-D21 | Embeddings in pgvector inside `assistant_db` (= D1, [RFC 0009](0009-assistant-service.md)) | No extra container for a catalogue of a few thousand products ([§3.1.3.7](#3137-store-selection)) | Qdrant or another dedicated vector database (kept as the alternative behind the `VectorStore` protocol) | The corpus grows by two orders of magnitude, or recall or latency disappoint (Q2) |
 | ARC-D22 | One architecture RFC plus one RFC per service; each table's columns defined once, in its owner's RFC, indexed here | Puts everything about one service in one reviewable document; cross-service consistency needs one home ([§3.2.2](#322-the-arguments)) | Milestone-based RFCs (`products` defined three times, four tables missing, [§5](#5-alternate-solutions) alt 14); one document with every column (~1,300 lines read out of context, alt 15) | The catalogue-completeness test keeps finding drift between the index and the code |
-| ARC-D23 | Entity-first service layout with the version folder inside each entity (`<entity>/v1/{routes,schemas}.py` beside unversioned `models.py`, `repo.py`, `utils.py`); `app/router.py` only includes routers and owns every prefix; handlers declared with decorators | A table has one shape at a time, so only the HTTP contract can be versioned; everything about an entity sits in one folder; every URL readable in one file ([§3.1.1.7](#3117-module-structure-inside-a-service), [mentor review §3](../reviews/2026-10-06-mentor-review.md#3-entity-first-service-layout-with-versions)) | Version-first `app/v1/<entity>/` (v2 copies models and rules, which drift); hybrid `app/<entity>/` + `app/api/v1/<entity>/` (each entity split over two trees); central handler registration (indirection once routes and handlers share a file) | Two API versions need different business rules for the same entity |
+| ARC-D23 | Version-first service layout: `app/v1/<entity>/` holds every entity complete — `models.py`, `repo.py`, workflows, consumers, tasks and the handlers (`routes.py`, `schemas.py`); a later `app/v<N>/<entity>/` holds only the files that version changes (handlers, schemas, and `repo.py` when its rules differ) and imports the rest from v1 by name; models live only in v1; `core/` and `health/` are not versioned; `app/router.py` only includes routers and owns every prefix; handlers declared with decorators; tests mirror it in `tests/{unit,integration}/v1/<entity>/` | A version is the unit that changes — URLs, handlers, contract and sometimes business rules — so each version is one folder whose files are exactly its differences, and nothing is copied. A table has one shape at a time, so models are imported from v1, never versioned ([§3.1.1.7](#3117-module-structure-inside-a-service)). *Changed after [mentor review 2026-10-13](../reviews/2026-10-13-mentor-review.md#1-version-first-layout) — previously entity-first with the version folder inside each entity (`<entity>/v1/{routes,schemas}.py` beside unversioned `models.py`, `repo.py`, `utils.py`), chosen after [mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions), which had no place for a per-version business rule; before that, layer-first: `app/api/v1/`, `models/`, `schemas/`, `services/`, `domain/` ([archive/0001 §3.1.1](archive/0001-foundation-and-core-services.md)).* | Entity-first with `<entity>/v1/` (a per-version rule needs a second repo inside an unversioned folder); version-first with a full copy per version (models and rules duplicated, then drift); hybrid `app/<entity>/` + `app/api/v1/<entity>/` (each entity split over two trees); central handler registration (indirection once routes and handlers share a file) | A later version imports from a version being retired — the shared files move to `core/` or the next base first, and this row records it |
 | ARC-D24 | Routes do not touch the ORM and repos do not build HTTP responses (enables B1) | One business rule is reachable from a route, a Temporal activity, an event consumer and a CLI, with one implementation and one set of tests ([§3.1.1.7](#3117-module-structure-inside-a-service), [§3.2.2](#322-the-arguments)) | Logic in route handlers (unreachable from activities and consumers) | — (highest cost of erosion; checked at every review, [§7](#7-test-plan)) |
-| ARC-D25 | Every RFC carries a decision register in §3.2.1 with a required *Why* column; no separate ADR files | One table per RFC, and a missing reason shows in review ([mentor review §2](../reviews/2026-10-06-mentor-review.md#2-a-reason-for-every-decision)) | ADR files under `docs/adr/` (splits a service's design across two places again); prose rationale only (nothing shows when a reason is missing) | Register rows routinely fall out of step with the spec text |
-| ARC-D26 | All diagrams are Mermaid; existing ASCII diagrams converted | Text in the Markdown, so it diffs and is reviewed; renders on GitHub, GitLab and VS Code; covers flowchart, sequence, ER and state diagrams ([mentor review §4](../reviews/2026-10-06-mentor-review.md#4-diagrams)) | PlantUML (needs a render server, no inline GitHub rendering); keep ASCII and add Mermaid only for new diagrams (two styles; ASCII ER and sequence diagrams are hard to maintain) | A diagram needs layout control Mermaid cannot give |
+| ARC-D25 | Every RFC carries a decision register in §3.2.1 with a required *Why* column; no separate ADR files | One table per RFC, and a missing reason shows in review. *Changed after [mentor review 2026-10-06 §2](../reviews/mentor-reviews.md#2-a-reason-for-every-decision) — previously the reasons were prose in §3.2 only, so a decision without one did not show.* | ADR files under `docs/adr/` (splits a service's design across two places again); prose rationale only (nothing shows when a reason is missing) | Register rows routinely fall out of step with the spec text |
+| ARC-D26 | All diagrams are Mermaid; existing ASCII diagrams converted | Text in the Markdown, so it diffs and is reviewed; renders on GitHub, GitLab and VS Code; covers flowchart, sequence, ER and state diagrams. *Changed after [mentor review 2026-10-06 §4](../reviews/mentor-reviews.md#4-diagrams) — previously ASCII art, and only a few per RFC.* | PlantUML (needs a render server, no inline GitHub rendering); keep ASCII and add Mermaid only for new diagrams (two styles; ASCII ER and sequence diagrams are hard to maintain) | A diagram needs layout control Mermaid cannot give |
+| ARC-D27 | Everything one entity alone uses lives under that entity — models, repos, enums, `clients/`, `providers/`, `workflows/`, `consumers/`, `tasks/`; `core/` holds only what two or more entities share; tests mirror `app/` | One folder answers "what does this entity do and what does it touch". An app-level `workflows/` or `clients/` folder was a second, layer-first tree beside the entity tree — the split ARC-D23 rejected. Moving up to `core/` happens when a second user appears, so sharing is a fact, not a forecast ([§3.1.1.7](#3117-module-structure-inside-a-service)). *Changed after [mentor review 2026-10-12 §2](../reviews/mentor-reviews.md#2-every-file-in-its-entity-folder) — previously `app/workflows/`, `app/clients/`, `app/providers/` sat beside the entities and `IdempotencyKey` was in `app/core/idempotency.py`.* | App-level `workflows/` and `clients/` (two trees per entity); a separate `app/idempotency/` entity for one endpoint's claims (an entity with one user); `CallerRole` in `common` (a vocabulary there breaks PLT-D24) | A workflow or client is used by two entities — it moves to `core/` and this row records why |
+| ARC-D28 | FastAPI is the HTTP framework for every service | Native `async def` on ASGI, which A6 (async all the way down) needs; request and response validation is Pydantic, the same models as the v1 schemas; OpenAPI is generated from the code, which the per-service `/docs` and the gateway's aggregated view rely on; `Depends` gives the per-request session, the caller and the repos without a container library; Part A names it. *Added after [mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack) — previously "Part A names the stack" was the only reason given.* | Django + DRF (sync-first ORM and request cycle; its ORM would compete with SQLAlchemy; admin and templating unused by an API-only backend); Flask (no native async or validation — both bolted on); Litestar (comparable design, smaller ecosystem and fewer OTel/Temporal examples; outside the brief); aiohttp (no validation or OpenAPI) | A service needs server-rendered pages or an admin back office |
+| ARC-D29 | Python 3.12 everywhere, one version pinned in `pyproject.toml`, the Dockerfiles and CI | `StrEnum` (the base of `DomainEnum`, S4), PEP 695 generics and faster `asyncio`; every dependency in [RFC 0001 §4](0001-platform-and-shared-infrastructure.md#4-dependenciesblockersknown-issues) supports it. *Added after [mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack).* | 3.11 (no PEP 695; slower task groups); 3.13 (Temporal and asyncpg wheels lagged at project start) | All dependencies ship 3.13 wheels and a reason to move appears |
+| ARC-D30 | SQLAlchemy 2.0 (async) with `asyncpg` | Typed `Mapped[]` models that mypy checks; `insert … on_conflict_do_nothing` and `FOR UPDATE` row locks, which the idempotency claim (ARC-D15) and stock reservation need; `asyncpg` is the fastest Postgres driver for asyncio; Alembic autogenerates from the same metadata. *Added after [mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack).* | SQLModel (thin layer over the same engine; couples ORM and API models, which ARC-D24 keeps apart); Tortoise ORM (weaker Postgres feature coverage, separate migration tool); raw `asyncpg` SQL (no unit of work, hand-written mapping in eight services); Django ORM (comes with Django, ARC-D28) | A service's queries are mostly analytical — then raw SQL inside its repo |
+| ARC-D31 | Pydantic v2 for request, response and settings models (`pydantic-settings`) | One validation library at the edge and in configuration; v2's Rust core is fast enough to validate every request; `extra="forbid"` rejects unknown fields; settings fail the container at start-up when a variable is missing. *Added after [mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack).* | marshmallow (no FastAPI integration, slower); attrs + cattrs (no OpenAPI); plain `os.environ` for settings (no type check, fails late) | — (FastAPI is built on it) |
+| ARC-D32 | Alembic, one history per service (= S14, PLT-D22) | Autogenerate from the SQLAlchemy metadata, a required `downgrade`, and an explicit `make migrate` step. *Added after [mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack).* | `Base.metadata.create_all` (no history, no downgrade); yoyo / raw SQL files (no autogenerate, model and schema drift) | — |
+| ARC-D33 | `httpx` for every outbound HTTP call (service clients, gateway proxying, tests) | Async and sync with one API; streaming responses for SSE pass-through; `ASGITransport` lets tests call an app in-process with the same client; instrumented by OpenTelemetry. *Added after [mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack).* | `aiohttp` (a second, different client API for tests); `requests` (blocking, breaks A6) | — |
+| ARC-D34 | Uvicorn with `uvloop`, one process per container, started as `uvicorn --factory main:create_application` | The reference ASGI server for FastAPI; `uvloop` speeds the event loop; scaling is more containers, not more workers per container, so Compose and health checks see each process. *Added after [mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack).* | Gunicorn with Uvicorn workers (a process manager inside a container that already has one); Hypercorn (HTTP/2 unused behind the gateway) | Deployment moves to a host without a container scheduler |
+| ARC-D35 | Docker images per service and Docker Compose for the local stack, with profiles (= PLT-D23) | The stack is eight services plus Postgres, Redis, Kafka, Temporal and the observability tools; one `make up` starts the same versions on every machine and in CI; Part A names Docker and Compose. *Added after [mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack).* | Local virtualenvs per service (twelve processes and their infrastructure by hand); kind/k3d + Kubernetes (production-shaped, but slow and heavy for a laptop and beyond the brief); Tilt (needs Kubernetes) | The project is deployed beyond one machine — then Kubernetes manifests |
+| ARC-D36 | Every decision changed by a review says so: the row's *Why* ends with *"Changed after [review §n] — previously …"*, and the RFC's amendment log records the date, the decision IDs and a link to the review record in `docs/reviews/` | A reviewer can see what was decided before, what changed, and on what basis, without reading git history. *Added after [mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review).* | Git history only (the reason is lost in commit messages); a separate change-log file (a third place to read) | — |
 
 #### 3.2.2. The arguments
 
@@ -1769,7 +1792,13 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
   | Sep 29, 2026 | §3.1.1.4 | Recorded the service-token path (client-credentials JWT with `scope`) for callers with no user in context, alongside user-token forwarding for `order → catalog` | archive/0000 reserved "a call with no user in context" for an amendment here; archive/0002 introduced it for Temporal activities without amending this section |
   | Sep 29, 2026 | §3.1.2.1, §3.1.2.3 | Surface map widened to `/api/v1/search/*` and `/api/v1/webhooks/shipment`; `catalog` added as a consumer of `catalog.product.updated`; topic count stated as fourteen rows / sixteen topics | Brought into line with the archived retrieval and events RFCs, which had extended both without amending the catalogue |
   | Sep 29, 2026 | §3.3.1 | Added ARC-Q1 (trace-context carrier) and ARC-Q2 (assistant hydration under R5/A13) | Inconsistencies surfaced by merging the archived RFCs; recorded rather than resolved silently |
-  | Oct 11, 2026 | §3.2.1, §3.1.1.1, §3.1.1.4, §3.1.1.6, §3.1.2.3, §3.1.3.3, §3.1.3.5 | Added the decision register (ARC-D1–ARC-D26); converted every ASCII diagram to Mermaid and added the system context, login sequence and event-flow diagrams | [Mentor review 2026-10-06](../reviews/2026-10-06-mentor-review.md) §2 and §4 |
+  | Oct 11, 2026 | §3.2.1, §3.1.1.1, §3.1.1.4, §3.1.1.6, §3.1.2.3, §3.1.3.3, §3.1.3.5 | Added the decision register (ARC-D1–ARC-D26); converted every ASCII diagram to Mermaid and added the system context, login sequence and event-flow diagrams | [Mentor review 2026-10-06](../reviews/mentor-reviews.md#review-of-2026-10-06) §2 and §4 |
+  | Oct 11, 2026 | §3.1.1.7 | Layer-first layout replaced by entity-first with the version inside the entity (ARC-D23) | [Mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) |
+  | Oct 12, 2026 | §2, §3.2.1 | Added ARC-D28–ARC-D35: why FastAPI, Python 3.12, SQLAlchemy + asyncpg, Pydantic, Alembic, httpx, Uvicorn and Docker Compose, with rejected alternatives | [Mentor review 2026-10-12 §1](../reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack) |
+  | Oct 12, 2026 | §3.1.1.7, §3.2.1 | ARC-D27: workflows, clients, providers and the `Idempotency-Key` model moved into the entity that owns them; `core/` narrowed to shared infrastructure | [Mentor review 2026-10-12 §2](../reviews/mentor-reviews.md#2-every-file-in-its-entity-folder) |
+  | Oct 12, 2026 | §3.2.1, §11 | ARC-D36: rows changed by a review name the review and the previous decision; every RFC keeps an amendment log | [Mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review) |
+  | Oct 14, 2026 | §3.1.1.5, §3.1.1.6 | Protocol on every edge of the target topology; links to the new cross-cutting pages (messaging and consistency, business flows, architecture diagrams) | [Mentor review 2026-10-13 §5–§7](../reviews/mentor-reviews.md#review-of-2026-10-13) |
+  | Oct 19, 2026 | §3.1.1.7, §3.2.1 | ARC-D23: version-first layout — every entity moved to `app/v1/<entity>/`, handlers flattened from `<entity>/v1/` to `v1/<entity>/routes.py`; a later version holds only the files it changes and imports the rest from v1 | [Mentor review 2026-10-13](../reviews/2026-10-13-mentor-review.md#1-version-first-layout) |
 
 - **Definition of done for this RFC.** Goals G1–G12 satisfied; RFCs 0001–0009 exist and none contradicts it without saying so; the boundary and convention tests in §7 implemented and green in CI; the §3.1.3.4 census ratified at the Part A review; reviewed and moved to **DONE**.
 
@@ -1777,7 +1806,7 @@ This RFC introduces no code, so its test plan is the testing *strategy* every ot
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against a specific row: a service inventory row or ownership-test candidate in §3.1.1, a boundary rule R1–R8, a decision A1–A14, a topic in the catalogue, a schema convention S1–S15, a `†` or `‡` cell in the §3.1.3.4 census, a decision-register row ARC-D1–ARC-D26, an open question (Q1–Q9, archive/0006 Q1–Q7, ARC-Q1–Q2), or a rejected alternative in §5 — so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against a specific row: a service inventory row or ownership-test candidate in §3.1.1, a boundary rule R1–R8, a decision A1–A14, a topic in the catalogue, a schema convention S1–S15, a `†` or `‡` cell in the §3.1.3.4 census, a decision-register row ARC-D1–ARC-D36, an open question (Q1–Q9, archive/0006 Q1–Q7, ARC-Q1–Q2), or a rejected alternative in §5 — so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

@@ -6,13 +6,13 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 
-from app.clients.catalog import CatalogClient
 from app.core.config import Settings, get_settings
 from app.core.db import create_database
 from app.core.logger import init_logger
 from app.health import routes as health
 from app.router import router
-from app.workflows.client import TemporalOrderWorkflows
+from app.v1.orders.clients.catalog import CatalogClient
+from app.v1.orders.workflows.client import TemporalOrderWorkflows
 from smartretail_common.app import install_platform
 from smartretail_common.auth import JwtVerifier
 from smartretail_common.temporal import TemporalClientFactory

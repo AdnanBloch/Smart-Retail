@@ -1,0 +1,96 @@
+{
+  "type": "record",
+  "name": "OrderCreated",
+  "namespace": "smartretail.events.payload",
+  "fields": [
+    {
+      "name": "order_id",
+      "type": "string"
+    },
+    {
+      "name": "order_number",
+      "type": "string"
+    },
+    {
+      "name": "customer_id",
+      "type": "string"
+    },
+    {
+      "name": "status",
+      "type": "string"
+    },
+    {
+      "name": "currency",
+      "type": "string"
+    },
+    {
+      "name": "subtotal",
+      "type": "string"
+    },
+    {
+      "name": "shipping_fee",
+      "type": "string"
+    },
+    {
+      "name": "total",
+      "type": "string"
+    },
+    {
+      "name": "item_count",
+      "type": "long"
+    },
+    {
+      "name": "items",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "OrderCreatedItem",
+          "namespace": "smartretail.events.payload",
+          "fields": [
+            {
+              "name": "product_id",
+              "type": "string"
+            },
+            {
+              "name": "variant_id",
+              "type": "string"
+            },
+            {
+              "name": "merchant_id",
+              "type": "string"
+            },
+            {
+              "name": "product_name",
+              "type": [
+                "null",
+                "string"
+              ],
+              "default": null
+            },
+            {
+              "name": "sku",
+              "type": "string"
+            },
+            {
+              "name": "quantity",
+              "type": "long"
+            },
+            {
+              "name": "unit_price",
+              "type": "string"
+            },
+            {
+              "name": "line_total",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "placed_at",
+      "type": "string"
+    }
+  ]
+}

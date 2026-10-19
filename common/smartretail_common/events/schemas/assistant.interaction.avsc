@@ -1,0 +1,26 @@
+{
+  "type": "record",
+  "name": "AssistantInteraction",
+  "namespace": "smartretail.events.payload",
+  "doc": "RFC 0009 §3.1.2.3 (AST-6): one assistant turn or generation. Ids, cost and timestamps are strings, as the outbox stores them.",
+  "fields": [
+    {"name": "interaction_id", "type": "string"},
+    {"name": "kind", "type": "string"},
+    {"name": "conversation_id", "type": ["null", "string"], "default": null},
+    {"name": "generation_id", "type": ["null", "string"], "default": null},
+    {"name": "user_id", "type": ["null", "string"], "default": null},
+    {"name": "merchant_id", "type": ["null", "string"], "default": null},
+    {"name": "intent", "type": ["null", "string"], "default": null},
+    {"name": "content_type", "type": ["null", "string"], "default": null},
+    {"name": "answered", "type": "boolean"},
+    {"name": "finish_reason", "type": "string"},
+    {"name": "source_product_ids", "type": {"type": "array", "items": "string"}, "default": []},
+    {"name": "model", "type": "string"},
+    {"name": "input_tokens", "type": "long"},
+    {"name": "output_tokens", "type": "long"},
+    {"name": "cost_usd", "type": "string"},
+    {"name": "latency_ms", "type": "long"},
+    {"name": "time_to_first_token_ms", "type": ["null", "long"], "default": null},
+    {"name": "occurred_at", "type": "string"}
+  ]
+}

@@ -8,8 +8,8 @@ routing can never expose it by accident (it also blocks ``/internal/*``).
 
 from fastapi import APIRouter
 
-from app.reservations.v1 import routes as reservations_v1
-from app.stock.v1 import routes as stock_v1
+from app.v1.reservations import routes as reservations_v1
+from app.v1.stock import routes as stock_v1
 
 router = APIRouter()
 

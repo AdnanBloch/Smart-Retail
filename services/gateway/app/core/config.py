@@ -13,6 +13,9 @@ class GatewaySettings(BaseServiceSettings):
     upstream_catalog_url: str = "http://catalog:8002"
     upstream_order_url: str = "http://order:8003"
     upstream_inventory_url: str = "http://inventory:8004"
+    upstream_notification_url: str = "http://notification:8005"
+    upstream_analytics_url: str = "http://analytics:8006"
+    upstream_assistant_url: str = "http://assistant:8007"
 
     gateway_cors_allow_origins: str = "http://localhost:3000,http://localhost:5173"
     gateway_cors_max_age_s: int = 600
@@ -23,6 +26,9 @@ class GatewaySettings(BaseServiceSettings):
     gateway_upload_read_timeout_s: float = 30.0
     gateway_upstream_connect_timeout_s: float = 2.0
     gateway_upstream_read_timeout_s: float = 10.0
+    # The `stream` timeout class (SSE: notifications, assistant chat). Must exceed
+    # the longest silent gap a stream may have between keepalives (GW-D30).
+    gateway_stream_read_timeout_s: float = 120.0
     gateway_upstream_max_connections: int = 100
     gateway_upstream_max_keepalive: int = 20
     gateway_openapi_cache_ttl_s: int = 60
@@ -45,6 +51,9 @@ class GatewaySettings(BaseServiceSettings):
             "catalog": self.upstream_catalog_url,
             "order": self.upstream_order_url,
             "inventory": self.upstream_inventory_url,
+            "notification": self.upstream_notification_url,
+            "analytics": self.upstream_analytics_url,
+            "assistant": self.upstream_assistant_url,
         }
 
 

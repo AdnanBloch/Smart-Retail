@@ -109,6 +109,24 @@ The process is multi-step, crosses service boundaries (`catalog`, `inventory`, t
 
 ### 3.1. Specification
 
+**Diagram index.**
+
+| Kind | Diagram | Section |
+| --- | --- | --- |
+| Component | Topology around `order` | [§3.1.1.1](#3111-responsibility-and-boundaries) |
+| Component | Modules: callers, repos, adapters | [§3.1.1.1](#3111-responsibility-and-boundaries) |
+| Flow | Idempotent creation (claim, replay, snapshot, commit) | [Idempotent creation (B7)](#idempotent-creation-b7) |
+| Sequence | Checkout request, happy path | [Idempotent creation (B7)](#idempotent-creation-b7) |
+| Sequence | `OrderWorkflow` saga and compensations | [`OrderWorkflow` — the saga](#orderworkflow--the-saga) |
+| Sequence | Cancellation by signal | [`OrderWorkflow` — the saga](#orderworkflow--the-saga) |
+| Sequence | Carrier webhook | [Carrier webhook simulation](#carrier-webhook-simulation) |
+| Sequence | `resume_unstarted_orders` | [Async jobs owned by `order`](#async-jobs-owned-by-order) |
+| State | Order status | [§3.1.1.3](#3113-state-machines) |
+| State | Payment status | [§3.1.1.3](#3113-state-machines) |
+| State | Shipment status | [§3.1.1.3](#3113-state-machines) |
+| Data | `Order` aggregate (class diagram) | [§3.1.1.2](#3112-domain-model) |
+| Data | `order_db` entity relationships | [`order_db`](#order_db) |
+
 #### 3.1.1. Architectural changes
 
 ##### 3.1.1.1. Responsibility and boundaries
@@ -210,7 +228,7 @@ flowchart TB
 | C21 | Delivery is scoped by originating client | `orders.origin_client_id`, persisted at creation, read by every activity that writes an outbox row |
 | S2, S4, S6, S7, S8, S10, S11, S12 | Schema conventions | Applied in §3.1.3; S4 transition tables in §3.1.1.3 |
 
-**Internal module layout** (the entity-first layout of [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) and [file-structure.md §4](../file-structure.md#4-service-layout-every-service); routes do not touch the ORM, and repos do not construct HTTP responses). `order` is planned; its one entity is `orders/` (orders, items, status history). `idempotency_keys` is request-level machinery rather than an order rule (R8), so it sits in `core/`:
+**Internal module layout** (the entity-first layout of [RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service) and [file-structure.md §4](../file-structure.md#4-service-layout-every-service); routes do not touch the ORM, and repos do not construct HTTP responses). Its one entity is `orders/` (orders, items, status history, `Idempotency-Key` claims). Everything only that entity uses — its workflow, outbound clients, provider fakes and the `idempotency_keys` claim — lives under it ([ARC-D27](0000-architecture.md#321-decision-register), ORD-D34); `core/` holds only what several modules share. Entries marked *(planned)* are not built yet:
 
 ```
 services/order/
@@ -220,75 +238,82 @@ services/order/
 ├── app/
 │   ├── router.py                 includes only: owns /api/v1 and the /orders and /webhooks prefixes
 │   ├── models.py                 imports every ORM model onto one metadata (Alembic, seed)
-│   ├── seed.py                   sample orders through the real workflow (O16)
-│   ├── core/
+│   ├── seed.py                   (planned) sample orders through the real workflow (O16)
+│   ├── core/                     shared by several modules, no order rules
 │   │   ├── config.py             OrderSettings (§3.1.1.6)
 │   │   ├── db.py                 Database factory, get_db
 │   │   ├── logger.py             JSON logging
 │   │   ├── dependencies.py       principal, role guards; user routes reject service tokens
-│   │   ├── security.py           carrier HMAC signer and verifier (ORD-13)
-│   │   ├── errors.py             IllegalTransition, idempotency and catalog problem types
-│   │   ├── enums.py              IdempotencyState
-│   │   ├── idempotency.py        IdempotencyKey ORM model + IdempotencyRepo:
-│   │   │                         claim / replay / complete / release (B7, ORD-8)
-│   │   ├── schemas.py            Pydantic bases
-│   │   └── utils.py              key canonicalisation, request hash (ORD-7)
+│   │   ├── security.py           (planned) carrier HMAC signer and verifier (ORD-13)
+│   │   ├── errors.py             order and catalog problem types
+│   │   ├── enums.py              CallerRole
+│   │   └── schemas.py            Pydantic bases
 │   ├── health/
 │   │   └── routes.py             /health, /health/ready
 │   ├── orders/
-│   │   ├── models.py             Order, OrderItem, OrderStatusHistory — persistence only
+│   │   ├── models.py             Order, OrderItem, OrderStatusHistory, IdempotencyKey — persistence only
 │   │   ├── repo.py               OrderRepo: create, advance(), cancel, reads — the only writer of status
+│   │   ├── idempotency_repo.py   IdempotencyRepo, StoredReply, IdempotencyKeyReused, RequestInProgress:
+│   │   │                         claim / replay / complete / release (B7, ORD-8); key canonicalisation
+│   │   │                         and request hash come from common (ORD-7)
 │   │   ├── shipment_repo.py      ShipmentRepo.apply_carrier_update() — shared by webhook and admin route
 │   │   ├── snapshot.py           catalog lookup → OrderLineSnapshot
+│   │   ├── access.py             ownership and isolation from token claims (ORD-16)
 │   │   ├── events.py             order-event payload builders (envelope from common)
 │   │   ├── dependencies.py       builds the repos for a request
-│   │   ├── enums.py              OrderStatus, PaymentStatus, ShipmentStatus,
+│   │   ├── enums.py              OrderStatus, PaymentStatus, ShipmentStatus, IdempotencyState,
 │   │   │                         OrderFailureReason (ORD-5)
 │   │   ├── state_machine.py      ORDER_/PAYMENT_/SHIPMENT_TRANSITIONS, transition()
 │   │   ├── utils.py              money: line and order totals (S2, ORD-4)
-│   │   └── v1/
-│   │       ├── routes.py         POST/GET /orders, /merchant, /{id}, /{id}/cancel, /{id}/workflow,
-│   │       │                     /{id}/shipment/status (test-only)
-│   │       └── schemas.py        the v1 request/response contract
-│   ├── webhooks/
+│   │   ├── v1/
+│   │   │   ├── routes.py         POST/GET /orders, /merchant, /{id}, /{id}/cancel, /{id}/workflow,
+│   │   │   │                     /{id}/shipment/status (test-only)
+│   │   │   └── schemas.py        the v1 request/response contract
+│   │   ├── providers/
+│   │   │   ├── payment.py        PaymentProvider protocol + FakePaymentProvider
+│   │   │   ├── shipping.py       ShippingProvider protocol + FakeShippingProvider
+│   │   │   └── errors.py         PaymentDeclined, AddressRejected (not retried)
+│   │   ├── clients/
+│   │   │   ├── catalog.py        httpx client, user token forwarded
+│   │   │   └── inventory.py      httpx client, service token (ORD-11)
+│   │   └── workflows/
+│   │       ├── order_workflow.py OrderWorkflow — sequence, compensation, signal, query
+│   │       ├── activities.py     thin adapters over the repos (B1)
+│   │       ├── types.py          what crosses the Temporal boundary; workflow, signal, query names
+│   │       ├── client.py         start, query, signal, describe — used by the routes
+│   │       └── worker.py         `python -m app.v1.orders.workflows.worker`
+│   ├── webhooks/                 (planned)
 │   │   └── v1/
 │   │       ├── routes.py         POST /webhooks/shipment (HMAC)
 │   │       └── schemas.py        carrier callback body
-│   ├── providers/
-│   │   ├── payment.py            PaymentProvider protocol + FakePaymentProvider
-│   │   └── shipping.py           ShippingProvider protocol + FakeShippingProvider
-│   ├── clients/
-│   │   ├── catalog.py            httpx client, user token forwarded
-│   │   └── inventory.py          httpx client, service token (ORD-11)
-│   ├── workflows/
-│   │   ├── order_workflow.py     OrderWorkflow — sequence, compensation, signal, query
-│   │   └── activities.py         thin adapters over the repos (B1)
-│   └── tasks/
-│       └── maintenance.py        sweep_idempotency_keys, resume_unstarted_orders (Celery)
-└── tests/
-    ├── unit/orders/              state machines, money, events, fakes
-    └── integration/orders/       real Postgres; test_migrations.py
+│   │   └── tasks/
+│   │       └── maintenance.py    resume_unstarted_orders (Celery Beat, ORD-9); sweep_idempotency_keys (planned)
+│   └── core/celery_app.py        Celery app + Beat schedule, queue order.maintenance (PLT-D36)
+└── tests/                        mirrors app/
+    ├── unit/orders/              state machines, money, snapshot and clients;
+    │                             providers/ (fakes), workflows/
+    └── integration/orders/       real Postgres; workflows/ (OrderWorkflow on a test Temporal)
 ```
 
 ```mermaid
 flowchart LR
     subgraph callers["Callers (thin)"]
-        routes["orders/v1/routes.py<br/>webhooks/v1/routes.py"]
-        acts["workflows/activities.py"]
+        routes["v1/orders/routes.py<br/>v1/webhooks/routes.py"]
+        acts["orders/workflows/activities.py"]
         tasks["tasks/maintenance.py"]
     end
     subgraph rules["Business rules"]
         orepo["orders/repo.py<br/>OrderRepo"]
         srepo["orders/shipment_repo.py<br/>ShipmentRepo"]
-        irepo["core/idempotency.py<br/>IdempotencyRepo"]
+        irepo["orders/idempotency_repo.py<br/>IdempotencyRepo"]
         sm["orders/state_machine.py<br/>orders/utils.py (money)"]
     end
     subgraph edges["Outbound adapters"]
-        clients["clients/catalog.py<br/>clients/inventory.py"]
-        providers["providers/payment.py<br/>providers/shipping.py"]
+        clients["orders/clients/catalog.py<br/>orders/clients/inventory.py"]
+        providers["orders/providers/payment.py<br/>orders/providers/shipping.py"]
     end
     db[("order_db<br/>orders/models.py, outbox")]
-    wf["workflows/order_workflow.py<br/>OrderWorkflow"]
+    wf["orders/workflows/order_workflow.py<br/>OrderWorkflow"]
 
     routes --> irepo
     routes --> orepo
@@ -306,7 +331,7 @@ flowchart LR
     irepo --> db
 ```
 
-`temporal-worker` registers `OrderWorkflow` and `order`'s activities by importing `app.workflows`; `celery-worker` registers `app.tasks`. Both are hosts ([RFC 0001](0001-platform-and-shared-infrastructure.md)); the logic and its tests belong here.
+`order-worker` registers `OrderWorkflow` and `order`'s activities from `app.v1.orders.workflows` (started as `python -m app.v1.orders.workflows.worker`); `celery-worker` will register `app.tasks`. Both are hosts ([RFC 0001](0001-platform-and-shared-infrastructure.md)); the logic and its tests belong here.
 
 ##### 3.1.1.2. Domain model
 
@@ -363,9 +388,9 @@ classDiagram
 | # | Invariant | Where enforced |
 | --- | --- | --- |
 | I1 | One order per `(user_id, Idempotency-Key)` | Primary key / unique `(user_id, key)` on `idempotency_keys` (S11, B7) |
-| I2 | Every status, payment-status and shipment-status change is an edge in its transition table | `transition()` in `app/orders/state_machine.py`; nothing else assigns those columns (review check) |
+| I2 | Every status, payment-status and shipment-status change is an edge in its transition table | `transition()` in `app/v1/orders/state_machine.py`; nothing else assigns those columns (review check) |
 | I3 | No lost update on an order | `version` checked and incremented in `OrderRepo.advance()` (S6); the loser gets `409` |
-| I4 | `line_total = unit_price × quantity`; `subtotal = Σ line_total`; `total = subtotal + shipping_fee` | `app/orders/utils.py`, computed server-side; stored values never recomputed from live catalog data |
+| I4 | `line_total = unit_price × quantity`; `subtotal = Σ line_total`; `total = subtotal + shipping_fee` | `app/v1/orders/utils.py`, computed server-side; stored values never recomputed from live catalog data |
 | I5 | All lines share the order's `currency` | Creation rejects mixed currencies with `422` (S2) |
 | I6 | `quantity > 0`; money columns non-negative | Database `CHECK`s (S2, S11) and Pydantic |
 | I7 | A snapshot never changes after creation | No update path exists for `order_items`; tested (§7) |
@@ -390,14 +415,14 @@ classDiagram
 
 | Code set | Where | Values | Why not a `DomainEnum` column |
 | --- | --- | --- | --- |
-| `OrderFailureReason` (ORD-5) | `orders.failure_reason`, `order_status_history.reason`, event payloads, metric label | `INSUFFICIENT_STOCK`, `INVENTORY_UNAVAILABLE`, `PAYMENT_DECLINED`, `PAYMENT_TIMEOUT`, `RESERVATION_EXPIRED`, `COMMIT_FAILED`, `FULFILMENT_FAILED`, `REFUND_FAILED`, `OPERATOR_TERMINATED` | The first three are the archive's codes; the rest name failure paths the archive describes without naming. The column is specified as plain nullable `text` in the catalogue; the set is a `StrEnum` in `app/orders/enums.py` validated by the service layer so metric labels stay bounded |
+| `OrderFailureReason` (ORD-5) | `orders.failure_reason`, `order_status_history.reason`, event payloads, metric label | `INSUFFICIENT_STOCK`, `INVENTORY_UNAVAILABLE`, `PAYMENT_DECLINED`, `PAYMENT_TIMEOUT`, `RESERVATION_EXPIRED`, `COMMIT_FAILED`, `FULFILMENT_FAILED`, `REFUND_FAILED`, `OPERATOR_TERMINATED` | The first three are the archive's codes; the rest name failure paths the archive describes without naming. The column is specified as plain nullable `text` in the catalogue; the set is a `StrEnum` in `app/v1/orders/enums.py` validated by the service layer so metric labels stay bounded |
 | Actor | `order_status_history.actor` | `customer:<id>` \| `workflow` \| `admin:<id>` \| `system` | A `<kind>:<id>` composite is not a closed set (S4) |
 
 **Order number.** `order_number` is human-readable, `SR-<year>-<7-digit sequence>`, e.g. `SR-2026-0001042`, unique. The sequence is a Postgres sequence `order_number_seq` in `order_db`, created by the initial migration (ORD-3). It is never used as a key across a boundary — ids are UUIDs (S1).
 
 ##### 3.1.1.3. State machines
 
-Three columns are state machines. Under S4 they are `text`, so the database no longer rejects a bad status; what replaces it is stricter, and it lives in `services/order/app/orders/state_machine.py` — one file, next to the enums it constrains (`app/orders/enums.py`).
+Three columns are state machines. Under S4 they are `text`, so the database no longer rejects a bad status; what replaces it is stricter, and it lives in `services/order/app/v1/orders/state_machine.py` — one file, next to the enums it constrains (`app/v1/orders/enums.py`).
 
 **Order status diagram.**
 
@@ -610,7 +635,7 @@ sequenceDiagram
 
 `OrderWorkflow(order_id, correlation_id, payment_method)` runs on the `order-lifecycle` task queue (ORD-D28) with `workflow_id = order-{order_id}`. One workflow per order, not one long-running workflow per customer (archive/0002 Q3, decided): the per-order id gives free deduplication at the Temporal level behind the idempotency key.
 
-Its input holds identifiers only (B2). `payment_method` is an opaque provider token (for the fake, a string such as `tok_ok`), never card data — there is no field anywhere that could hold a card number. It travels only in the workflow input because no column persists it (ORD-Q5). Temporal history is readable in its UI, and nothing sensitive is put in it.
+Its input holds identifiers only (B2). `payment_method` is an opaque provider token (for the fake, a string such as `tok_ok`), never card data — there is no field anywhere that could hold a card number. It is persisted in `orders.payment_method` so `resume_unstarted_orders` can start a stranded order's workflow (ORD-D35, settling ORD-Q5). Temporal history is readable in its UI, and nothing sensitive is put in it.
 
 ```mermaid
 sequenceDiagram
@@ -840,7 +865,7 @@ Shipment progression after confirmation is driven by carrier callbacks. `POST /a
 ```mermaid
 sequenceDiagram
     participant X as Carrier (simulated)
-    participant O as order webhooks/v1/routes.py
+    participant O as order v1/webhooks/routes.py
     participant R as ShipmentRepo
     participant D as order_db
     X->>O: POST /api/v1/webhooks/shipment, X-Carrier-Signature t, v1
@@ -870,8 +895,8 @@ sequenceDiagram
 
 | Job | Host | Schedule | Effect |
 | --- | --- | --- | --- |
-| `sweep_idempotency_keys` | `celery-worker`, queue `maintenance` | Celery Beat, daily | `DELETE FROM idempotency_keys WHERE expires_at < now()` in batches; safe to run twice |
-| `resume_unstarted_orders` (ORD-9) | `celery-worker`, queue `maintenance` | Celery Beat, every minute | Finds `pending` orders with `workflow_run_id IS NULL` older than 30 s (the `(status, created_at)` index "for operational sweeps") and starts their workflow; `WorkflowAlreadyStarted` is success |
+| `sweep_idempotency_keys` (planned) | `order-celery`, queue `order.maintenance` (PLT-D36) | Celery Beat, daily | `DELETE FROM idempotency_keys WHERE expires_at < now()` in batches; safe to run twice |
+| `resume_unstarted_orders` (ORD-9) | `order-celery`, queue `order.maintenance` (PLT-D36) | Celery Beat, every minute | Finds `pending` orders with `workflow_run_id IS NULL` older than 30 s (the `(status, created_at)` index "for operational sweeps") and starts their workflow; `WorkflowAlreadyStarted` is success |
 | `OrderWorkflow` and its activities | `order-worker` (PLT-D33), task queue `order-lifecycle` | Per order | The saga above |
 
 ```mermaid
@@ -1029,7 +1054,7 @@ All routes are under `/api/v1`, reached through the gateway at `:8000`, and foll
 
 **Operational** — `GET /health`, `GET /health/ready` (checks `order_db`; reports Temporal reachability without failing on it), `GET /metrics`, `GET /docs`.
 
-**Route precedence.** `/orders/merchant` is declared before `/{id}` in `orders/v1/routes.py`, and `{id}` is typed as a UUID, so `merchant` can never be parsed as an id.
+**Route precedence.** `/orders/merchant` is declared before `/{id}` in `v1/orders/routes.py`, and `{id}` is typed as a UUID, so `merchant` can never be parsed as an id.
 
 **`202` semantics.** An accepted order exists and is addressable, but its lifecycle is asynchronous. The client learns the outcome by `GET /orders/{id}` or, preferably, by the `order_confirmed` / `order_failed` notification pushed by `notification` over SSE ([RFC 0007](0007-notification-service.md)). A client retry is a poll, never a second order.
 
@@ -1188,6 +1213,7 @@ Payment and shipment are **sub-state on this aggregate**, not separate services 
 | `placed_at`, `confirmed_at`, `created_at`, `updated_at` | `timestamptz` | |
 | `notified_at` | `timestamptz` | nullable — so a notification failure is visible on the order |
 | `origin_client_id` | `text` | nullable — the `X-Client-Id` of the checkout request, persisted because `order.confirmed` and `order.failed` are emitted by the Temporal workflow after the request has ended and would otherwise have no origin ([archive/0003](archive/0003-events-and-observability.md) C21) |
+| `payment_method` | `text` | nullable — the opaque provider token from checkout (`tok_ok` for the fake), never card data; read only by `resume_unstarted_orders` to start a workflow that did not start at checkout (ORD-D35). Null for orders placed before the column; the job skips those |
 
 Indexes: unique `order_number`; `(customer_id, created_at desc)`; `status`; `(status, created_at)` for operational sweeps.
 
@@ -1253,7 +1279,7 @@ Constraint: unique `(user_id, key)` — S11, and the mechanism behind "one order
 | Unique | `idempotency_keys` | `(user_id, key)` — the S11 arbiter | archive/0006 |
 | Index | `idempotency_keys` | `expires_at` — the sweep's predicate | **ORD-3, proposed** |
 | Sequence | — | `order_number_seq` — the numeric part of `order_number` | **ORD-3, proposed** |
-| Comment | `orders` | `COMMENT ON COLUMN orders.status IS 'DomainEnum OrderStatus — see services/order/app/orders/enums.py; transitions in app/orders/state_machine.py'`, and the same for `payment_status`, `shipment_status` | archive/0006 S4 |
+| Comment | `orders` | `COMMENT ON COLUMN orders.status IS 'DomainEnum OrderStatus — see services/order/app/v1/orders/enums.py; transitions in app/v1/orders/state_machine.py'`, and the same for `payment_status`, `shipment_status` | archive/0006 S4 |
 
 No `CHECK` names a status value and no Postgres `ENUM` type exists (S4). The status columns carry no index beyond those listed; the enums-as-text trade (alphabetical `ORDER BY status`) is irrelevant because no order query sorts by status.
 
@@ -1261,12 +1287,10 @@ No `CHECK` names a status value and no Postgres `ENUM` type exists (S4). The sta
 
 | Revision | Content | Downgrade |
 | --- | --- | --- |
-| `0001_initial` | `orders` (all columns except `notified_at`, `origin_client_id`), `order_items`, `order_status_history`, `idempotency_keys`, the shared `outbox` DDL, `order_number_seq`, indexes and checks above, S4 column comments | Drop in reverse |
-| `0002_orders_notification_origin` | `orders` + `notified_at`, + `origin_client_id` (both nullable, no backfill) | Drop both columns |
-| `0003_outbox_client_id_relay_index` | `outbox` + `client_id` (nullable) and the relay's partial index on `published_at IS NULL` ordered by `id` — as defined in RFC 0000 | Drop both |
-| `0004_idempotency_expiry_index` | `idempotency_keys(expires_at)` index (ORD-3) | Drop index |
+| `0001_initial` | `orders` (all columns, including `notified_at` and `origin_client_id`), `order_items`, `order_status_history`, `idempotency_keys` with its `expires_at` index (ORD-3), the shared `outbox` DDL with `client_id` and the relay's partial index, `order_number_seq`, indexes and checks above, S4 column comments. The contents first planned as revisions 0002–0004 ship here (ORD-D29) | Drop in reverse |
+| `0002_idempotency_state_comment` | Comment only: `idempotency_keys.state` now points at `services/order/app/v1/orders/enums.py` (ORD-D34) | Restore the `app/core/enums.py` comment |
 
-Vocabulary changes are not migrations: adding a value to any `order` enum is one line in `app/orders/enums.py` plus an edge in its transition table, and `alembic check` must report no pending diff.
+Vocabulary changes are not migrations: adding a value to any `order` enum is one line in `app/v1/orders/enums.py` plus an edge in its transition table, and `alembic check` must report no pending diff.
 
 **Shared tables carried.** [`outbox`](0000-architecture.md#3132-shared-tables--outbox-and-processed_events) (S12) — yes. `processed_events` (S13) — no; `order` consumes nothing.
 
@@ -1367,13 +1391,15 @@ This RFC already carries ID'd decisions (A*, B*, C*, R*, S* from RFC 0000 and th
 | ORD-D24 | Isolation by token claims: another customer's order is `404`; merchants see only their own lines, never total, address or payment reference (= ORD-16) | `403` would confirm the order exists; the merchant scope comes from the catalog snapshot, not the request ([§3.1.2.2](#3122-role-matrix)) | Scoping by request fields; `403` for foreign orders | Multi-merchant sub-orders come into scope (archive/0002 Q9) |
 | ORD-D25 | `origin_client_id` persisted on the order and copied into every outbox row (= C21, archive/0006 Q7) | `order.confirmed` and `order.failed` are emitted by the worker after the request has ended and would otherwise have no origin ([§3.2](#32-rationale)) | Reading the client id from request context (not available on the worker) | Not expected |
 | ORD-D26 | `order` is a producer only: seven events, no refund topic, no `processed_events` (= ORD-17, ORD-Q2) | Carrier updates are a signed HTTP call made idempotent by the state machine; refunds ride on `payment_status` so the RFC 0000 catalogue is not amended silently ([§3.1.2.4](#3124-events-consumed)) | A `payment.refunded` topic; consuming carrier events from Kafka | The RFC 0000 catalogue adds a refund topic (ORD-Q2) |
-| ORD-D27 | Entity-first layout: one `orders/` entity with `models`, `repo`, `enums`, `state_machine`, `utils` (money) and `v1/{routes,schemas}`; `idempotency_keys` in `core/` | The binding layout ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)); the idempotency mechanism is request plumbing, not an order rule (R8) ([§3.1.1.1](#3111-responsibility-and-boundaries)) | Version-first `app/v1/<entity>/`; hybrid `app/api/v1/` split (mentor review §3) | A second entity needs idempotency, or the mechanism moves to `common` |
+| ORD-D27 | Entity-first layout: one `orders/` entity with `models`, `repo`, `enums`, `state_machine`, `utils` (money) and `v1/{routes,schemas}`; `idempotency_keys` in `core/` (that placement superseded by ORD-D34) | The binding layout ([RFC 0000 §3.1.1.7](0000-architecture.md#3117-module-structure-inside-a-service)); the idempotency mechanism is request plumbing, not an order rule (R8) ([§3.1.1.1](#3111-responsibility-and-boundaries)). *Changed after [mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) — previously layer-first: `app/api/v1/` handlers, `app/domain/` (enums, state machine), `app/services/` (rules, idempotency), `app/models/` and `app/schemas/`.* | Version-first `app/v1/<entity>/`; hybrid `app/api/v1/` split (mentor review §3) | A second entity needs idempotency, or the mechanism moves to `common` |
 | ORD-D28 | The task queue is `order-lifecycle` (RFC 0001 PLT-D13 owns the name; §3.1.1.4 and §3.1.1.6 said `orders`) (Milestone 2 implementation) | Platform owns hosting names; two names for one queue would be a defect | `orders` (contradicts the platform register) | — |
 | ORD-D29 | `orders.notified_at`, `orders.origin_client_id`, `outbox.client_id` and the `idempotency_keys(expires_at)` index are in `0001_initial` instead of revisions 0002-0004 (Milestone 2 implementation) | Nothing was deployed, and the M2 `notify` activity needs `notified_at`; one revision is easier to review than four additive ones on an empty database | Shipping 0001-0004 at once (four revisions for one release) | — |
 | ORD-D30 | ORD-1 (`awaiting_payment → refunding`) and the refund-then-reverse compensations are implemented in M2, ahead of the M4 review the phasing table lists (Milestone 2 implementation) | The M2 saga charges before it commits and ships, so a post-charge failure needs a refund path now; without the edge a refunded order would jump straight to `failed` | Defer, and leave post-charge failures uncompensated in M2 | The review rejects ORD-1 |
 | ORD-D31 | A failure after shipment creation but at the `confirmed` write compensates like a shipment failure (refund, reverse commit, `FULFILMENT_FAILED`); a failed `notify` leaves the order `confirmed` with `notified_at` null (Milestone 2 implementation) | The status write retries for five minutes, so failing it means the order cannot be confirmed; undoing the money and stock is the safe end. `notify` never changes the order's outcome | Leaving an order charged and committed but stuck `awaiting_payment` | — |
 | ORD-D32 | The request hash is computed over the validated request body (defaults filled in), not the raw bytes (refines ORD-7; Milestone 2 implementation) | Two requests that differ only in an omitted optional field are the same request; hashing the validated model makes that so, and the hash ignores key order and number formatting anyway | Raw-byte hashing (whitespace and key order would make retries look like different requests) | — |
-| ORD-D33 | An order accepted while Temporal is unreachable stays `pending` with a null `workflow_run_id` until `resume_unstarted_orders` (ORD-9) exists; M2 does not start it later (Milestone 2 implementation) | Checkout acceptance must not depend on the orchestrator (§3.1.1.5), and the resume job is phased with Celery Beat. `payment_method` is not persisted (ORD-Q5), so a resume job needs that question settled first | Returning 503 after the order is committed (the order would exist while the client believes it failed) | M3 adds Celery Beat |
+| ORD-D33 | An order accepted while Temporal is unreachable stays `pending` with a null `workflow_run_id` until `resume_unstarted_orders` (ORD-9) exists; M2 does not start it later (Milestone 2 implementation) | Checkout acceptance must not depend on the orchestrator (§3.1.1.5), and the resume job is phased with Celery Beat. `payment_method` is not persisted (ORD-Q5), so a resume job needs that question settled first | Returning 503 after the order is committed (the order would exist while the client believes it failed) | *Superseded by ORD-D35 in Milestone 3* |
+| ORD-D34 | Everything only `orders` uses lives under it (ARC-D27): `app/core/idempotency.py` split into `IdempotencyKey` → `app/orders/models.py` and `IdempotencyRepo`, `StoredReply`, `IdempotencyKeyReused`, `RequestInProgress` → `app/orders/idempotency_repo.py`; `IdempotencyState` `app/core/enums.py` → `app/orders/enums.py`; `app/workflows/`, `app/clients/`, `app/providers/` → `app/orders/workflows/`, `app/orders/clients/`, `app/orders/providers/`; worker started as `python -m app.orders.workflows.worker`; tests in `tests/{unit,integration}/orders/workflows/` and `tests/unit/orders/providers/`; revision `0002_idempotency_state_comment` repoints the `idempotency_keys.state` column comment (supersedes the `core/` placement in ORD-D27) | Only `POST /orders` uses an `Idempotency-Key`, so the claim belongs to the `orders` entity; the saga, the catalog and inventory clients and the provider fakes are likewise used by `orders` alone, so one folder answers what the entity does and calls. The Temporal names were already explicit (`name=` on every `@workflow.defn` and `@activity.defn`), so nothing Temporal stores changed. *Changed after [mentor review 2026-10-12 §2](../reviews/mentor-reviews.md#2-every-file-in-its-entity-folder) — previously `IdempotencyKey` and `IdempotencyRepo` were in `app/core/idempotency.py`, `IdempotencyState` in `app/core/enums.py`, and `workflows/`, `clients/`, `providers/` sat at `app/` level.* | A separate `app/idempotency/` entity (an entity with one user); keeping the claim in `core/` as request plumbing (`core/` holds only what several modules share); app-level `workflows/`, `clients/`, `providers/` (a second, layer-first tree beside the entity) | A second endpoint needs an `Idempotency-Key` — the claim becomes its own entity |
+| ORD-D35 | `orders.payment_method` stores the checkout's provider token, and `resume_unstarted_orders` (ORD-9) runs every minute on `order-celery`: it starts the workflow of every `pending` order with a null `workflow_run_id` older than 30 s, treats `WorkflowAlreadyStartedError` as success (reading the run id back) and writes the run id only where it is still null (Milestone 3 implementation; settles ORD-Q5) | Committing the order and starting its workflow touch two systems, so a crash or a Temporal outage between them strands the order; this job closes that gap the way the outbox closes the database/Kafka gap — the committed row is the record of work still to do. The token is an opaque identifier, not a secret, so storing it is as safe as carrying it in Temporal history. *Changed after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) §4 — previously (ORD-D33) a stranded order stayed `pending` for ever.* | Starting the workflow before committing (a workflow for an order that may roll back). Storing nothing and failing stranded orders (a customer's accepted order lost to an outage) | A real provider: store its payment-intent id instead of the token |
 
 **Why Temporal rather than a chain of Kafka consumers.** Part A requires that an interrupted order be "resumable or cleanly reversible". With choreography, the answer to "where is order X stuck?" is "read six consumers' logs and infer", compensation is scattered across the consumers that happen to run after a failure, and step timeouts have to be hand-rolled everywhere. Temporal answers that question with a query, keeps compensation adjacent to the step it undoes, and persists workflow state so a worker crash resumes rather than loses. Kafka is the wrong tool for a saga — no built-in state, no compensation, no visibility into where a process is stuck — and Temporal is the wrong tool for broadcasting a fact, which is why the workflow's outcome leaves as events (A12).
 
@@ -1432,7 +1458,7 @@ Original question IDs are kept, with the archived RFC that raised them — sever
 | ORD-Q2 | new | Should refunds have their own topic (`payment.refunded`)? | Not added without amending the RFC 0000 catalogue; refunds ride on `order.failed` / `order.cancelled` as `payment_status` | Part A architecture review |
 | ORD-Q3 | new | Should payment and shipment sub-state changes write `order_status_history` rows? | No: the table's columns are `OrderStatus` values. Sub-state changes are audited by their outbox rows (actor, correlation and time in the envelope). A reviewer may prefer sub-state rows in the timeline | Part A architecture review |
 | ORD-Q4 | new | Cancellation by Temporal *Update* instead of signal + query? | Update gives a synchronous accept/reject and closes the race at the cancellable point; signal + query is kept because the archive specifies a signal | Part A architecture review |
-| ORD-Q5 | new | The payment-method token lives only in the workflow input — is that right? | Yes for a simulated provider (it is an opaque identifier, not a secret); a real provider would store a provider-side payment-intent id on the order instead | If a real provider appears |
+| ORD-Q5 | resolved (ORD-D35) | The payment-method token lives only in the workflow input — is that right? | Yes for a simulated provider (it is an opaque identifier, not a secret); a real provider would store a provider-side payment-intent id on the order instead | If a real provider appears |
 | ORD-Q6 | new | `order_items` money columns have no adjacent currency column (S2's letter) | Currency is per order and enforced identical across lines (I5); adding `order_items.currency` would restate one fact per line | Part A architecture review |
 
 ---
@@ -1710,13 +1736,27 @@ Service dependencies: `catalog`'s product read and `published` status ([RFC 0004
 
 - **On the fakes.** They are not placeholders; within this project they are the design (A9). They are more useful than a real sandbox for the purpose at hand, because they can be told to fail on demand — which is what the saga's tests need.
 - **On the outbox.** Writing outbox rows before anything read them looked like waste and was the opposite: it was the single decision that most reduced the risk of the event backbone's arrival.
+- **Amendment log.**
+
+  | Date | Section | Change | Reason |
+  | --- | --- | --- | --- |
+  | Oct 11, 2026 | All | Shared package path `libs/common` → `common` | [Mentor review 2026-10-06 §1](../reviews/mentor-reviews.md#1-shared-package-folder) |
+  | Oct 11, 2026 | §3.2, §3.2.1 | Added the decision register (ORD-D1–ORD-D27); existing `ORD-` and platform IDs kept and referenced; prose rationale kept after it | [Mentor review 2026-10-06 §2](../reviews/mentor-reviews.md#2-a-reason-for-every-decision) |
+  | Oct 11, 2026 | §3.1.1.1, §3.1.1.3, §3.2.1 | Layer-first layout (`api/v1/`, `domain/`, `services/`, `models/`, `schemas/`) replaced by the `orders/` entity with `v1/` inside it (ORD-D27) | [Mentor review 2026-10-06 §3](../reviews/mentor-reviews.md#3-entity-first-service-layout-with-versions) |
+  | Oct 11, 2026 | §3.1.1.1–§3.1.1.4, §3.1.3 | ASCII diagrams converted to Mermaid; component, class, state, flow, sequence and ER diagrams added | [Mentor review 2026-10-06 §4](../reviews/mentor-reviews.md#4-diagrams) |
+  | Oct 11, 2026 | §3.2.1 | Added ORD-D28–ORD-D33: `order-lifecycle` queue, migrations folded into `0001_initial`, ORD-1 in M2, post-shipment compensation, validated-body request hash, unstarted orders stay `pending` | Milestone 2 implementation (README *Milestone 2 decisions and deviations*) |
+  | Oct 12, 2026 | §3.1.1.1, §3.1.3, §3.2.1 | ORD-D34: `IdempotencyKey`, `IdempotencyRepo` and `IdempotencyState` moved from `core/` into `orders/`; `workflows/`, `clients/`, `providers/` moved under `orders/`; module tree, component diagram and worker command updated; migration `0002_idempotency_state_comment`; ORD-D27's `core/` placement superseded | [Mentor review 2026-10-12 §2](../reviews/mentor-reviews.md#2-every-file-in-its-entity-folder) |
+  | Oct 12, 2026 | §3.2.1, §11 | ORD-D27 marked with the review that changed it; this amendment log added | [Mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review) |
+  | Oct 12, 2026 | §3.1 | Diagram index added | [Mentor review 2026-10-12 §4](../reviews/mentor-reviews.md#4-diagram-coverage-per-service) |
+  | Oct 14, 2026 | §3.1.1.1, §3.1.1.4, §3.1.3, §3.2.1, §3.3.1 | Milestone 3: `orders.payment_method` (migration `0004`) and `resume_unstarted_orders` on `order-celery`; ORD-D35 added, ORD-D33 superseded, ORD-Q5 resolved | [Mentor review 2026-10-13 §4](../reviews/mentor-reviews.md#review-of-2026-10-13) |
+
 - **Definition of done.** Goals G1–G8 verified by their stated checks; the failure-injection, concurrency and isolation suites green; `make up && make migrate && make seed && make test` green from a clean clone; this RFC moved to **DONE** with review outcomes folded in and every ORD proposal ratified or re-decided.
 
 ---
 
 ## 12. Comments
 
-*Reviewer comments go here. Please raise objections against a specific decision (B1–B11, ORD-1–ORD-17), an open question, a transition-table edge, a column, or a rejected alternative in §5, so the discussion attaches to something specific.*
+*Reviewer comments go here. Please raise objections against a specific decision (B1–B11, ORD-1–ORD-17, a decision-register row ORD-D1–ORD-D34), an open question, a transition-table edge, a column, or a rejected alternative in §5, so the discussion attaches to something specific.*
 
 | Reviewer | Section | Comment | Resolution |
 | --- | --- | --- | --- |

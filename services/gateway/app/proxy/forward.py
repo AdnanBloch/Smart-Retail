@@ -18,6 +18,7 @@ from app.proxy.errors import (
     UpstreamTimeout,
     UpstreamUnavailable,
 )
+from smartretail_common.client_id import HEADER, valid_client_id
 from smartretail_common.context import get_request_id
 
 HOP_BY_HOP = frozenset(
@@ -61,6 +62,9 @@ def request_headers(request: Request) -> dict[str, str]:
         headers["x-request-id"] = request_id
     if "content-length" in request.headers:
         headers["content-length"] = request.headers["content-length"]
+    # C21: a malformed X-Client-Id is dropped, never rejected (GW-D31).
+    if HEADER in headers and valid_client_id(headers[HEADER]) is None:
+        del headers[HEADER]
     return headers
 
 
@@ -132,6 +136,13 @@ async def forward(
         params=request.url.query.encode("latin-1") if request.url.query else None,
         headers=request_headers(request),
         content=body,
+        # Per request, so the route's timeout class (default, upload, stream) applies;
+        # the client's own timeout is only the default (GW-14, GW-D30).
+        timeout=httpx.Timeout(
+            read_timeout,
+            connect=client.timeout.connect,
+            pool=client.timeout.pool,
+        ),
     )
     try:
         response = await client.send(upstream_request, stream=True)
