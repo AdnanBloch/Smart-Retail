@@ -250,49 +250,48 @@ services/order/
 │   │   └── schemas.py            Pydantic bases
 │   ├── health/
 │   │   └── routes.py             /health, /health/ready
-│   ├── orders/
-│   │   ├── models.py             Order, OrderItem, OrderStatusHistory, IdempotencyKey — persistence only
-│   │   ├── repo.py               OrderRepo: create, advance(), cancel, reads — the only writer of status
-│   │   ├── idempotency_repo.py   IdempotencyRepo, StoredReply, IdempotencyKeyReused, RequestInProgress:
-│   │   │                         claim / replay / complete / release (B7, ORD-8); key canonicalisation
-│   │   │                         and request hash come from common (ORD-7)
-│   │   ├── shipment_repo.py      ShipmentRepo.apply_carrier_update() — shared by webhook and admin route
-│   │   ├── snapshot.py           catalog lookup → OrderLineSnapshot
-│   │   ├── access.py             ownership and isolation from token claims (ORD-16)
-│   │   ├── events.py             order-event payload builders (envelope from common)
-│   │   ├── dependencies.py       builds the repos for a request
-│   │   ├── enums.py              OrderStatus, PaymentStatus, ShipmentStatus, IdempotencyState,
-│   │   │                         OrderFailureReason (ORD-5)
-│   │   ├── state_machine.py      ORDER_/PAYMENT_/SHIPMENT_TRANSITIONS, transition()
-│   │   ├── utils.py              money: line and order totals (S2, ORD-4)
-│   │   ├── v1/
+│   ├── v1/                       the base version: every entity, complete (ARC-D23)
+│   │   ├── orders/
+│   │   │   ├── models.py         Order, OrderItem, OrderStatusHistory, IdempotencyKey — persistence only
+│   │   │   ├── repo.py           OrderRepo: create, advance(), cancel, reads — the only writer of status
+│   │   │   ├── idempotency_repo.py  IdempotencyRepo, StoredReply, IdempotencyKeyReused, RequestInProgress:
+│   │   │   │                     claim / replay / complete / release (B7, ORD-8); key canonicalisation
+│   │   │   │                     and request hash come from common (ORD-7)
+│   │   │   ├── shipment_repo.py  ShipmentRepo.apply_carrier_update() — shared by webhook and admin route
+│   │   │   ├── snapshot.py       catalog lookup → OrderLineSnapshot
+│   │   │   ├── access.py         ownership and isolation from token claims (ORD-16)
+│   │   │   ├── events.py         order-event payload builders (envelope from common)
+│   │   │   ├── dependencies.py   builds the repos for a request
+│   │   │   ├── enums.py          OrderStatus, PaymentStatus, ShipmentStatus, IdempotencyState,
+│   │   │   │                     OrderFailureReason (ORD-5)
+│   │   │   ├── state_machine.py  ORDER_/PAYMENT_/SHIPMENT_TRANSITIONS, transition()
+│   │   │   ├── utils.py          money: line and order totals (S2, ORD-4)
 │   │   │   ├── routes.py         POST/GET /orders, /merchant, /{id}, /{id}/cancel, /{id}/workflow,
 │   │   │   │                     /{id}/shipment/status (test-only)
-│   │   │   └── schemas.py        the v1 request/response contract
-│   │   ├── providers/
-│   │   │   ├── payment.py        PaymentProvider protocol + FakePaymentProvider
-│   │   │   ├── shipping.py       ShippingProvider protocol + FakeShippingProvider
-│   │   │   └── errors.py         PaymentDeclined, AddressRejected (not retried)
-│   │   ├── clients/
-│   │   │   ├── catalog.py        httpx client, user token forwarded
-│   │   │   └── inventory.py      httpx client, service token (ORD-11)
-│   │   └── workflows/
-│   │       ├── order_workflow.py OrderWorkflow — sequence, compensation, signal, query
-│   │       ├── activities.py     thin adapters over the repos (B1)
-│   │       ├── types.py          what crosses the Temporal boundary; workflow, signal, query names
-│   │       ├── client.py         start, query, signal, describe — used by the routes
-│   │       └── worker.py         `python -m app.v1.orders.workflows.worker`
-│   ├── webhooks/                 (planned)
-│   │   └── v1/
+│   │   │   ├── schemas.py        the v1 request/response contract
+│   │   │   ├── providers/
+│   │   │   │   ├── payment.py    PaymentProvider protocol + FakePaymentProvider
+│   │   │   │   ├── shipping.py   ShippingProvider protocol + FakeShippingProvider
+│   │   │   │   └── errors.py     PaymentDeclined, AddressRejected (not retried)
+│   │   │   ├── clients/
+│   │   │   │   ├── catalog.py    httpx client, user token forwarded
+│   │   │   │   └── inventory.py  httpx client, service token (ORD-11)
+│   │   │   ├── workflows/
+│   │   │   │   ├── order_workflow.py OrderWorkflow — sequence, compensation, signal, query
+│   │   │   │   ├── activities.py  thin adapters over the repos (B1)
+│   │   │   │   ├── types.py      what crosses the Temporal boundary; workflow, signal, query names
+│   │   │   │   ├── client.py     start, query, signal, describe — used by the routes
+│   │   │   │   └── worker.py     `python -m app.v1.orders.workflows.worker`
+│   │   │   └── tasks/
+│   │   │       └── maintenance.py  resume_unstarted_orders (Celery Beat, ORD-9); sweep_idempotency_keys (planned)
+│   │   └── webhooks/             (planned)
 │   │       ├── routes.py         POST /webhooks/shipment (HMAC)
 │   │       └── schemas.py        carrier callback body
-│   │   └── tasks/
-│   │       └── maintenance.py    resume_unstarted_orders (Celery Beat, ORD-9); sweep_idempotency_keys (planned)
 │   └── core/celery_app.py        Celery app + Beat schedule, queue order.maintenance (PLT-D36)
 └── tests/                        mirrors app/
-    ├── unit/orders/              state machines, money, snapshot and clients;
+    ├── unit/v1/orders/           state machines, money, snapshot and clients;
     │                             providers/ (fakes), workflows/
-    └── integration/orders/       real Postgres; workflows/ (OrderWorkflow on a test Temporal)
+    └── integration/v1/orders/    real Postgres; workflows/ (OrderWorkflow on a test Temporal)
 ```
 
 ```mermaid

@@ -226,21 +226,21 @@ services/analytics/
     │   ├── schemas.py       Pydantic bases (as_of, money as string)
     │   └── utils.py         small pure helpers
     ├── health/routes.py     /health, /health/ready (Mongo primary, broker, consumer lag)
-    └── metrics/
-        ├── models.py        collection handles, index and TTL declarations, ensure_indexes()
-        ├── repo.py          MetricsRepo: the metric definitions and read pipelines; the only place a formula lives
-        ├── rollups.py       apply_<event_type>() — pure functions: envelope → list of Mongo update ops
-        ├── scoping.py       merchant scope from the verified claim, injected into every pipeline
-        ├── conversions_repo.py  assistant interaction ↔ order correlation
-        ├── reconcile_repo.py    rebuild_daily_rollups logic (called by the Celery task)
-        ├── backfill_repo.py     raw_events → projection replay; bootstrap-compacted
-        ├── dependencies.py  builds the repos for a request
-        ├── enums.py         CounterName, MetricKey, Granularity, PopularRankBy, FailureSource, InteractionKind
-        ├── utils.py         bucket keys (UTC date of occurred_at), week/month composition; no I/O
-        ├── consumers/       one thin handler per topic: decode → rollups → txn; Mongo dedupe adapter; DLQ observer
-        ├── tasks/           Celery task shims (rebuild_daily_rollups) — call reconcile_repo.py
-        ├── cli/             backfill, bootstrap-compacted — call backfill_repo.py
-        └── v1/
+    └── v1/                  the base version: every entity, complete (ARC-D23)
+        └── metrics/
+            ├── models.py    collection handles, index and TTL declarations, ensure_indexes()
+            ├── repo.py      MetricsRepo: the metric definitions and read pipelines; the only place a formula lives
+            ├── rollups.py   apply_<event_type>() — pure functions: envelope → list of Mongo update ops
+            ├── scoping.py   merchant scope from the verified claim, injected into every pipeline
+            ├── conversions_repo.py  assistant interaction ↔ order correlation
+            ├── reconcile_repo.py  rebuild_daily_rollups logic (called by the Celery task)
+            ├── backfill_repo.py  raw_events → projection replay; bootstrap-compacted
+            ├── dependencies.py  builds the repos for a request
+            ├── enums.py     CounterName, MetricKey, Granularity, PopularRankBy, FailureSource, InteractionKind
+            ├── utils.py     bucket keys (UTC date of occurred_at), week/month composition; no I/O
+            ├── consumers/   one thin handler per topic: decode → rollups → txn; Mongo dedupe adapter; DLQ observer
+            ├── tasks/       Celery task shims (rebuild_daily_rollups) — call reconcile_repo.py
+            ├── cli/         backfill, bootstrap-compacted — call backfill_repo.py
             ├── routes.py    every /analytics/* route, decorated handlers — parse, validate, call, serialise. No rules
             └── schemas.py   Pydantic request/response contracts
 ```

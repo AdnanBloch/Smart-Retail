@@ -166,21 +166,23 @@ The full map, including the layout every service follows, is in
 ```
 docker-compose.yml   Makefile   .env.example   pyproject.toml (ruff/mypy config)
 common/         smartretail_common + tests
-services/<svc>/      main.py, app/{router.py, core/, <entity>/, …}, alembic/, tests/
+services/<svc>/      main.py, app/{router.py, core/, v1/<entity>/, …}, alembic/, tests/
 ops/postgres/init/   databases, roles and grants
 scripts/keys.sh      RS256 key pair and the worker's client secret
 scripts/seed_demo.py demo products, stock and orders through the API
 tests/e2e/           journeys through the gateway
 ```
 
-Services are organised by entity. Each `app/<entity>/` holds its ORM model
-(`models.py`), its business rules (`repo.py`) and helpers such as the state
-machine. Only the HTTP contract is versioned: `app/<entity>/v1/routes.py`
-deals with HTTP only and `v1/schemas.py` holds the Pydantic request/response
-models, which are the API contract. `app/router.py` only includes the entity
-routers and owns the `/api/v1` and entity prefixes, so every URL can be read
-there. Cross-entity infrastructure lives in `app/core/`. The ORM is never
-exposed directly. See [docs/file-structure.md](docs/file-structure.md).
+Services are organised by version, then by entity. `app/v1/<entity>/` holds
+the entity's ORM model (`models.py`), its business rules (`repo.py`), helpers
+such as the state machine, and its handlers: `routes.py` deals with HTTP only
+and `schemas.py` holds the Pydantic request/response models, which are the API
+contract. A later version, `app/v2/<entity>/`, holds only the files it changes
+(handlers, schemas, and `repo.py` if its rules differ) and imports the rest,
+models included, from v1 by name. `app/router.py` only includes the routers and
+owns the `/api/v<N>` and entity prefixes, so every URL can be read there.
+Cross-entity infrastructure lives in `app/core/`, which is not versioned. The
+ORM is never exposed directly. See [docs/file-structure.md](docs/file-structure.md).
 
 ## API overview
 
@@ -276,9 +278,13 @@ Each is a row in the owning RFC's decision register (§3.2.1).
   ([mentor review 2026-10-12 §1](docs/reviews/mentor-reviews.md#1-why-fastapi-and-the-rest-of-the-stack)).
 - **Everything in its entity folder** (ARC-D27, CAT-D32, ORD-D34). Workflows,
   clients and providers moved under `products/` and `orders/`, and the
-  `Idempotency-Key` model into `orders/`. The workers now start with
-  `python -m app.<entity>.workflows.worker`
+  `Idempotency-Key` model into `orders/`
   ([§2](docs/reviews/mentor-reviews.md#2-every-file-in-its-entity-folder)).
+- **Version-first layout** (ARC-D23, changed). Every entity moved to
+  `app/v1/<entity>/`, with its handlers in `routes.py` and `schemas.py`. A later
+  version holds only the files it changes and imports the rest from v1. The
+  workers now start with `python -m app.v1.<entity>.workflows.worker`
+  ([mentor review 2026-10-13](docs/reviews/2026-10-13-mentor-review.md#1-version-first-layout)).
 - **Review traceability** (ARC-D36). A decision a review changed says so in its
   register row, with what it was before. Every RFC has an amendment log that
   links the review behind each change

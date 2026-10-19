@@ -266,44 +266,43 @@ services/notification/
 │   │   ├── config.py             NotificationSettings (§3.1.1.6)
 │   │   ├── db.py  logger.py  dependencies.py  errors.py  schemas.py  utils.py
 │   ├── health/routes.py          /health, /health/ready
-│   ├── notifications/
-│   │   ├── models.py             Notification, DeliveryAttempt
-│   │   ├── repo.py               NotificationRepo: list, mark-read, read-all, unread count, admin view
-│   │   ├── recording_repo.py     event → recipient → type → channels → scope → rows (called by consumers/)
-│   │   ├── delivery_report_repo.py  ack: delivered_at stamping; calls stream/cursor_repo.py for the clamped advance
-│   │   ├── promotion_repo.py     the origin_first promoter (called by tasks/)
-│   │   ├── dispatch_repo.py      attempt rows and the adapter call (called by tasks/)
-│   │   ├── dependencies.py
-│   │   ├── enums.py              NotificationType, NotificationChannel, DeliveryStatus, NotificationDeliveryScope
-│   │   ├── utils.py              scope derivation, channel table, DeliveryStatus transition table; no I/O
-│   │   ├── templates/            one module per NotificationType
-│   │   ├── consumers/            thin handlers per topic → recording_repo.py
-│   │   ├── tasks/                Celery task bodies (hosted by celery-worker): dispatch, promote, redispatch → *_repo.py
-│   │   ├── adapters/
-│   │   │   ├── base.py           NotificationAdapter protocol
-│   │   │   ├── email_log.py      logging email adapter
-│   │   │   ├── sms_log.py        logging SMS adapter
-│   │   │   └── web_push.py       specified, not registered
-│   │   └── v1/
-│   │       ├── routes.py         list, read, read-all, unread-count, ack, admin
-│   │       └── schemas.py
-│   ├── subscriptions/
-│   │   ├── models.py             PushSubscription (specified, unused)
-│   │   └── repo.py               PushSubscriptionRepo, read by adapters/web_push.py; no v1/ until an endpoint exists
-│   └── stream/
-│       ├── models.py             StreamCursor
-│       ├── cursor_repo.py        cold start, greatest() upsert with clamp, last_seen_at
-│       ├── tickets.py            mint / redeem (GETDEL)
-│       ├── catchup.py            floor, bounded query, truncation
-│       ├── fanout.py             PUBLISH / SUBSCRIBE, message schema
-│       ├── connection.py         per-connection queue, heartbeat, presence, cap
-│       ├── frames.py             typed frame serialisers
-│       ├── utils.py              per-connection frame filter; no I/O
-│       ├── tasks/                sweep_stale_stream_cursors (hosted by celery-worker) → cursor_repo.py
-│       └── v1/
+│   └── v1/                       the base version: every entity, complete (ARC-D23)
+│       ├── notifications/
+│       │   ├── models.py         Notification, DeliveryAttempt
+│       │   ├── repo.py           NotificationRepo: list, mark-read, read-all, unread count, admin view
+│       │   ├── recording_repo.py  event → recipient → type → channels → scope → rows (called by consumers/)
+│       │   ├── delivery_report_repo.py  ack: delivered_at stamping; calls stream/cursor_repo.py for the clamped advance
+│       │   ├── promotion_repo.py  the origin_first promoter (called by tasks/)
+│       │   ├── dispatch_repo.py  attempt rows and the adapter call (called by tasks/)
+│       │   ├── dependencies.py
+│       │   ├── enums.py          NotificationType, NotificationChannel, DeliveryStatus, NotificationDeliveryScope
+│       │   ├── utils.py          scope derivation, channel table, DeliveryStatus transition table; no I/O
+│       │   ├── templates/        one module per NotificationType
+│       │   ├── consumers/        thin handlers per topic → recording_repo.py
+│       │   ├── tasks/            Celery task bodies (hosted by celery-worker): dispatch, promote, redispatch → *_repo.py
+│       │   ├── adapters/
+│       │   │   ├── base.py       NotificationAdapter protocol
+│       │   │   ├── email_log.py  logging email adapter
+│       │   │   ├── sms_log.py    logging SMS adapter
+│       │   │   └── web_push.py   specified, not registered
+│       │   ├── routes.py         list, read, read-all, unread-count, ack, admin
+│       │   └── schemas.py
+│       ├── subscriptions/
+│       │   ├── models.py         PushSubscription (specified, unused)
+│       │   └── repo.py           PushSubscriptionRepo, read by adapters/web_push.py; no routes until an endpoint exists
+│       └── stream/
+│           ├── models.py         StreamCursor
+│           ├── cursor_repo.py    cold start, greatest() upsert with clamp, last_seen_at
+│           ├── tickets.py        mint / redeem (GETDEL)
+│           ├── catchup.py        floor, bounded query, truncation
+│           ├── fanout.py         PUBLISH / SUBSCRIBE, message schema
+│           ├── connection.py     per-connection queue, heartbeat, presence, cap
+│           ├── frames.py         typed frame serialisers
+│           ├── utils.py          per-connection frame filter; no I/O
+│           ├── tasks/            sweep_stale_stream_cursors (hosted by celery-worker) → cursor_repo.py
 │           ├── routes.py         stream-ticket, stream (HTTP only; delegates to the modules above)
 │           └── schemas.py
-└── tests/  unit/<entity>/  integration/<entity>/
+└── tests/  unit/v1/<entity>/  integration/v1/<entity>/
 ```
 
 Both entity routers mount under `/notifications`. Literal segments (`/unread-count`, `/read-all`, `/ack`, `/admin`, `/stream-ticket`, `/stream`) are declared before `/{id}` in their `v1/routes.py`, and `app/router.py` includes `stream/v1` before `notifications/v1` so the stream literals are never captured by `/{id}`.

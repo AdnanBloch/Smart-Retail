@@ -202,29 +202,30 @@ services/identity/
 │   │   ├── enums.py              UserRole, MerchantStatus (S4) — shared by several entities
 │   │   └── schemas.py            StrictModel / OutModel bases, shared field types
 │   ├── health/routes.py          /health, /health/ready (DB + active signing key)
-│   ├── auth/
-│   │   ├── models.py             RefreshSession
-│   │   ├── enums.py              TokenType (typ claim; not persisted)
-│   │   ├── dependencies.py       builds the auth repos
-│   │   ├── registration_repo.py  create user (+ merchant profile)
-│   │   ├── authentication_repo.py credential check, dummy-hash equalisation, rehash-on-login
-│   │   ├── session_repo.py       rotate, reuse detection, logout, revoke_all_sessions
-│   │   ├── token_repo.py         claim assembly and signing (access token, session pair)
-│   │   └── v1/{routes,schemas}.py register, login, refresh, logout, jwks (+ token, planned)
-│   ├── users/
-│   │   ├── models.py             User
-│   │   ├── repo.py               profile, password change, admin updates (IDN-7, I10)
-│   │   ├── dependencies.py
-│   │   ├── utils.py              password policy (IDN-2)
-│   │   └── v1/{routes,schemas}.py /users/me, /users/me/password, admin /users
-│   └── merchants/
-│       ├── models.py             MerchantProfile
-│       ├── repo.py               public profile, /me, admin listing (+ status transitions, planned)
-│       ├── dependencies.py
-│       ├── utils.py              MERCHANT_TRANSITIONS (§3.1.1.3), slug derivation
-│       └── v1/{routes,schemas}.py /merchants/me, /merchants/{id}, admin /merchants (+ /status, planned)
+│   └── v1/                       the base version: every entity, complete (ARC-D23)
+│       ├── auth/
+│       │   ├── models.py         RefreshSession
+│       │   ├── enums.py          TokenType (typ claim; not persisted)
+│       │   ├── dependencies.py   builds the auth repos
+│       │   ├── registration_repo.py  create user (+ merchant profile)
+│       │   ├── authentication_repo.py credential check, dummy-hash equalisation, rehash-on-login
+│       │   ├── session_repo.py   rotate, reuse detection, logout, revoke_all_sessions
+│       │   ├── token_repo.py     claim assembly and signing (access token, session pair)
+│       │   └── {routes,schemas}.py register, login, refresh, logout, jwks (+ token, planned)
+│       ├── users/
+│       │   ├── models.py         User
+│       │   ├── repo.py           profile, password change, admin updates (IDN-7, I10)
+│       │   ├── dependencies.py
+│       │   ├── utils.py          password policy (IDN-2)
+│       │   └── {routes,schemas}.py /users/me, /users/me/password, admin /users
+│       └── merchants/
+│           ├── models.py         MerchantProfile
+│           ├── repo.py           public profile, /me, admin listing (+ status transitions, planned)
+│           ├── dependencies.py
+│           ├── utils.py          MERCHANT_TRANSITIONS (§3.1.1.3), slug derivation
+│           └── {routes,schemas}.py /merchants/me, /merchants/{id}, admin /merchants (+ /status, planned)
 ├── alembic/                      per-service history (S14)
-└── tests/{unit,integration}/<entity>/
+└── tests/{unit,integration}/v1/<entity>/
 ```
 
 The client-credentials grant (IDN-T3) and the outbox writes (IDN-T4, IDN-T5) are *(planned)*: they land in `auth/` and `merchants/` as further repos and routes, not as new top-level packages.

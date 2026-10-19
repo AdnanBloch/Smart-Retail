@@ -239,39 +239,38 @@ services/inventory/
 │   │   ├── errors.py           DomainError subclasses: insufficient-stock, reservation-not-held, …
 │   │   ├── enums.py            CallerRole — shared by both entities
 │   │   └── schemas.py          Pydantic bases
-│   ├── stock/
-│   │   ├── models.py           StockItem, StockMovement — SQLAlchemy ORM, no behaviour
-│   │   ├── repo.py             StockRepo: set, adjust, initialise, read, low-stock queries
-│   │   ├── ledger_repo.py      LedgerRepo: the only writer of stock_movements; reconciliation check
-│   │   ├── locking.py          canonical lock order, lock_timeout, bounded retry
-│   │   ├── access.py           merchant ownership against stock_items.merchant_id (INV-14)
-│   │   ├── events.py           inventory.* outbox payloads (INV-7)
-│   │   ├── enums.py            StockMovementReason, StockoutTrigger
-│   │   ├── dependencies.py     builds the stock repos for a request
-│   │   └── v1/
-│   │       ├── routes.py       public + merchant/admin /inventory/*; internal POST /stock-items
-│   │       └── schemas.py      v1 request/response models
-│   ├── reservations/
-│   │   ├── models.py           Reservation
-│   │   ├── repo.py             ReservationRepo: reserve / commit / release / reverse / expire — the one hard function
-│   │   ├── enums.py            ReservationStatus
-│   │   ├── state_machine.py    RESERVATION_TRANSITIONS, transition() — no I/O (INV-D26)
-│   │   ├── sweeper.py          sweep_once / in-process expiry sweeper driver (INV-10)
-│   │   ├── consumers/
-│   │   │   └── order_cancelled.py      order.cancelled → ReservationRepo.release_for_order
-│   │   ├── tasks/
-│   │   │   └── maintenance.py          Celery: smartretail.inventory.sweep_expired_reservations
-│   │   ├── dependencies.py
-│   │   └── v1/
-│   │       ├── routes.py       internal (service token) /reservations routes
-│   │       └── schemas.py
-│   ├── stock/consumers/
-│   │   └── catalog_product_published.py  catalog.product.published → StockRepo.insert_initial
+│   ├── v1/                     the base version: every entity, complete (ARC-D23)
+│   │   ├── stock/
+│   │   │   ├── models.py       StockItem, StockMovement — SQLAlchemy ORM, no behaviour
+│   │   │   ├── repo.py         StockRepo: set, adjust, initialise, read, low-stock queries
+│   │   │   ├── ledger_repo.py  LedgerRepo: the only writer of stock_movements; reconciliation check
+│   │   │   ├── locking.py      canonical lock order, lock_timeout, bounded retry
+│   │   │   ├── access.py       merchant ownership against stock_items.merchant_id (INV-14)
+│   │   │   ├── events.py       inventory.* outbox payloads (INV-7)
+│   │   │   ├── enums.py        StockMovementReason, StockoutTrigger
+│   │   │   ├── dependencies.py  builds the stock repos for a request
+│   │   │   ├── routes.py       public + merchant/admin /inventory/*; internal POST /stock-items
+│   │   │   └── schemas.py      v1 request/response models
+│   │   ├── reservations/
+│   │   │   ├── models.py       Reservation
+│   │   │   ├── repo.py         ReservationRepo: reserve / commit / release / reverse / expire — the one hard function
+│   │   │   ├── enums.py        ReservationStatus
+│   │   │   ├── state_machine.py  RESERVATION_TRANSITIONS, transition() — no I/O (INV-D26)
+│   │   │   ├── sweeper.py      sweep_once / in-process expiry sweeper driver (INV-10)
+│   │   │   ├── consumers/
+│   │   │   │   └── order_cancelled.py  order.cancelled → ReservationRepo.release_for_order
+│   │   │   ├── tasks/
+│   │   │   │   └── maintenance.py      Celery: smartretail.inventory.sweep_expired_reservations
+│   │   │   ├── dependencies.py
+│   │   │   ├── routes.py       internal (service token) /reservations routes
+│   │   │   └── schemas.py
+│   │   └── stock/consumers/
+│   │       └── catalog_product_published.py  catalog.product.published → StockRepo.insert_initial
 │   └── core/
 │       ├── consumer.py         the consumer process (group inventory): wires both handlers (INV-D31)
 │       ├── celery_app.py       Celery app + Beat schedule, queue inventory.maintenance (PLT-D36)
 │       └── tasks.py            Celery: smartretail.inventory.sweep_processed_events (PLT-17)
-└── tests/                      unit/<entity>/…, integration/<entity>/…
+└── tests/                      unit/v1/<entity>/…, integration/v1/<entity>/…
 ```
 
 The internal routes live in each entity's `v1/routes.py` (on a second router the entity exports for `app/router.py` to mount under `/internal/v1/inventory`), so a path's full URL is still readable from `app/router.py` alone. Routes never touch the ORM; repos never construct an HTTP response. That seam is what lets a route, a Temporal activity (via the internal route), a Kafka consumer and a Celery task reach one implementation of each rule.

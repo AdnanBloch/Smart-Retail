@@ -209,28 +209,29 @@ services/catalog/
 │   │   ├── schemas.py            # Pydantic bases for the versioned schemas
 │   │   └── utils.py              # small pure helpers
 │   ├── health/routes.py          # /health, /health/ready
-│   ├── products/
-│   │   ├── models.py             # Product, ProductAuditLog; (planned) ProductPublishFailure
-│   │   ├── enums.py              # ProductStatus, ProductAuditAction; (planned) PublishStep, UnpublishReason
-│   │   ├── state_machine.py      # PRODUCT_TRANSITIONS, transition(), IllegalTransition
-│   │   ├── access.py             # ownership and visibility (I4)
-│   │   ├── repo.py               # ProductRepo: create/update/archive, status, version check, audit (+ outbox, publish accept, suspension)
-│   │   ├── listing_repo.py       # filters, sort, pagination, visibility; (planned) browse cache
-│   │   ├── audit_repo.py         # product_audit_log writes (S7, CAT-5)
-│   │   ├── publishing_repo.py    # PublishingRepo: the five publishing steps the activities call in-process (CAT-D27)
-│   │   ├── dependencies.py
-│   │   ├── v1/{routes,schemas}.py  # /products, /products/me, /{id}, /status, /history, nested /variants and /media adds
-│   │   ├── workflows/            # ProductPublishingWorkflow, activities, types, client (start/cancel), worker
-│   │   │                         #   (`python -m app.v1.products.workflows.worker`, CAT-D32)
-│   │   └── clients/inventory.py  # InventoryClient: stock initialisation for sync_downstream, service token
-│   ├── variants/                 # models.py, repo.py (VariantRepo), dependencies.py, v1/{routes,schemas}.py — PATCH/DELETE /variants/{id}
-│   ├── categories/               # models.py, repo.py, dependencies.py, v1/{routes,schemas}.py — /categories
-│   ├── media/                    # models.py, repo.py (MediaRepo), dependencies.py, v1/{routes,schemas}.py — DELETE /media/{id};
+│   ├── v1/                       # the base version: every entity, complete (ARC-D23)
+│   │   ├── products/
+│   │   │   ├── models.py         # Product, ProductAuditLog; (planned) ProductPublishFailure
+│   │   │   ├── enums.py          # ProductStatus, ProductAuditAction; (planned) PublishStep, UnpublishReason
+│   │   │   ├── state_machine.py  # PRODUCT_TRANSITIONS, transition(), IllegalTransition
+│   │   │   ├── access.py         # ownership and visibility (I4)
+│   │   │   ├── repo.py           # ProductRepo: create/update/archive, status, version check, audit (+ outbox, publish accept, suspension)
+│   │   │   ├── listing_repo.py   # filters, sort, pagination, visibility; (planned) browse cache
+│   │   │   ├── audit_repo.py     # product_audit_log writes (S7, CAT-5)
+│   │   │   ├── publishing_repo.py  # PublishingRepo: the five publishing steps the activities call in-process (CAT-D27)
+│   │   │   ├── dependencies.py
+│   │   │   ├── {routes,schemas}.py  # /products, /products/me, /{id}, /status, /history, nested /variants and /media adds
+│   │   │   ├── workflows/        # ProductPublishingWorkflow, activities, types, client (start/cancel), worker
+│   │   │   │                     #   (`python -m app.v1.products.workflows.worker`, CAT-D32)
+│   │   │   └── clients/inventory.py  # InventoryClient: stock initialisation for sync_downstream, service token
+│   │   ├── variants/             # models.py, repo.py (VariantRepo), dependencies.py, {routes,schemas}.py — PATCH/DELETE /variants/{id}
+│   │   ├── categories/           # models.py, repo.py, dependencies.py, {routes,schemas}.py — /categories
+│   │   └── media/                # models.py, repo.py (MediaRepo), dependencies.py, {routes,schemas}.py — DELETE /media/{id};
 │   │                             #   (planned) enums.py (MediaProcessingStatus), MinIO storage, upload validation
 │   ├── internal/                 # (planned) /internal/v1 routes for publishing activities (CAT-3), included by app/router.py
 │   ├── tasks/                    # (planned) process_media Celery task — imported by celery-worker
 │   └── consumers/                # (planned) identity.merchant.status_changed + cache invalidation — thin, like routes
-└── tests/                        # unit/<entity>/…, integration/<entity>/…, test_schema_conventions.py
+└── tests/                        # unit/v1/<entity>/…, integration/v1/<entity>/…, test_schema_conventions.py
 ```
 
 Routes do not touch the ORM and repos do not construct HTTP responses. That seam is why a publishing activity, the consumer and a route share one implementation of each rule (B1). Where the internal routes live (`app/internal/` versus an `internal/` folder per entity) is not fixed by [file-structure §5](../file-structure.md#5-per-service-differences); the folder above is a proposal.

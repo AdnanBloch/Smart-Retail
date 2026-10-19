@@ -308,59 +308,57 @@ services/assistant/
 │   │   │   └── llm.py         LLMProvider protocol + real/cassette/scripted-fake (chat/, generations/) (E11)
 │   │   └── tasks/             retention sweeps on the shared outbox and processed_events tables, which no entity owns
 │   ├── health/routes.py
-│   ├── search/                product_chunks, embedding_cache, index_state, query_log
-│   │   ├── models.py
-│   │   ├── repo.py            SearchRepo: dense, keyword, RRF fusion, grouping, hydration, query_log (D4, D7–D9)
-│   │   ├── indexing_repo.py   per-event index/remove logic, reindex (§3.1.1.4)
-│   │   ├── cache_repo.py      content-hash embedding cache (D6)
-│   │   ├── vector_store.py    VectorStore protocol: upsert/search/delete_by_product/count
-│   │   ├── renderer.py        structured record → prose (D5)
-│   │   ├── chunker.py         typed chunks, identity prefix, bounds
-│   │   ├── enums.py           ChunkType, IndexStatus, SearchMode
-│   │   ├── utils.py           index_state transition table (AST-7), RRF arithmetic; no I/O
-│   │   ├── dependencies.py
-│   │   ├── clients/
-│   │   │   └── embeddings.py  EmbeddingProvider protocol + real/disk-cached/fake (D10); only search/ embeds
-│   │   ├── consumers/
-│   │   │   └── product_events.py  thin handler → indexing_repo.py (run by indexer-worker)
-│   │   ├── tasks/             Celery: run_reindex, anonymise_query_log, evict_embedding_cache, check_index_model
-│   │   └── v1/
-│   │       ├── routes.py      /api/v1/search/*
-│   │       └── schemas.py
-│   ├── chat/                  conversations, messages
-│   │   ├── models.py
-│   │   ├── repo.py            ConversationRepo: persistence, windowed memory, rolling summary (E9)
-│   │   ├── enums.py           MessageRole, Intent, FinishReason
-│   │   ├── agent/
-│   │   │   ├── state.py       typed graph state (E2)
-│   │   │   ├── nodes/         guard, load_memory, classify, retrieve, compare,
-│   │   │   │                  clarify, refuse, resolve_follow_up, hydrate,
-│   │   │   │                  assemble_context, generate, persist
-│   │   │   ├── graph.py       customer graph + merchant generation graph
-│   │   │   └── streaming.py   astream_events → typed SSE events (E3, E5)
-│   │   ├── dependencies.py
-│   │   ├── tasks/             Celery: sweep_anonymous_conversations
-│   │   └── v1/
-│   │       ├── routes.py      /api/v1/assistant/chat*, /conversations*, /messages/{id}/feedback
-│   │       └── schemas.py
-│   ├── generations/           generations, token_budgets, bulk_generation_jobs
-│   │   ├── models.py
-│   │   ├── repo.py            GenerationRepo: ownership check, drafts, applied false → true
-│   │   ├── bulk_repo.py       BulkGenerationJobRepo: job creation, counters, cancellation
-│   │   ├── budget_repo.py     Redis fast path + token_budgets reconciliation (E10)
-│   │   ├── enums.py           BulkJobStatus
-│   │   ├── utils.py           BulkJobStatus transition table; no I/O
-│   │   ├── dependencies.py
-│   │   ├── tasks/             Celery: run_bulk_generation, reconcile_token_budgets
-│   │   └── v1/
-│   │       ├── routes.py      /api/v1/assistant/generate*, /generations*, /usage*
-│   │       └── schemas.py
-│   └── prompts/               prompt_templates (no HTTP surface, so no v1/)
-│       ├── models.py
-│       └── repo.py            active-version lookup and rendering
+│   └── v1/                    the base version: every entity, complete (ARC-D23)
+│       ├── search/            product_chunks, embedding_cache, index_state, query_log
+│       │   ├── models.py
+│       │   ├── repo.py        SearchRepo: dense, keyword, RRF fusion, grouping, hydration, query_log (D4, D7–D9)
+│       │   ├── indexing_repo.py  per-event index/remove logic, reindex (§3.1.1.4)
+│       │   ├── cache_repo.py  content-hash embedding cache (D6)
+│       │   ├── vector_store.py  VectorStore protocol: upsert/search/delete_by_product/count
+│       │   ├── renderer.py    structured record → prose (D5)
+│       │   ├── chunker.py     typed chunks, identity prefix, bounds
+│       │   ├── enums.py       ChunkType, IndexStatus, SearchMode
+│       │   ├── utils.py       index_state transition table (AST-7), RRF arithmetic; no I/O
+│       │   ├── dependencies.py
+│       │   ├── clients/
+│       │   │   └── embeddings.py  EmbeddingProvider protocol + real/disk-cached/fake (D10); only search/ embeds
+│       │   ├── consumers/
+│       │   │   └── product_events.py  thin handler → indexing_repo.py (run by indexer-worker)
+│       │   ├── tasks/         Celery: run_reindex, anonymise_query_log, evict_embedding_cache, check_index_model
+│       │   ├── routes.py      /api/v1/search/*
+│       │   └── schemas.py
+│       ├── chat/              conversations, messages
+│       │   ├── models.py
+│       │   ├── repo.py        ConversationRepo: persistence, windowed memory, rolling summary (E9)
+│       │   ├── enums.py       MessageRole, Intent, FinishReason
+│       │   ├── agent/
+│       │   │   ├── state.py   typed graph state (E2)
+│       │   │   ├── nodes/     guard, load_memory, classify, retrieve, compare,
+│       │   │   │              clarify, refuse, resolve_follow_up, hydrate,
+│       │   │   │              assemble_context, generate, persist
+│       │   │   ├── graph.py   customer graph + merchant generation graph
+│       │   │   └── streaming.py  astream_events → typed SSE events (E3, E5)
+│       │   ├── dependencies.py
+│       │   ├── tasks/         Celery: sweep_anonymous_conversations
+│       │   ├── routes.py      /api/v1/assistant/chat*, /conversations*, /messages/{id}/feedback
+│       │   └── schemas.py
+│       ├── generations/       generations, token_budgets, bulk_generation_jobs
+│       │   ├── models.py
+│       │   ├── repo.py        GenerationRepo: ownership check, drafts, applied false → true
+│       │   ├── bulk_repo.py   BulkGenerationJobRepo: job creation, counters, cancellation
+│       │   ├── budget_repo.py  Redis fast path + token_budgets reconciliation (E10)
+│       │   ├── enums.py       BulkJobStatus
+│       │   ├── utils.py       BulkJobStatus transition table; no I/O
+│       │   ├── dependencies.py
+│       │   ├── tasks/         Celery: run_bulk_generation, reconcile_token_budgets
+│       │   ├── routes.py      /api/v1/assistant/generate*, /generations*, /usage*
+│       │   └── schemas.py
+│       └── prompts/           prompt_templates (no HTTP surface, so no routes.py)
+│           ├── models.py
+│           └── repo.py        active-version lookup and rendering
 ├── eval/                      retrieval set (30 queries), answer sets (25 conv.,
 │                              8 vague, adversarial, injection)
-└── tests/                     unit/<entity>/, integration/<entity>/, test_migrations.py
+└── tests/                     unit/v1/<entity>/, integration/v1/<entity>/, test_migrations.py
 ops/prompts/                   template sources seeded into prompt_templates
 ```
 

@@ -18,7 +18,7 @@ two topics:
 > version. In an upcoming version, the main files contain only the URLs and the
 > views (the handlers, as we call them), and we reference a few files from an
 > older version, or from v1, explicitly — models, for example.
-
+>
 > Have to understand: Temporal; Kafka partitioning — which method we use; the
 > commit solution; retry, on which basis; atomicity; the business logic;
 > RabbitMQ, Celery workers and Kafka — why use all of them when we have one.
@@ -43,7 +43,7 @@ two topics:
 (ARC-D23) put the version *inside* each entity, and versioned only the HTTP
 contract:
 
-```
+```text
 app/orders/models.py, repo.py, workflows/, …   not versioned
 app/orders/v1/routes.py, schemas.py            versioned
 ```
@@ -69,7 +69,7 @@ API versions need different business rules for the same entity."*
 **What the layout is now.** In identity, catalog, order, inventory,
 notification, analytics and assistant:
 
-```
+```text
 app/
   router.py          every URL in one file: mounts /api/v1 (and a later /api/v2)
   models.py          imports app.v1.<entity>.models onto one metadata
@@ -82,7 +82,7 @@ tests/{unit,integration}/v1/<entity>/
 
 A later version is a folder that holds only the files it changes:
 
-```
+```text
 app/v2/orders/routes.py     # the handlers and URLs of v2
 app/v2/orders/schemas.py    # the v2 contract
 app/v2/orders/repo.py       # only if v2's business rules differ
@@ -122,6 +122,11 @@ from app.v1.orders.repo import OrderRepo    # or app.v2.orders.repo when the rul
   - order `0005_enum_comment_paths_v1`
   - notification `0004_enum_comment_paths_v1`
 - Earlier migrations are history and keep the paths they were written with.
+  So do decision-register and amendment-log rows written before this change:
+  they record the layout of their time.
+- Each service RFC's module tree, file-structure.md, the README, and the
+  current-state text and links in every RFC now use the `app/v1/<entity>/`
+  paths.
 
 Binding: [RFC 0000](../rfcs/0000-architecture.md) ARC-D23 and §3.1.1.7;
 [file-structure.md](../file-structure.md) §4.
