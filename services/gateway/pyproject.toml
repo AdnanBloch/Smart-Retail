@@ -14,6 +14,8 @@ dependencies = [
     "httpx>=0.28,<0.29",
     "pydantic-settings>=2.6,<3",
     "pyjwt[crypto]>=2.10,<2.11",
+    # GW-7: rate-limit counters.
+    "redis[hiredis]>=5.2,<6",
 ]
 
 [tool.setuptools]

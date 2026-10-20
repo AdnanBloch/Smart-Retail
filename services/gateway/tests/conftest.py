@@ -77,7 +77,10 @@ def upstreams() -> dict[str, Upstream]:
 
 @pytest.fixture
 def settings() -> GatewaySettings:
-    return GatewaySettings(jwt_public_key_path=None, gateway_max_body_bytes=1024)
+    # Rate limiting is off here; tests/integration/test_ratelimit.py turns it on.
+    return GatewaySettings(
+        jwt_public_key_path=None, gateway_max_body_bytes=1024, gateway_ratelimit_enabled=False
+    )
 
 
 @pytest.fixture

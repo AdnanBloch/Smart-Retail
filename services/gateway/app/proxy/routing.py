@@ -13,6 +13,8 @@ to the service's own checks (GW-1); a gateway allow is never authorisation.
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from app.core.ratelimit import RateFamily
+
 ADMIN = "admin"
 MERCHANT = "merchant"
 CUSTOMER = "customer"
@@ -40,6 +42,8 @@ class RouteRule:
     upload: bool = False
     # GW-D30: the `stream` timeout class, for server-sent events.
     stream: bool = False
+    # GW-7: the route's own rate-limit family, stacked on `default`.
+    rate: RateFamily | None = None
 
     @property
     def segments(self) -> tuple[str, ...]:
@@ -72,16 +76,18 @@ def _r(
     *,
     upload: bool = False,
     stream: bool = False,
+    rate: RateFamily | None = None,
 ) -> RouteRule:
     methods_set = frozenset(methods.split(","))
-    return RouteRule(pattern, methods_set, upstream, policy, frozenset(roles), upload, stream)
+    return RouteRule(pattern, methods_set, upstream, policy, frozenset(roles), upload, stream, rate)
 
 
 P = Policy
+RL = RateFamily
 ROUTES: tuple[RouteRule, ...] = (
     # identity
     _r("/api/v1/auth/register", "POST", "identity", P.PUBLIC),
-    _r("/api/v1/auth/login", "POST", "identity", P.PUBLIC),
+    _r("/api/v1/auth/login", "POST", "identity", P.PUBLIC, rate=RL.LOGIN),
     _r("/api/v1/auth/refresh", "POST", "identity", P.PUBLIC),
     _r("/api/v1/auth/jwks", "GET", "identity", P.PUBLIC),
     _r("/api/v1/auth/logout", "POST", "identity", P.BEARER),
@@ -122,7 +128,7 @@ ROUTES: tuple[RouteRule, ...] = (
     _r("/api/v1/variants/{id}", "PATCH,DELETE", "catalog", P.BEARER, CATALOG_WRITERS),
     _r("/api/v1/media/{id}", "DELETE", "catalog", P.BEARER, CATALOG_WRITERS),
     # order (RFC 0005 §3.1.2.2)
-    _r("/api/v1/orders", "POST", "order", P.BEARER, {CUSTOMER}),
+    _r("/api/v1/orders", "POST", "order", P.BEARER, {CUSTOMER}, rate=RL.ORDER_CREATE),
     _r("/api/v1/orders", "GET", "order", P.BEARER, ORDER_READERS),
     _r("/api/v1/orders/merchant", "GET", "order", P.BEARER, {MERCHANT}),
     _r("/api/v1/orders/{id}", "GET", "order", P.BEARER, ORDER_READERS),
@@ -140,7 +146,7 @@ ROUTES: tuple[RouteRule, ...] = (
     _r("/api/v1/notifications", "GET", "notification", P.BEARER),
     _r("/api/v1/notifications/unread-count", "GET", "notification", P.BEARER),
     _r("/api/v1/notifications/read-all", "POST", "notification", P.BEARER),
-    _r("/api/v1/notifications/ack", "POST", "notification", P.BEARER),
+    _r("/api/v1/notifications/ack", "POST", "notification", P.BEARER, rate=RL.NOTIF_ACK),
     _r("/api/v1/notifications/stream-ticket", "POST", "notification", P.BEARER),
     _r("/api/v1/notifications/stream", "GET", "notification", P.PUBLIC, stream=True),
     _r("/api/v1/notifications/admin", "GET", "notification", P.BEARER, {ADMIN}),
@@ -153,19 +159,41 @@ ROUTES: tuple[RouteRule, ...] = (
     _r("/api/v1/analytics/inventory/stockouts", "GET", "analytics", P.BEARER, ANALYTICS_READERS),
     _r("/api/v1/analytics/failures", "GET", "analytics", P.BEARER, {ADMIN}),
     # assistant (RFC 0009 §3.1.2.1)
-    _r("/api/v1/search/semantic", "POST", "assistant", P.OPTIONAL),
-    _r("/api/v1/search/similar/{id}", "GET", "assistant", P.OPTIONAL),
+    _r("/api/v1/search/semantic", "POST", "assistant", P.OPTIONAL, rate=RL.SEARCH),
+    _r("/api/v1/search/similar/{id}", "GET", "assistant", P.OPTIONAL, rate=RL.SEARCH),
     _r("/api/v1/search/index/status", "GET", "assistant", P.BEARER, {ADMIN}),
     _r("/api/v1/search/index/reindex", "POST", "assistant", P.BEARER, {ADMIN}),
     _r("/api/v1/search/index/{id}", "GET", "assistant", P.BEARER, CATALOG_WRITERS),
-    _r("/api/v1/assistant/chat", "POST", "assistant", P.OPTIONAL, stream=True),
-    _r("/api/v1/assistant/chat/sync", "POST", "assistant", P.OPTIONAL),
+    _r("/api/v1/assistant/chat", "POST", "assistant", P.OPTIONAL, stream=True, rate=RL.CHAT),
+    _r("/api/v1/assistant/chat/sync", "POST", "assistant", P.OPTIONAL, rate=RL.CHAT),
     _r("/api/v1/assistant/conversations", "GET", "assistant", P.BEARER, {CUSTOMER}),
     _r("/api/v1/assistant/conversations/{id}", "GET,DELETE", "assistant", P.BEARER, {CUSTOMER}),
     _r("/api/v1/assistant/messages/{id}/feedback", "POST", "assistant", P.BEARER, {CUSTOMER}),
-    _r("/api/v1/assistant/generate", "POST", "assistant", P.BEARER, {MERCHANT}, stream=True),
-    _r("/api/v1/assistant/generate/sync", "POST", "assistant", P.BEARER, {MERCHANT}),
-    _r("/api/v1/assistant/generate/bulk", "POST", "assistant", P.BEARER, {MERCHANT}),
+    _r(
+        "/api/v1/assistant/generate",
+        "POST",
+        "assistant",
+        P.BEARER,
+        {MERCHANT},
+        stream=True,
+        rate=RL.GENERATE,
+    ),
+    _r(
+        "/api/v1/assistant/generate/sync",
+        "POST",
+        "assistant",
+        P.BEARER,
+        {MERCHANT},
+        rate=RL.GENERATE,
+    ),
+    _r(
+        "/api/v1/assistant/generate/bulk",
+        "POST",
+        "assistant",
+        P.BEARER,
+        {MERCHANT},
+        rate=RL.GENERATE,
+    ),
     _r("/api/v1/assistant/generate/jobs/{id}", "GET", "assistant", P.BEARER, {MERCHANT}),
     _r("/api/v1/assistant/generate/jobs/{id}/cancel", "POST", "assistant", P.BEARER, {MERCHANT}),
     _r("/api/v1/assistant/generations", "GET", "assistant", P.BEARER, {MERCHANT}),

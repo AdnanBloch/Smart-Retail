@@ -33,6 +33,22 @@ class GatewaySettings(BaseServiceSettings):
     gateway_upstream_max_keepalive: int = 20
     gateway_openapi_cache_ttl_s: int = 60
 
+    # GW-7: rate-limit counters, shared across replicas. Fails open past the timeout.
+    redis_url: str = "redis://redis:6379/0"
+    gateway_ratelimit_enabled: bool = True
+    gateway_ratelimit_redis_timeout_ms: int = 50
+    # Warm connections kept for the limiter; a burst queues for one (GW-7).
+    gateway_ratelimit_redis_pool_size: int = 20
+    rl_default_per_ip_per_min: int = 100
+    rl_login_per_ip_per_min: int = 5
+    rl_order_create_per_user_per_min: int = 30
+    rl_search_anon_per_ip_per_min: int = 20
+    rl_search_per_user_per_min: int = 60
+    rl_chat_anon_per_ip_per_min: int = 3
+    rl_chat_per_user_per_min: int = 10
+    rl_generate_per_merchant_per_hour: int = 20
+    rl_notif_ack_per_client_per_min: int = 12
+
     @field_validator("gateway_cors_allow_origins")
     @classmethod
     def _no_wildcard(cls, value: str) -> str:
