@@ -109,7 +109,13 @@ class CategoryRepo:
         if in_use:
             raise CategoryInUse()
         await self.session.delete(category)
-        await self.session.commit()
+        try:
+            await self.session.commit()
+        except IntegrityError as exc:
+            # A product or child category referencing it committed after the check
+            # above: the foreign key (RESTRICT) is the arbiter.
+            await self.session.rollback()
+            raise CategoryInUse() from exc
 
     async def _ensure_no_cycle(self, category_id: uuid.UUID, parent_id: uuid.UUID) -> None:
         categories = await self._all()
@@ -128,4 +134,7 @@ class CategoryRepo:
             await self.session.rollback()
             if "slug" in str(exc.orig):
                 raise DuplicateSlug() from exc
+            if "fk_categories_parent_id_categories" in str(exc.orig):
+                # The parent was deleted after the existence check above.
+                raise unknown_reference("parent_id", "Parent category does not exist") from exc
             raise

@@ -292,8 +292,11 @@ class OrderRepo:
                 SHIPMENT_TRANSITIONS, "shipment_status", order.shipment_status, change.shipment
             )
         if status is None and payment is None and shipment is None:
-            await self.session.rollback()
-            return order  # already in effect: an idempotent no-op
+            # Already in effect: an idempotent no-op. Nothing is dirty, so the commit
+            # only releases the row lock; a rollback would expire ``order`` and the
+            # caller's read of it after the session closes would fail.
+            await self.session.commit()
+            return order
 
         if status == OrderStatus.CONFIRMED and (
             (payment or order.payment_status) != PaymentStatus.SUCCEEDED

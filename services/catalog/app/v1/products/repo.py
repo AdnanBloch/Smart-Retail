@@ -276,4 +276,7 @@ class ProductRepo:
             await self.session.rollback()
             if "uq_products_merchant_id_sku" in str(exc.orig):
                 raise DuplicateSku("This merchant already has a product with that SKU") from exc
+            if "fk_products_category_id_categories" in str(exc.orig):
+                # The category was deleted after ``_ensure_category`` read it.
+                raise unknown_reference("category_id", "Category does not exist") from exc
             raise

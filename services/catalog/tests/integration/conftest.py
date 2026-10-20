@@ -181,3 +181,41 @@ async def outbox_rows(database_url: str, event_type: str) -> list[dict]:
     finally:
         await conn.close()
     return [json.loads(r["p"]) for r in rows]
+
+
+def principal(role: str, subject: str) -> "object":
+    """A verified caller, for driving a repo directly (race tests hold transactions open)."""
+    from smartretail_common.auth import Principal
+
+    return Principal(
+        subject=subject,
+        role=role,
+        token_type="user",
+        merchant_id=subject if role == "merchant" else None,
+        merchant_status=None,
+        session_id=None,
+        expires_at=0,
+        key_id=None,
+        claims={},
+    )
+
+
+async def wait_until_blocked(database_url: str, at_least: int = 1) -> None:
+    """Returns once ``at_least`` backends of this database are waiting on a lock."""
+    import asyncio
+
+    import asyncpg
+
+    conn = await asyncpg.connect(database_url.replace("postgresql+asyncpg://", "postgresql://", 1))
+    try:
+        for _ in range(250):
+            waiting = await conn.fetchval(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND wait_event_type = 'Lock'"
+            )
+            if waiting >= at_least:
+                return
+            await asyncio.sleep(0.02)
+    finally:
+        await conn.close()
+    raise AssertionError("the second transaction never blocked on a lock")

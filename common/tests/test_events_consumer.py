@@ -297,3 +297,23 @@ def test_a_consumer_needs_a_store_or_a_sessionmaker() -> None:
         EventConsumer(
             group="g", handlers={}, codec=registered_codec(PUBLISHED), dlq=FakePublisher()
         )
+
+
+async def test_an_idle_poll_is_not_an_error_and_polling_continues(events_engine) -> None:
+    consumer, _ = make(events_engine, Recorder())
+    source = FakeSource()  # nothing to read yet: poll returns None
+    stop = asyncio.Event()
+    original = source.commit
+
+    def commit_then_stop(msg: FakeMessage) -> None:
+        original(msg)
+        stop.set()
+
+    source.commit = commit_then_stop  # type: ignore[method-assign]
+    task = asyncio.create_task(consumer.run(source, stop))
+    await asyncio.sleep(0.05)  # several empty polls
+    assert not task.done()
+    late = await message(consumer)
+    source.messages.append(late)
+    await asyncio.wait_for(task, timeout=5)
+    assert source.committed == [late] and await effects(events_engine) == 1

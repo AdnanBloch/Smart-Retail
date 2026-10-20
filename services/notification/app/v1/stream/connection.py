@@ -16,7 +16,7 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 
@@ -47,10 +47,19 @@ async def claim_slot(redis: "Redis", user_id: object, *, limit: int, ttl_seconds
     return True
 
 
+# Decrement and drop-at-zero in one step: as two commands, a claim landing between
+# the DECR and the DEL was deleted with the key and the cap drifted open.
+_RELEASE = """
+local n = redis.call('DECR', KEYS[1])
+if n <= 0 then redis.call('DEL', KEYS[1]) end
+return n
+"""
+
+
 async def release_slot(redis: "Redis", user_id: object) -> None:
     try:
-        if int(await redis.decr(conns_key(user_id))) <= 0:
-            await redis.delete(conns_key(user_id))
+        # redis-py types eval for both clients; the asyncio client returns an awaitable.
+        await cast("Awaitable[int]", redis.eval(_RELEASE, 1, conns_key(user_id)))
     except Exception as exc:  # the TTL reclaims it
         logger.warning("slot release failed", extra={"error": repr(exc)})
 

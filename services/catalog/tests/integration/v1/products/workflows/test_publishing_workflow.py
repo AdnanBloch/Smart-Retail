@@ -393,3 +393,146 @@ async def test_undecodable_media_through_celery_fails_without_retry(
     async with app.state.db.sessionmaker() as s:
         media = await s.get(ProductMedia, uuid.UUID(upload["id"]))
         assert media.processing_status == "failed"
+
+
+class LostCelery:
+    """A broker that accepts the task but never answers: ``get`` times out."""
+
+    def __init__(self) -> None:
+        self.sent: list[list[str]] = []
+
+    def send_task(self, name, args):
+        self.sent.append(args)
+
+        class Pending:
+            def get(self, timeout, propagate):
+                raise TimeoutError("no reply from catalog.media")
+
+        return Pending()
+
+
+async def test_lost_celery_job_is_retried_then_fails_the_media(
+    client, callers, env, starter, app, storage, inventory
+) -> None:
+    """MediaJobFailed is infrastructure, so retried up to publish_media_max_attempts;
+    the last attempt marks the media failed and the publish compensates."""
+    from app.v1.media.tasks.process import CeleryMediaJobs
+
+    celery = LostCelery()
+    activities = PublishingActivities(
+        app.state.db, app.state.settings, storage, inventory, CeleryMediaJobs(celery, timeout=1)
+    )
+    async with Worker(
+        env.client,
+        task_queue=QUEUE,
+        workflows=[ProductPublishingWorkflow],
+        activities=activities.all(),
+    ):
+        product = await complete_product(client, callers)
+        r = await client.post(
+            f"/api/v1/products/{product['id']}/media/upload",
+            data={"version": str(product["version"])},
+            files={"file": ("a.png", png(), "image/png")},
+            headers=callers.merchant_a,
+        )
+        upload = r.json()
+        outcome, detail = await _run_publish(
+            client, callers, starter, {**product, "version": upload["version"]}
+        )
+    assert (outcome["status"], outcome["failed_step"]) == ("failed", "process_media")
+    assert "MediaJobFailed" in outcome["reason"] and "no reply" in outcome["reason"]
+    assert len(celery.sent) == app.state.settings.publish_media_max_attempts
+    assert detail["status"] == "draft" and inventory.calls == []
+    async with app.state.db.sessionmaker() as s:
+        media = await s.get(ProductMedia, uuid.UUID(upload["id"]))
+        assert media.processing_status == "failed"
+
+
+# --- races and duplicates through real Temporal (CAT-7) -----------------------
+
+
+async def test_concurrent_publishes_run_one_workflow_and_publish_once(
+    client, callers, env, starter, worker, inventory, database_url
+) -> None:
+    product = await complete_product(client, callers)
+    responses = await asyncio.gather(
+        *(publish(client, callers.merchant_a, product) for _ in range(4))
+    )
+    accepted = [r for r in responses if r.status_code == 202]
+    assert len(accepted) == 1, [r.text for r in responses]
+    assert sorted(r.status_code for r in responses) == [202, 409, 409, 409]
+    assert list(starter.handles) == [accepted[0].json()["workflow_id"]]
+
+    outcome = await outcome_of(starter.handles[accepted[0].json()["workflow_id"]])
+    assert outcome["status"] == "published"
+    assert len(inventory.calls) == 1
+    assert len(await outbox_rows(database_url, "catalog.product.published")) == 1
+
+
+async def test_a_workflow_id_is_never_started_twice(client, callers, env, starter, worker) -> None:
+    """REJECT_DUPLICATE: the second line of defence behind the status guard holds
+    even after the first run has finished."""
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    from app.v1.products.workflows.client import TemporalPublishStarter
+
+    product = await complete_product(client, callers)
+    accepted = (await publish(client, callers.merchant_a, product)).json()
+    await outcome_of(starter.handles[accepted["workflow_id"]])
+    with pytest.raises(WorkflowAlreadyStartedError):
+        await TemporalPublishStarter.start(
+            starter,
+            product_id=product["id"],
+            workflow_id=accepted["workflow_id"],
+            actor_id=callers.merchant_a_id,
+            correlation_id=None,
+        )
+
+
+async def test_republish_after_a_failed_run_starts_a_fresh_workflow(
+    client, callers, env, starter, worker, inventory
+) -> None:
+    """A failed publish leaves the product in draft; the merchant's retry gets a new
+    workflow id (new version) and succeeds once the dependency is back."""
+    inventory.error = ApplicationError("bad variants", type="validation", non_retryable=True)
+    product = await complete_product(client, callers)
+    first, detail = await _run_publish(client, callers, starter, product)
+    assert first["status"] == "failed"
+
+    inventory.error = None
+    second, detail = await _run_publish(client, callers, starter, detail)
+    assert second["status"] == "published" and detail["status"] == "published"
+    assert len(starter.handles) == 2 and len(set(starter.handles)) == 2
+    status = (
+        await client.get(
+            f"/api/v1/products/{product['id']}/publish-status", headers=callers.merchant_a
+        )
+    ).json()
+    assert status["state"] == "published"
+
+
+async def test_cancel_before_the_first_activity_still_compensates(
+    client, callers, env, starter, app, storage, inventory
+) -> None:
+    """The cancel arrives with the workflow's first task, before any activity is
+    scheduled (the ``asyncio.CancelledError`` path, not ``ActivityError``): the
+    product must still go back to draft with a recorded reason."""
+    product = await complete_product(client, callers)
+    accepted = (await publish(client, callers.merchant_a, product)).json()
+    handle = starter.handles[accepted["workflow_id"]]
+    await handle.cancel()  # no worker yet: start and cancel land in one activation
+
+    activities = PublishingActivities(app.state.db, app.state.settings, storage, inventory)
+    async with Worker(
+        env.client,
+        task_queue=QUEUE,
+        workflows=[ProductPublishingWorkflow],
+        activities=activities.all(),
+    ):
+        with pytest.raises(WorkflowFailureError):
+            await handle.result()
+    detail = await client.get(f"/api/v1/products/{product['id']}", headers=callers.admin)
+    assert detail.json()["status"] == "draft"
+    failure = await _failure(app, product["id"])
+    assert (failure.failed_step, failure.reason) == ("validate_product", "cancelled")
+    assert inventory.calls == []
