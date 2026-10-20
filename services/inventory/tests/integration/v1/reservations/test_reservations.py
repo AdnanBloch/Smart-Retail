@@ -10,6 +10,8 @@ from sqlalchemy import update
 
 from app.v1.reservations import sweeper
 from app.v1.reservations.models import Reservation
+from app.v1.stock.reconcile import find_drift
+from smartretail_common.db import Database
 from tests.integration.conftest import init_stock, public, reserve
 
 
@@ -32,22 +34,12 @@ async def _events(database_url: str, event_type: str) -> list[dict]:
 
 async def _assert_ledger_reconciles(database_url: str) -> None:
     """I5/I6: quantities equal the ledger's sums and the held reservations."""
-    conn = await asyncpg.connect(_pg(database_url))
+    db = Database(database_url)
     try:
-        drift = await conn.fetch(
-            """
-            SELECT s.variant_id FROM stock_items s
-            LEFT JOIN (SELECT variant_id, sum(delta_on_hand) AS oh, sum(delta_reserved) AS rs
-                       FROM stock_movements GROUP BY variant_id) m USING (variant_id)
-            LEFT JOIN (SELECT variant_id, sum(quantity) AS held FROM reservations
-                       WHERE status = 'held' GROUP BY variant_id) r USING (variant_id)
-            WHERE s.on_hand <> coalesce(m.oh, 0) OR s.reserved <> coalesce(m.rs, 0)
-               OR s.reserved <> coalesce(r.held, 0)
-            """
-        )
+        async with db.sessionmaker() as session:
+            assert await find_drift(session) == []
     finally:
-        await conn.close()
-    assert drift == []
+        await db.dispose()
 
 
 async def test_reserve_then_replay_then_conflict(client, callers, database_url) -> None:

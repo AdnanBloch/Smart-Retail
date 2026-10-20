@@ -19,7 +19,11 @@ SWEEP_EVERY_SECONDS = float(os.environ.get("INVENTORY_SWEEPER_INTERVAL_SECONDS",
 app = make_celery(
     "inventory",
     broker_url=BROKER_URL,
-    include=["app.v1.reservations.tasks.maintenance", "app.core.tasks"],
+    include=[
+        "app.v1.reservations.tasks.maintenance",
+        "app.v1.stock.tasks.maintenance",
+        "app.core.tasks",
+    ],
     beat_schedule={
         # B5: replaces the in-process sweeper loop (INV-10).
         "sweep-expired-reservations": {
@@ -30,6 +34,11 @@ app = make_celery(
         "sweep-processed-events": {
             "task": "smartretail.inventory.sweep_processed_events",
             "schedule": crontab(hour=3, minute=0),
+        },
+        # INV-D23: daily I5/I6 check; detects drift, never corrects it.
+        "reconcile-inventory-ledger": {
+            "task": "smartretail.inventory.reconcile_inventory_ledger",
+            "schedule": crontab(hour=3, minute=30),
         },
     },
 )
