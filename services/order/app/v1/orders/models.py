@@ -23,7 +23,13 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.v1.orders.enums import IdempotencyState, OrderStatus, PaymentStatus, ShipmentStatus
+from app.v1.orders.enums import (
+    IdempotencyState,
+    OrderStatus,
+    PaymentAttemptKind,
+    PaymentStatus,
+    ShipmentStatus,
+)
 from smartretail_common.db import Base, CreatedAt, Timestamps, UUIDPrimaryKey
 from smartretail_common.db_types import DomainEnumText
 
@@ -168,3 +174,33 @@ class IdempotencyKey(CreatedAt, Base):
         comment="DomainEnum IdempotencyState — see services/order/app/v1/orders/enums.py",
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PaymentAttempt(Timestamps, Base):
+    """The provider fake's dedupe state, keyed by idempotency key (ORD-D36, B3).
+
+    A real provider keeps this on its side; the fake keeps it here so every
+    worker replica, and a restarted worker, sees the same charges. The first
+    result written for a key wins; later attempts return it (exactly one
+    charge, mentor review 2026-10-20 §7).
+    """
+
+    __tablename__ = "payment_attempts"
+    __table_args__ = (
+        CheckConstraint("attempts >= 1", name="attempts_positive"),
+        Index("ix_payment_attempts_order_id", "order_id"),
+    )
+
+    idempotency_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    kind: Mapped[PaymentAttemptKind | str] = mapped_column(
+        DomainEnumText(PaymentAttemptKind),
+        nullable=False,
+        comment="DomainEnum PaymentAttemptKind — see services/order/app/v1/orders/enums.py",
+    )
+    # Null for a refund row: the refund names its charge by key, not order.
+    order_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    payment_method: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    # Null until the provider returned a result; then fixed (first writer wins).
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference: Mapped[str | None] = mapped_column(Text, nullable=True)

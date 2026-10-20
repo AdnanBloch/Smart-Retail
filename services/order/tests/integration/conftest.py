@@ -13,7 +13,14 @@ from smartretail_common.auth import JwtVerifier
 from smartretail_common.testing import provision_test_database, truncate_all
 
 SERVICE_DIR = str(Path(__file__).resolve().parents[2])
-TABLES = ["order_items", "order_status_history", "idempotency_keys", "outbox", "orders"]
+TABLES = [
+    "order_items",
+    "order_status_history",
+    "idempotency_keys",
+    "outbox",
+    "orders",
+    "payment_attempts",
+]
 
 
 class FakeCatalog:

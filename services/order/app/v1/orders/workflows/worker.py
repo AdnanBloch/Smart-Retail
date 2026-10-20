@@ -8,6 +8,7 @@ is the worker's (B10).
 
 import asyncio
 import logging
+from typing import Any
 
 import httpx
 from temporalio.client import Client
@@ -21,6 +22,7 @@ from app.core.db import create_database
 from app.core.logger import init_logger
 from app.v1.orders.clients.inventory import InventoryClient
 from app.v1.orders.providers.payment import FakePaymentProvider
+from app.v1.orders.providers.payment_store import PostgresPaymentStore
 from app.v1.orders.providers.shipping import FakeShippingProvider
 from app.v1.orders.workflows.activities import OrderActivities
 from app.v1.orders.workflows.order_workflow import OrderWorkflow
@@ -29,6 +31,22 @@ from smartretail_common.service_token import ServiceCredentials, ServiceTokenCli
 logger = logging.getLogger("order.worker")
 
 INVENTORY_SCOPE = "inventory:internal"
+
+
+def worker_options(settings: Settings) -> dict[str, Any]:
+    """ORD-D37: this worker's share of the `order-lifecycle` queue, set explicitly.
+
+    A burst of orders waits on the task queue; each replica pulls at most this
+    much at once. Add replicas (`--scale order-worker=N`) for more throughput;
+    ORD-D36 makes that safe for payments.
+    """
+    options: dict[str, Any] = {
+        "max_concurrent_activities": settings.order_worker_max_concurrent_activities,
+        "max_concurrent_workflow_tasks": settings.order_worker_max_concurrent_workflow_tasks,
+    }
+    if settings.order_worker_max_activities_per_second is not None:
+        options["max_activities_per_second"] = settings.order_worker_max_activities_per_second
+    return options
 
 
 async def run(settings: Settings) -> None:
@@ -46,7 +64,7 @@ async def run(settings: Settings) -> None:
             db,
             settings,
             InventoryClient(settings.inventory_base_url, tokens, http),
-            FakePaymentProvider(settings),
+            FakePaymentProvider(settings, PostgresPaymentStore(db)),
             FakeShippingProvider(settings),
         )
         client = await Client.connect(
@@ -57,6 +75,7 @@ async def run(settings: Settings) -> None:
             task_queue=settings.order_task_queue,
             workflows=[OrderWorkflow],
             activities=activities.all(),
+            **worker_options(settings),
         )
         logger.info("worker started", extra={"task_queue": settings.order_task_queue})
         try:

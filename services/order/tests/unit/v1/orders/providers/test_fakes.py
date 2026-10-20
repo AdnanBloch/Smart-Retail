@@ -38,7 +38,7 @@ async def test_charges_dedupe_by_key_and_refunds_follow() -> None:
     order = uuid.uuid4()
     first = await _charge(fake, order, "tok_ok")
     assert (await _charge(fake, order, "tok_ok")) == first and first.reference.startswith("pay_")
-    assert fake.charge_count(order) == 1
+    assert await fake.charge_count(order) == 1
     refund = await _refund(fake, order)
     assert refund.outcome == RefundOutcome.REFUNDED and await _refund(fake, order) == refund
     nothing = await _refund(fake, uuid.uuid4())
