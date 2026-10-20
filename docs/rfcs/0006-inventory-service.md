@@ -634,7 +634,7 @@ The known ceiling is the one the design accepts: a hot variant row serialises wr
 | Task | Queue | Schedule | What it does |
 | --- | --- | --- | --- |
 | `sweep_expired_reservations` | `maintenance` | Celery Beat, every minute | Selects up to `INVENTORY_SWEEP_BATCH_SIZE` `held` reservations with `expires_at < now()` (no lock, ordered by `expires_at`); for each, one short transaction in canonical lock order — lock the `stock_items` row, lock the reservation, **re-check** `held` and `expires_at < now()`, transition to `expired`, `reserved −= q`, ledger `expire (0,−q)`, outbox `inventory.released` (`reason: expired`). Loops batches until none remain or the run budget is spent. Safe on two workers and safe to run twice: the re-check under lock makes a lost race a no-op |
-| `reconcile_inventory_ledger` | `maintenance` | Celery Beat, daily | For every variant: `Σ delta_on_hand = on_hand`, `Σ delta_reserved = reserved`, `reserved = Σ held quantity`. Emits `inventory_ledger_drift_variants`, logs each drifting variant with its values. **Detects, never corrects** — a correction is a `manual_adjustment` a human makes, so the ledger stays the record |
+| `reconcile_inventory_ledger` | `maintenance` | Celery Beat, daily at 03:30 | For every variant: `Σ delta_on_hand = on_hand`, `Σ delta_reserved = reserved`, `reserved = Σ held quantity`. Logs `inventory_ledger_drift_variants` (the count) and one warning per drifting variant with its values. **Detects, never corrects** — a correction is a `manual_adjustment` a human makes, so the ledger stays the record. Built in `app/v1/stock/reconcile.py` and `app/v1/stock/tasks/maintenance.py` after [mentor review 2026-10-20 §1](../reviews/mentor-reviews.md#1-reserved-counter-versus-reservation-rows) (INV-D32) |
 
 The sweeper is **a safety net beneath the compensation, not a replacement for it** (B5): the normal path releases through `release_inventory`. It exists so a workflow lost in a way Temporal cannot recover does not strand stock forever, and it is independent of Temporal, so a failure mode Temporal cannot see still self-heals. The same `ReservationRepo.expire_due()` also runs from an in-process asyncio loop when `INVENTORY_SWEEPER_INPROCESS=true` — the driver used before RabbitMQ and Celery are in the stack, and the fallback when they are down (INV-10). Both drivers call the same function; running both at once is safe for the same reason two Celery workers are.
 
@@ -1090,11 +1090,11 @@ No `updated_at` — append-only tables are the documented S3 break; nothing is e
 
 | # | Revision | Content |
 | --- | --- | --- |
-| 1 | `0001_initial` | `stock_items`, `reservations`, `stock_movements`, `outbox` (shared DDL), constraints and indexes above; S4 column comments |
-| 2 | `0002_processed_events` | `processed_events` (shared DDL) `‡` |
-| 3 | `0003_outbox_client_id` | `outbox.client_id text NULL` (C21) |
-| 4 | `0004_ledger_reference_index` | `stock_movements (reference_type, reference_id)`; partial `reservations (expires_at) WHERE status = 'held'` replacing the plain index; `reservations.variant_id` FK to `stock_items.variant_id` — all INV-11/INV-13 proposals |
-| — | grants | The `inventory` role gets `SELECT, INSERT, UPDATE` on `stock_items`, `reservations`, `outbox`, `processed_events`; `SELECT, INSERT` only on `stock_movements` (I9, INV-12); no grant on any other database (R1) |
+| 1 | `0001_initial` | `stock_items`, `reservations`, `stock_movements`, `outbox` (shared DDL, including `outbox.client_id`), constraints and indexes above — including the `stock_movements (reference_type, reference_id)` index, the partial `reservations (expires_at) WHERE status = 'held'` index and the `reservations.variant_id` FK that were planned for a later revision (INV-11/INV-13); S4 column comments |
+| 2 | `0002_outbox_relay_grant` | The `outbox_relay` role's grant on `outbox` (PLT-D6) |
+| 3 | `0003_processed_events` | `processed_events` (shared DDL) `‡` |
+| 4 | `0004_enum_comment_paths_v1` | Enum column comments repointed at `app/v1/` (ARC-D23); comment only |
+| — | grants (**not yet built**) | The `inventory` role gets `SELECT, INSERT, UPDATE` on `stock_items`, `reservations`, `outbox`, `processed_events`; `SELECT, INSERT` only on `stock_movements` (I9, INV-12); no grant on any other database (R1) |
 
 Vocabularies (`ReservationStatus`, `StockMovementReason`) are not migrations (S4). Multi-location stock, if ever required, is a future `location_id` added to `stock_items`' unique key.
 
@@ -1125,10 +1125,10 @@ Vocabularies (`ReservationStatus`, `StockMovementReason`) are not migrations (S4
 | 8 | Seed: stock for every seeded variant through the real publish + set path | `make seed` idempotent | 5, 7 |
 | 9 | `0002_processed_events`, `0003_outbox_client_id`; `inventory-consumer` for `catalog.product.published` and `order.cancelled` | Stock row created on publish without a synchronous call; replay is a no-op | Kafka, relay, consumer base class |
 | 10 | Stockout events (`depleted`, `low_stock`, `reservation_refused`) and their Avro schemas | Order to exhaustion → `inventory.stockout` on its topic | 3, 9 |
-| 11 | Celery Beat tasks `sweep_expired_reservations`, `reconcile_inventory_ledger` | Beat fires; drift metric exported | 6, RabbitMQ/Celery |
+| 11 | Celery Beat tasks `sweep_expired_reservations`, `reconcile_inventory_ledger` ✅ (reconcile built 2026-10-20) | Beat fires; drift count logged; injected drift reported, not corrected | 6, RabbitMQ/Celery |
 | 12 | Redis cache-aside on `GET /inventory/{variant_id}` with post-commit invalidation | Hit and invalidation tested; Redis-down test | Redis |
 | 13 | Metrics, spans, log fields, Grafana row | `/metrics` non-null; checkout trace includes `inventory` | OTel stack |
-| 14 | `0004_ledger_reference_index` and grants hardening once ratified | Migration + grant test | Review of INV-11/12/13 |
+| 14 | Grants hardening once ratified (the planned indexes already shipped in `0001_initial`) | Migration + grant test | Review of INV-11/12/13 |
 | 15 | Review: ratify `‡` cells, INV decisions and open questions | Status → IN-REVIEW → DONE | all |
 
 **Delivery phasing**
@@ -1192,6 +1192,7 @@ Decisions that already carry an ID (B*, Q*, R*, INV-1 to INV-16, INV-A*) keep it
 | INV-D29 | The retry policy for the order workflow's inventory activities is RFC 0005's ORD-10 (`commit` and the compensations retry without an attempt cap inside their windows); §3.1.1.4's "recommended policy … adopted in RFC 0005" is superseded (Milestone 2 implementation) | The workflow's owner sets its policies; a capped retry on a compensation is worse than a late one | Five attempts for every inventory activity (a compensation could give up) | — |
 | INV-D30 | An `adjust` `Idempotency-Key` is stored as the ledger reference `uuid5(namespace, "<caller>:<variant>:<key>")` with `reference_type = adjustment` (implements INV-11; Milestone 2 implementation) | `reference_id` is a uuid column, keys are free text; a deterministic uuid scoped to caller and variant makes the replay check one indexed lookup | A key column on `stock_movements` (widens an append-only ledger for one route) | — |
 | INV-D31 | The two consumer handlers run inside the consumer base's transaction and never commit: `StockRepo.insert_initial` (split out of `initialise`) and `ReservationRepo.release_for_order` (one transaction for the whole order, under `stock.locking.locked`, which maps lock contention to `InventoryContended`, a `DependencyUnavailable`). Handlers live with the entity they change (`app/stock/consumers/`, `app/reservations/consumers/`); `app/core/consumer.py` wires both (Milestone 3 implementation) | The `processed_events` claim and the effect must commit together (A11, C4), so the handler cannot own the commit. One transaction per reservation (the earlier text) would let a crash leave half an order released with the event marked handled. Contention as `DependencyUnavailable` makes the base wait and retry instead of dead-lettering a healthy event (PLT-D40). *Added after [mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) §2–§4.* | Reusing `in_locked_transaction` (commits inside the handler, so the dedupe row and the effect could disagree). One transaction per reservation (not atomic with the claim) | A cancelled order can hold enough reservations that one transaction is too long |
+| INV-D32 | `stock_items.reserved` is kept as a stored counter of held reservations (I5) beside the `reservations` rows, changed only by `ReservationRepo` in the same locked transaction as the row it summarises, and proven daily by `reconcile_inventory_ledger` (INV-D23). The rows are the record of *who* holds *what*; the counter is their total, kept so the database can enforce `CHECK (on_hand >= reserved)` and `available` can stay a stored column (INV-D4) | Dropping the counter keeps the real cost (the stock-row lock that stops two reserves from both seeing room) and loses the strongest guard (a DB `CHECK` independent of application code); it also turns every availability read and the merchant low-stock filter into an aggregate. Drift, the risk of two copies, is closed by one write path in one transaction, I5 assertions after every test including the race tests, and the daily reconciliation. *Added after [mentor review 2026-10-20 §1](../reviews/mentor-reviews.md#1-reserved-counter-versus-reservation-rows).* | Compute `SUM(quantity) WHERE status='held'` on demand (no DB-level oversell guard; a scan per read; the lock stays). A trigger maintaining the counter (hidden logic; a second lock path outside INV-D7's order). Ledger-only event sourcing (rejected in INV-D2) | Reconciliation reports drift that a code path, not a hand-written SQL change, caused |
 
 #### 3.2.2. Reasoning
 
@@ -1524,6 +1525,7 @@ Numbered alternatives keep their archive/0002 §5 numbers.
   | Oct 12, 2026 | §3.2.1, §11 | INV-D25 marked with the review that changed it; this amendment log added | [Mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review) |
   | Oct 12, 2026 | §3.1 | Diagram index added | [Mentor review 2026-10-12 §4](../reviews/mentor-reviews.md#4-diagram-coverage-per-service) |
   | Oct 14, 2026 | §3.1.1.1, §3.1.1.4, §3.2.1 | Milestone 3: the `inventory` consumer (`catalog.product.published`, `order.cancelled`) and the Celery sweeper built; module tree and consumer table brought in line with the code; INV-D31 (handlers inside the consumer's transaction; `release_for_order` is one transaction) | [Mentor review 2026-10-13 §2–§4](../reviews/mentor-reviews.md#review-of-2026-10-13) |
+  | Oct 20, 2026 | §3.1.1.4, §3.1.3, §3.2.1, §3.1.5 | `reconcile_inventory_ledger` built and scheduled; INV-D32 (why `reserved` is a counter beside the reservation rows); migration table brought in line with the real revisions | [Mentor review 2026-10-20 §1](../reviews/mentor-reviews.md#1-reserved-counter-versus-reservation-rows) |
 
 ---
 

@@ -1052,7 +1052,7 @@ Ordered so that the proxy core is proven end to end before edge policies are lay
 | `order` and `inventory` prefixes, reservations blocked at the edge, service-token refusal at the edge (GW-T10, GW-3) | M2 |
 | OTel spans, `traceparent`, `X-Request-ID` becomes the trace ID (GW-T11) | M3 |
 | `/metrics` and Grafana panels (GW-T12) | M3 |
-| Rate limiting in Redis: `default`, `login_*`, `order_create`, `notif_ack` (GW-T13) | M3 |
+| Rate limiting in Redis: `default`, `login_ip`, `order_create`, `search_*`, `chat_*`, `generate`, `notif_ack` (GW-T13) | M3 — built after [mentor review 2026-10-20 §7](../reviews/mentor-reviews.md#7-scalability-bottlenecks-and-the-fixes-made); `login_email` (GW-8) not yet built |
 | `X-Client-Id` pass-through and shape validation (GW-T14) | M3 |
 | `notification`, `analytics`, `webhooks` prefixes; `ticket` and `hmac` policies (GW-T15) | M3 |
 | SSE pass-through for the notification stream, including disconnect propagation and stream cap (GW-T16) | M3 |
@@ -1443,6 +1443,7 @@ No `sse-starlette`: the gateway relays upstream bytes and never constructs an SS
   | Oct 12, 2026 | §3.1, §3.1.3, §3.2.1 | Added the diagram index and the data diagram of the gateway's in-memory and Redis state and forwarded headers (GW-D29) | [Mentor review 2026-10-12 §4](../reviews/mentor-reviews.md#4-diagram-coverage-per-service) |
   | Oct 12, 2026 | §3.2.1, §11 | Rows changed by a review (GW-D28, GW-D29) name the review and the previous decision; this amendment log added | [Mentor review 2026-10-12 §3](../reviews/mentor-reviews.md#3-every-change-traced-to-its-review) |
   | Oct 15, 2026 | §3.1.2.1, §3.2.1 | GW-D30–GW-D32: `stream` timeout class and per-request timeouts (fixes the upload class), `X-Client-Id` shape check, routes for notification, analytics and assistant | [Mentor review 2026-10-13](../reviews/mentor-reviews.md#review-of-2026-10-13) |
+  | Oct 20, 2026 | §3.1.1.4, §3.1.2.1, §3.1.5 | GW-7 built: `app/core/ratelimit.py` (fixed window `SET NX EX` + `INCR` + `PTTL` in one `MULTI`, fail open past `GATEWAY_RATELIMIT_REDIS_TIMEOUT_MS`), per-IP classes before auth and per-subject after in `app/proxy/routes.py`, `RateLimit-*` for the tightest class, `429 rate-limited`; route rules carry a rate family. Redis is reached through a bounded pool (`GATEWAY_RATELIMIT_REDIS_POOL_SIZE`, 20) warmed at start-up: the first e2e run showed cold connections (≈47 ms in Docker) consuming the 50 ms budget, so a burst failed open. The local Compose stack sets the budget to 500 ms and raises the per-IP classes, because one laptop shares one source IP and one CPU across the whole stack; the code defaults stay as specified. `login_email` (GW-8) still to do | [Mentor review 2026-10-20 §7](../reviews/mentor-reviews.md#7-scalability-bottlenecks-and-the-fixes-made) |
 - **Definition of done.** Goals GW-G1–GW-G10 verified by their stated checks; the measured SSE latency tests green through the gateway; the route table matching every owning RFC's endpoint list; this RFC moved to **DONE** with review outcomes folded in.
 
 ---
