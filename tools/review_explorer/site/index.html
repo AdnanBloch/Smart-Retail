@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SmartRetail · Review Explorer</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="data.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">SmartRetail <span>Review Explorer</span></a>
+    <form id="ask-form" class="ask" autocomplete="off">
+      <input id="ask-input" type="search" placeholder="Ask anything: why Temporal? what if Kafka is down? how is overselling stopped?   ( / )">
+    </form>
+    <div class="lens" role="group" aria-label="Lens">
+      <button data-lens="business">Business</button>
+      <button data-lens="technical">Technical</button>
+    </div>
+    <button id="theme" class="icon" title="Toggle light/dark (t)">◐</button>
+  </header>
+  <div class="layout">
+    <nav id="nav" class="nav"></nav>
+    <main id="main" class="main"></main>
+  </div>
+  <div id="missing" hidden>
+    <p><code>data.js</code> was not found. Build it first:</p>
+    <pre>python3 tools/review_explorer/build.py</pre>
+    <p>or run <code>make review-ui</code>.</p>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
