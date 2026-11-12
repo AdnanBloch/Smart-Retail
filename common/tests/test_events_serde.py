@@ -195,3 +195,13 @@ async def test_garbage_after_a_valid_header_is_a_serialization_error() -> None:
         await registered_codec(PUBLISHED).decode(
             "smartretail.catalog.product.published", b"\x00\x00\x00\x00\x01\xff\xff\xff"
         )
+
+
+async def test_the_in_memory_registry_refuses_a_lookup_it_never_registered() -> None:
+    schemas = InMemorySchemaRegistry()
+    schema_id = await schemas.register("t-value", '"string"')
+    assert await schemas.lookup("t-value", '"string"') == schema_id
+    with pytest.raises(SchemaNotRegistered):
+        await schemas.lookup("t-value", '"int"')
+    with pytest.raises(SchemaNotRegistered):
+        await schemas.lookup("other-value", '"string"')

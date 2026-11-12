@@ -16,6 +16,10 @@ from app.v1.users import events
 from app.v1.users.models import User
 from app.v1.users.utils import check_password_policy
 
+EMAIL_CONSTRAINT = "uq_users_email"
+SLUG_CONSTRAINT = "uq_merchant_profiles_slug"
+SLUG_ATTEMPTS = 5
+
 
 class RegistrationRepo:
     def __init__(self, session: AsyncSession, settings: Settings, hasher: PasswordHasher) -> None:
@@ -40,31 +44,39 @@ class RegistrationRepo:
         if existing is not None:
             raise EmailTaken()
 
-        user = User(
-            email=email,
-            password_hash=password_hash,
-            full_name=full_name,
-            role=role,
-        )
-        self.session.add(user)
-        try:
-            await self.session.flush()
-            if role == UserRole.MERCHANT:
-                display_name = business_name or full_name
-                self.session.add(
-                    MerchantProfile(
-                        user_id=user.id,
-                        business_name=display_name,
-                        slug=await unique_slug(self.session, display_name),
-                        status=MerchantStatus.PENDING,
+        # Two merchants with the same name can pick the same free slug at once;
+        # the loser's insert fails on the constraint and it retries with the
+        # next one. The constraint name, not the message text, tells which
+        # race was lost: a slug may itself contain the word "email".
+        for attempt in range(1, SLUG_ATTEMPTS + 1):
+            user = User(
+                email=email,
+                password_hash=password_hash,
+                full_name=full_name,
+                role=role,
+            )
+            self.session.add(user)
+            try:
+                await self.session.flush()
+                if role == UserRole.MERCHANT:
+                    display_name = business_name or full_name
+                    self.session.add(
+                        MerchantProfile(
+                            user_id=user.id,
+                            business_name=display_name,
+                            slug=await unique_slug(self.session, display_name),
+                            status=MerchantStatus.PENDING,
+                        )
                     )
-                )
-            events.user_registered(self.session, user, client_id=client_id)
-            await self.session.commit()
-        except IntegrityError as exc:
-            await self.session.rollback()
-            if "email" in str(exc.orig):
-                raise EmailTaken() from exc
-            raise
+                events.user_registered(self.session, user, client_id=client_id)
+                await self.session.commit()
+            except IntegrityError as exc:
+                await self.session.rollback()
+                if EMAIL_CONSTRAINT in str(exc.orig):
+                    raise EmailTaken() from exc
+                if SLUG_CONSTRAINT in str(exc.orig) and attempt < SLUG_ATTEMPTS:
+                    continue
+                raise
+            break
         await self.session.refresh(user)
         return user

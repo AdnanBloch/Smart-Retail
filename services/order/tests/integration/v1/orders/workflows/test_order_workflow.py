@@ -17,6 +17,7 @@ from temporalio.worker import Replayer, Worker
 
 from app.models import Order
 from app.v1.orders.providers.payment import FakePaymentProvider
+from app.v1.orders.providers.payment_store import PostgresPaymentStore
 from app.v1.orders.providers.shipping import FakeShippingProvider
 from app.v1.orders.workflows.activities import OrderActivities
 from app.v1.orders.workflows.client import TemporalOrderWorkflows
@@ -149,8 +150,9 @@ def inventory() -> FakeInventory:
 
 
 @pytest.fixture
-def payments(settings) -> GatedPayments:
-    return GatedPayments(settings)
+def payments(settings, app) -> GatedPayments:
+    # The worker's real store (ORD-D36), so the dedupe is the database's.
+    return GatedPayments(settings, PostgresPaymentStore(app.state.db))
 
 
 def make_worker(env, app, inventory, payments, settings, **options) -> Worker:
@@ -208,7 +210,7 @@ async def test_happy_path_confirms(
     assert [t["to"] for t in order["timeline"]] == ["pending", "awaiting_payment", "confirmed"]
     assert inventory.available[variant] == 8
     assert {r.status for r in inventory.reservations.values()} == {"committed"}
-    assert payments.charge_count(uuid.UUID(order["order_id"])) == 1
+    assert await payments.charge_count(uuid.UUID(order["order_id"])) == 1
     types = [e["type"] for e in await outbox_rows(database_url)]
     assert types == ["order.created", "payment.succeeded", "order.confirmed"]
 
@@ -258,7 +260,7 @@ async def test_flaky_provider_charges_exactly_once(
     )
     assert outcome == "confirmed"
     assert [c[0] for c in payments.calls] == ["charge"] * 3
-    assert payments.charge_count(uuid.UUID(order["order_id"])) == 1
+    assert await payments.charge_count(uuid.UUID(order["order_id"])) == 1
 
 
 async def test_expired_reservation_refunds_after_charge(
@@ -399,3 +401,51 @@ async def test_history_replays_deterministically(
     await Replayer(workflows=[OrderWorkflow]).replay_workflow(await handle.fetch_history())
     described = await workflows.describe(handle.id)
     assert described["execution_status"] == "COMPLETED" and described["stage"] == "failed"
+
+
+async def test_complete_flow_from_checkout_to_delivery(
+    client, callers, catalog, inventory, workflows, worker, payments, database_url
+) -> None:
+    """Checkout → saga → confirmed, then the carrier takes it to delivered: every
+    history row and every outbox event of the order, in order."""
+    outcome, order, variant = await run_order(client, callers, catalog, inventory, workflows)
+    assert outcome == "confirmed"
+    order_id = order["order_id"]
+    url = f"/api/v1/orders/{order_id}/shipment/status"
+    for status, tracking in (("shipped", None), ("in_transit", "TRK-LIVE"), ("delivered", None)):
+        r = await client.post(
+            url, json={"status": status, "tracking_number": tracking}, headers=callers.admin
+        )
+        assert r.status_code == 200 and r.json()["applied"] is True, r.text
+
+    detail = (await client.get(f"/api/v1/orders/{order_id}", headers=callers.customer_a)).json()
+    assert (detail["status"], detail["payment"]["status"]) == ("delivered", "succeeded")
+    assert detail["shipment"]["status"] == "delivered"
+    assert detail["shipment"]["tracking_number"] == "TRK-LIVE"
+    assert [(t["from"], t["to"], t["actor"]) for t in detail["timeline"]] == [
+        (None, "pending", f"customer:{callers.customer_a_id}"),
+        ("pending", "awaiting_payment", "workflow"),
+        ("awaiting_payment", "confirmed", "workflow"),
+        ("confirmed", "shipped", f"admin:{callers.admin_id}"),
+        ("shipped", "delivered", f"admin:{callers.admin_id}"),
+    ]
+    events = await outbox_rows(database_url)
+    assert [e["type"] for e in events] == [
+        "order.created",
+        "payment.succeeded",
+        "order.confirmed",
+        "shipment.status_changed",
+        "shipment.status_changed",
+        "shipment.status_changed",
+    ]
+    assert {e["order_id"] for e in events} == {order_id}
+    assert [(e["from_status"], e["to_status"]) for e in events[3:]] == [
+        ("created", "shipped"),
+        ("shipped", "in_transit"),
+        ("in_transit", "delivered"),
+    ]
+    # Stock was committed once, the card charged once, the order notified once.
+    assert inventory.available[variant] == 8
+    assert {r.status for r in inventory.reservations.values()} == {"committed"}
+    assert await payments.charge_count(uuid.UUID(order_id)) == 1
+    assert detail["notified_at"] == order["notified_at"]

@@ -47,6 +47,8 @@ SmartRetail/
 ├── workers/               # platform process hosts: outbox_relay (§6)
 ├── ops/                   # infrastructure config (§7)
 ├── scripts/               # developer scripts (§7)
+├── tools/
+│   └── review_explorer/   # review UI over docs/ and the code (`make review-ui`, §7)
 └── tests/
     └── e2e/               # end-to-end tests through the gateway (§7)
 ```
@@ -361,6 +363,11 @@ scripts/
 tests/
 └── e2e/
     └── test_smoke.py          # Milestone 1 journey through the gateway
+
+tools/
+└── review_explorer/           # `make review-ui`: browse decisions, rules, flows and failure cases
+    ├── build.py               # parses docs/ and scans the code into site/data.js (stdlib only)
+    └── site/                  # static page: index.html, app.js, style.css
 ```
 
 Unit and integration tests live inside each package (`common/tests/`,
@@ -376,3 +383,4 @@ None of these are source. Do not edit them or commit them.
 | `.env`, `keys/` | local secrets and key pair |
 | `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `__pycache__/` | tool caches (at the root and inside packages) |
 | `*.egg-info/` | editable-install metadata |
+| `tools/review_explorer/site/data.js` | review explorer data, rebuilt by `make review-ui` |

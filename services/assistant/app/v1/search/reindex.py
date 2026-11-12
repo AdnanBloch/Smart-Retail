@@ -162,8 +162,15 @@ async def _reindex_one(
 ) -> None:
     try:
         async with db.sessionmaker() as session, session.begin():
-            state = await session.get(IndexState, product_id)
-            if state is None or state.source_document is None:
+            # Locked before reading the stored document, so an event for this
+            # product cannot commit between the read and the write; a product
+            # removed since the batch was listed is skipped, not resurrected.
+            state = await session.get(IndexState, product_id, with_for_update=True)
+            if (
+                state is None
+                or state.source_document is None
+                or state.status == IndexStatus.REMOVED
+            ):
                 report.skipped += 1
                 return
             payload = {**state.source_document, "version": state.catalog_version}

@@ -1,0 +1,21 @@
+{
+  // Read by Pylance (VS Code) and pyright. Editable installs in .venv use an
+  // import hook that static analysers cannot follow, and every service has its
+  // own top-level `app` package, so each service gets its own environment.
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "exclude": ["**/node_modules", "**/__pycache__", "**/htmlcov", ".venv", "docs"],
+  "executionEnvironments": [
+    { "root": "common" },
+    { "root": "services/analytics", "extraPaths": ["common"] },
+    { "root": "services/assistant", "extraPaths": ["common"] },
+    { "root": "services/catalog", "extraPaths": ["common"] },
+    { "root": "services/gateway", "extraPaths": ["common"] },
+    { "root": "services/identity", "extraPaths": ["common"] },
+    { "root": "services/inventory", "extraPaths": ["common"] },
+    { "root": "services/notification", "extraPaths": ["common"] },
+    { "root": "services/order", "extraPaths": ["common"] },
+    { "root": ".", "extraPaths": ["common"] }
+  ]
+}

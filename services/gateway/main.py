@@ -1,7 +1,8 @@
 """ASGI entry point: ``uvicorn --factory main:create_application`` (RFC 0002).
 
 Pipeline per request: correlation → CORS → route match → size limit →
-auth policy → forward → relay. Operational routes are served locally.
+per-IP rate limits → auth policy → per-subject rate limits → forward → relay.
+Operational routes are served locally.
 """
 
 from collections.abc import AsyncIterator
@@ -13,6 +14,7 @@ from fastapi import FastAPI
 from app.core.config import GatewaySettings, get_settings
 from app.core.cors import EdgeCORSMiddleware
 from app.core.logger import init_logger
+from app.core.ratelimit import RateLimiter, create_limiter_redis
 from app.docs.openapi import OpenApiAggregator
 from app.proxy.forward import make_client
 from app.proxy.routing import ROUTES, RouteTable
@@ -46,14 +48,20 @@ def create_application(
         )
         clients[name] = client
 
+    redis = create_limiter_redis(settings) if settings.gateway_ratelimit_enabled else None
+    limiter = RateLimiter(settings, redis)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await verifier.refresh_jwks(force=True)
         if not verifier.has_keys:
             raise RuntimeError("no JWT verification key available")
+        await limiter.warm()
         yield
         for client in clients.values():
             await client.aclose()
+        if redis is not None:
+            await redis.aclose(close_connection_pool=True)
 
     application = FastAPI(
         title="SmartRetail gateway",
@@ -67,6 +75,7 @@ def create_application(
     application.state.routes = routes
     application.state.verifier = verifier
     application.state.clients = clients
+    application.state.limiter = limiter
     application.state.upstream_names = tuple(settings.upstreams)
     application.state.openapi = OpenApiAggregator(
         clients,

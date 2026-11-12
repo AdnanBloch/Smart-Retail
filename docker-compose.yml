@@ -203,6 +203,23 @@ services:
       GATEWAY_MAX_UPLOAD_BYTES: ${GATEWAY_MAX_UPLOAD_BYTES:-10485760}
       GATEWAY_UPSTREAM_CONNECT_TIMEOUT_S: ${GATEWAY_UPSTREAM_CONNECT_TIMEOUT_S:-2}
       GATEWAY_UPSTREAM_READ_TIMEOUT_S: ${GATEWAY_UPSTREAM_READ_TIMEOUT_S:-10}
+      # GW-7: rate-limit counters. Redis is in the `events` profile; without it
+      # every limit fails open (GW-D12), so the `core` profile still works.
+      REDIS_URL: redis://redis:6379/0
+      # Per-subject classes keep the RFC 0002 values. Per-IP classes are raised
+      # for the local stack only: here the browser, `make seed` and the e2e suite
+      # all reach the gateway from one Docker bridge address, so the production
+      # per-IP values (100/min default, 5 logins/min) would throttle the machine,
+      # not a client. Set the RFC values in .env to try them.
+      # The 50 ms Redis budget (RFC 0002) assumes a gateway with its own CPU. With
+      # the whole stack on one laptop, event-loop starvation alone can exceed it
+      # and every limit fails open, so the local stack allows 500 ms.
+      GATEWAY_RATELIMIT_REDIS_TIMEOUT_MS: ${GATEWAY_RATELIMIT_REDIS_TIMEOUT_MS:-500}
+      RL_ORDER_CREATE_PER_USER_PER_MIN: ${RL_ORDER_CREATE_PER_USER_PER_MIN:-30}
+      RL_DEFAULT_PER_IP_PER_MIN: ${RL_DEFAULT_PER_IP_PER_MIN:-6000}
+      RL_LOGIN_PER_IP_PER_MIN: ${RL_LOGIN_PER_IP_PER_MIN:-600}
+      RL_SEARCH_ANON_PER_IP_PER_MIN: ${RL_SEARCH_ANON_PER_IP_PER_MIN:-600}
+      RL_CHAT_ANON_PER_IP_PER_MIN: ${RL_CHAT_ANON_PER_IP_PER_MIN:-600}
     volumes:
       - *public-key
     # No hard depends_on (RFC 0002): an unavailable upstream is a 503, not a
@@ -345,6 +362,10 @@ services:
     command: ["python", "-m", "app.v1.orders.workflows.worker"]
     environment:
       <<: [*service-env, *order-env, *workflow-env]
+      # ORD-D37: per-replica pull limits on `order-lifecycle`. Scale out with
+      # `docker compose up --scale order-worker=N`; ORD-D36 keeps payments exactly-once.
+      ORDER_WORKER_MAX_CONCURRENT_ACTIVITIES: ${ORDER_WORKER_MAX_CONCURRENT_ACTIVITIES:-50}
+      ORDER_WORKER_MAX_CONCURRENT_WORKFLOW_TASKS: ${ORDER_WORKER_MAX_CONCURRENT_WORKFLOW_TASKS:-50}
     volumes:
       - *public-key
     restart: on-failure

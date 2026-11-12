@@ -33,6 +33,19 @@ class ShipmentStatus(DomainEnum):
     DELIVERED = "delivered"
 
 
+class PaymentAttemptKind(DomainEnum):
+    """``payment_attempts.kind``: which provider call a dedupe row records."""
+
+    CHARGE = "charge"
+    REFUND = "refund"
+
+
+class ChargeOutcome(StrEnum):
+    """``payment_attempts.outcome`` of a charge row; a refund row stores a ``RefundOutcome``."""
+
+    CHARGED = "charged"
+
+
 class OrderFailureReason(StrEnum):
     """ORD-5. Plain text in the database; a closed set in code so metric labels stay bounded."""
 

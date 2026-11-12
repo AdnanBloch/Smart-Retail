@@ -3,21 +3,22 @@
 No card data exists anywhere: ``payment_method`` is an opaque provider token.
 The fake's behaviour is a pure function of ``(token, attempt number for that
 idempotency key)`` and it dedupes by idempotency key, so a retried charge
-returns the first result — **exactly one charge** (B3). Within this project
+returns the first result — **exactly one charge** (B3). The dedupe state lives
+in a ``PaymentStore`` shared by every worker replica (ORD-D36). Within this project
 the fake is the design, not a placeholder.
 """
 
 import asyncio
 import hashlib
 import uuid
-from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Protocol
 
 from app.core.config import Settings
-from app.v1.orders.enums import RefundOutcome
+from app.v1.orders.enums import ChargeOutcome, PaymentAttemptKind, RefundOutcome
 from app.v1.orders.providers.errors import PaymentDeclined, ProviderTransientError
+from app.v1.orders.providers.payment_store import InMemoryPaymentStore, PaymentStore
 
 
 @dataclass(frozen=True)
@@ -58,12 +59,13 @@ def _ref(prefix: str, key: str) -> str:
 
 @dataclass
 class FakePaymentProvider:
+    """Dedupes by idempotency key through a ``PaymentStore`` (ORD-D36): the
+    worker passes ``PostgresPaymentStore``, so replicas and restarts share it.
+    ``calls`` is this process's call log only (B10)."""
+
     settings: Settings
+    store: PaymentStore = field(default_factory=InMemoryPaymentStore)
     calls: list[tuple[str, str]] = field(default_factory=list)
-    attempts: Counter[str] = field(default_factory=Counter)
-    charges: dict[str, ChargeResult] = field(default_factory=dict)
-    methods: dict[str, str] = field(default_factory=dict)
-    refunds: dict[str, RefundResult] = field(default_factory=dict)
 
     async def charge(
         self,
@@ -75,9 +77,14 @@ class FakePaymentProvider:
         payment_method: str,
     ) -> ChargeResult:
         self.calls.append(("charge", idempotency_key))
-        self.attempts[idempotency_key] += 1
-        if idempotency_key in self.charges:
-            return self.charges[idempotency_key]
+        stored = await self.store.attempt(
+            idempotency_key,
+            kind=PaymentAttemptKind.CHARGE,
+            order_id=order_id,
+            payment_method=payment_method,
+        )
+        if stored.outcome == ChargeOutcome.CHARGED:
+            return ChargeResult(str(stored.reference))
         s = self.settings
         if payment_method == s.fake_payment_decline_token:
             raise PaymentDeclined("card declined")
@@ -85,12 +92,12 @@ class FakePaymentProvider:
             # Longer than the activity's start_to_close: an ambiguous timeout.
             await asyncio.sleep(s.fake_provider_timeout_seconds)
             raise ProviderTransientError("payment provider timed out")
-        if payment_method == s.fake_payment_flaky_token and self.attempts[idempotency_key] <= 2:
+        if payment_method == s.fake_payment_flaky_token and stored.attempts <= 2:
             raise ProviderTransientError("payment provider hiccup")
-        result = ChargeResult(_ref("pay", idempotency_key))
-        self.charges[idempotency_key] = result
-        self.methods[idempotency_key] = payment_method
-        return result
+        final = await self.store.record(
+            idempotency_key, outcome=ChargeOutcome.CHARGED, reference=_ref("pay", idempotency_key)
+        )
+        return ChargeResult(str(final.reference))
 
     async def refund(
         self,
@@ -101,17 +108,19 @@ class FakePaymentProvider:
         currency: str,
     ) -> RefundResult:
         self.calls.append(("refund", idempotency_key))
-        if idempotency_key in self.refunds:
-            return self.refunds[idempotency_key]
-        if charge_idempotency_key not in self.charges:
-            result = RefundResult(RefundOutcome.NOTHING_CAPTURED)
-        elif self.methods[charge_idempotency_key] == self.settings.fake_payment_refund_fail_token:
+        stored = await self.store.attempt(idempotency_key, kind=PaymentAttemptKind.REFUND)
+        if stored.outcome is not None:
+            return RefundResult(RefundOutcome(stored.outcome), stored.reference)
+        charge = await self.store.get(charge_idempotency_key)
+        if charge is None or charge.outcome != ChargeOutcome.CHARGED:
+            outcome, reference = RefundOutcome.NOTHING_CAPTURED, None
+        elif charge.payment_method == self.settings.fake_payment_refund_fail_token:
             raise ProviderTransientError("refund rejected by provider")
         else:
-            result = RefundResult(RefundOutcome.REFUNDED, _ref("rf", idempotency_key))
-        self.refunds[idempotency_key] = result
-        return result
+            outcome, reference = RefundOutcome.REFUNDED, _ref("rf", idempotency_key)
+        final = await self.store.record(idempotency_key, outcome=outcome, reference=reference)
+        return RefundResult(RefundOutcome(str(final.outcome)), final.reference)
 
-    def charge_count(self, order_id: uuid.UUID) -> int:
+    async def charge_count(self, order_id: uuid.UUID) -> int:
         """Successful charges for an order — the "exactly one charge" check."""
-        return sum(1 for key in self.charges if key.startswith(f"order-{order_id}:"))
+        return await self.store.charge_count(order_id)

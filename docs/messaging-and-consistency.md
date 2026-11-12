@@ -15,6 +15,11 @@ Each section opens with the short answer, then explains the mechanism, then
 names the alternative and why it was not used. The binding versions are the RFC
 rows linked at the end of each section. This page puts them in one place.
 
+Throughput, bursts, retries across every layer, the saga pattern and failure
+cases are covered in
+[distributed-systems-and-failure-modes.md](distributed-systems-and-failure-modes.md),
+from the review of 2026-10-20.
+
 | Review point | Section |
 | --- | --- |
 | §1 Kafka partitioning, which method | [1. Partitioning](#1-partitioning) |

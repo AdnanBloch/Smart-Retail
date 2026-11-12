@@ -39,10 +39,21 @@ class SessionRepo:
 
     async def refresh(self, raw: str, *, user_agent: str | None, ip: str | None) -> IssuedTokens:
         now = datetime.now(UTC)
+        token_hash = hash_refresh_token(raw)
+        user_id = await self.session.scalar(
+            select(RefreshSession.user_id).where(RefreshSession.token_hash == token_hash)
+        )
+        if user_id is None:
+            raise InvalidRefreshToken()
+        # Serialise every refresh of one user, user row first. Without it a
+        # replayed token racing a rotation of its successor revokes "every live
+        # session" with a snapshot taken before the new successor committed,
+        # and the successor survives the reuse detection.
+        await self.session.execute(
+            select(User.id).where(User.id == user_id).with_for_update(key_share=True)
+        )
         current = await self.session.scalar(
-            select(RefreshSession)
-            .where(RefreshSession.token_hash == hash_refresh_token(raw))
-            .with_for_update()
+            select(RefreshSession).where(RefreshSession.token_hash == token_hash).with_for_update()
         )
         if current is None:
             raise InvalidRefreshToken()

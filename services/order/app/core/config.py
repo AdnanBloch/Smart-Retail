@@ -25,6 +25,13 @@ class Settings(BaseServiceSettings, DatabaseSettings):
     # PLT-D13: `order-lifecycle` (RFC 0005 said `orders`; RFC 0001 owns the name).
     order_task_queue: str = "order-lifecycle"
     order_workflow_execution_timeout_seconds: int = 86_400
+    # ORD-D37: per-replica pull limits on `order-lifecycle`. Activities are
+    # I/O-bound HTTP and DB calls, so 50 at once keeps one process busy without
+    # exhausting its 30 DB connections; scale out with replicas, not these.
+    order_worker_max_concurrent_activities: int = 50
+    order_worker_max_concurrent_workflow_tasks: int = 50
+    # Optional cap on this replica's activity starts per second (None = no cap).
+    order_worker_max_activities_per_second: float | None = None
 
     idempotency_ttl_hours: int = 24
     idempotency_in_progress_lease_seconds: int = 30

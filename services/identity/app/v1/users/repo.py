@@ -93,6 +93,18 @@ class UserRepo:
     async def admin_update(
         self, user_id: uuid.UUID, *, role: UserRole | None = None, is_active: bool | None = None
     ) -> User:
+        # I10: never demote or deactivate the last active admin. Lock every
+        # active admin row, in id order and before the target row, so two
+        # concurrent demotions serialise here instead of deadlocking (each
+        # holding its own target while waiting for the other's).
+        active_admins = set(
+            await self.session.scalars(
+                select(User.id)
+                .where(User.role == UserRole.ADMIN, User.is_active.is_(True))
+                .order_by(User.id)
+                .with_for_update()
+            )
+        )
         user = await self._get(user_id, for_update=True)
         changes: dict[str, Any] = {
             k: v for k, v in {"role": role, "is_active": is_active}.items() if v is not None
@@ -102,16 +114,9 @@ class UserRepo:
         role_changed = new_role != user.role
         deactivated = user.is_active and not new_active
 
-        # I10: never demote or deactivate the last active admin. Lock every
-        # active admin row so two concurrent demotions cannot both pass.
-        if user.role == UserRole.ADMIN and user.is_active and (role_changed or deactivated):
-            admins = await self.session.scalars(
-                select(User.id)
-                .where(User.role == UserRole.ADMIN, User.is_active.is_(True))
-                .with_for_update()
-            )
-            if not set(admins) - {user.id}:
-                raise LastAdmin()
+        demoted = user.role == UserRole.ADMIN and user.is_active and (role_changed or deactivated)
+        if demoted and not active_admins - {user.id}:
+            raise LastAdmin()
 
         if role_changed:
             await self._apply_role_change(user, UserRole(new_role))

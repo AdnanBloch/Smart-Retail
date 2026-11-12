@@ -251,27 +251,39 @@ def test_incomplete_product_fails_to_publish(client: httpx.Client, actors) -> No
     assert client.get(f"/api/v1/products/{product['id']}").status_code == 404
 
 
+def new_customer(client: httpx.Client) -> dict[str, str]:
+    email = f"wf-buyer-{uuid.uuid4().hex[:10]}@smartretail.local"
+    r = client.post(
+        "/api/v1/auth/register",
+        json={"email": email, "password": PASSWORD, "full_name": "WF buyer", "role": "customer"},
+    )
+    assert r.status_code == 201, r.text
+    return login(client, email, PASSWORD)
+
+
 def test_fifty_orders_for_ten_units_confirm_exactly_ten(client: httpx.Client, actors) -> None:
-    """G6: oversell is impossible under concurrency."""
+    """G6: oversell is impossible under concurrency. Five customers, ten orders
+    each: under the per-user `order_create` limit (GW-7), so every order is
+    accepted and the race is decided by inventory alone."""
     product, variant = published_product(client, actors, stock=10)
     body = order_body(product, 1)
+    buyers = [new_customer(client) for _ in range(5)]
 
-    async def burst() -> list[httpx.Response]:
+    async def burst() -> list[tuple[dict[str, str], httpx.Response]]:
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=30) as ac:
-            return await asyncio.gather(
-                *(
-                    ac.post(
-                        "/api/v1/orders",
-                        json=body,
-                        headers={**actors["customer"], "Idempotency-Key": str(uuid.uuid4())},
-                    )
-                    for _ in range(50)
-                )
-            )
+
+            async def place(buyer: dict[str, str]) -> tuple[dict[str, str], httpx.Response]:
+                headers = {**buyer, "Idempotency-Key": str(uuid.uuid4())}
+                return buyer, await ac.post("/api/v1/orders", json=body, headers=headers)
+
+            return await asyncio.gather(*(place(b) for b in buyers for _ in range(10)))
 
     accepted = asyncio.run(burst())
-    assert [r.status_code for r in accepted] == [202] * 50
-    orders = [settle(client, actors, r.json()["order_id"], seconds=120) for r in accepted]
+    assert [r.status_code for _, r in accepted] == [202] * 50
+    orders = [
+        settle(client, {"customer": buyer}, r.json()["order_id"], seconds=120)
+        for buyer, r in accepted
+    ]
     outcomes = [(o["status"], o["failure_reason"]) for o in orders]
     assert outcomes.count(("confirmed", None)) == 10, outcomes
     assert outcomes.count(("failed", "INSUFFICIENT_STOCK")) == 40, outcomes

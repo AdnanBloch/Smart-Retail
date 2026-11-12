@@ -12,6 +12,7 @@ section number inside that date's review.
 | 2026-10-06 | [Review of 2026-10-06](#review-of-2026-10-06) | `common/` package, entity-first layout with versioned API folders, a decision register in every RFC, Mermaid diagrams, coverage gate, pre-commit and CI |
 | 2026-10-12 | [Review of 2026-10-12](#review-of-2026-10-12) | Why FastAPI and the rest of the stack (ARC-D28–ARC-D35); everything an entity uses under its folder; review-changed decisions traced in every RFC; diagram index per service |
 | 2026-10-13 | [Review of 2026-10-13](#review-of-2026-10-13) · [full record](2026-10-13-mentor-review.md) | Version-first layout (`app/v1/<entity>/`, ARC-D23 changed); Kafka partitioning, commit, retry and dedupe explained and built; outbox relay, inventory consumer and Celery in Milestone 3; why Kafka, RabbitMQ/Celery and Temporal each exist; end-to-end business flows; one diagrams page |
+| 2026-10-20 | [Review of 2026-10-20](#review-of-2026-10-20) | Reserved counter kept and proven (INV-D32, reconciliation built); where the system is asynchronous; internal calls, retries and the saga explained; 32 failure cases; ranked bottlenecks; gateway rate limit (GW-7), explicit worker concurrency (ORD-D37), shared payment dedupe (ORD-D36); race and full-flow tests across every package |
 
 ## Review of 2026-10-06
 
@@ -428,3 +429,258 @@ business rule, which is the case ARC-D23 had named as its reason to revisit.
 
 Binding: RFC 0000 ARC-D23 and §3.1.1.7;
 [file-structure.md §4](../file-structure.md#4-service-layout-every-service).
+
+## Review of 2026-10-20
+
+A review of distributed-systems behaviour after Milestone 3. The mentor's
+concerns:
+
+- the stock row and the reservation table look like two sources of truth;
+- the system *feels* synchronous, especially orders;
+- what happens when many orders arrive at once.
+
+The mentor asked for failure cases to be thought through in advance, and for
+much deeper testing. The long-form answers are on one new page,
+[distributed-systems-and-failure-modes.md](../distributed-systems-and-failure-modes.md).
+This section records the options and choices.
+
+| # | Mentor's request | Where it lands |
+| --- | --- | --- |
+| 1 | `stock_items.reserved` and the `reservations` table both hold reservations: a duplicate source of truth? Explore and review the decision | [§1](#1-reserved-counter-versus-reservation-rows) · [DS §7](../distributed-systems-and-failure-modes.md#7-the-reserved-counter-and-the-reservation-rows) · RFC 0006 INV-D32, INV-D23 |
+| 2 | Where is the distributed and asynchronous logic? Orders feel synchronous, with no queue when many arrive at once; future bottlenecks | [§2](#2-where-the-system-is-asynchronous) · [DS §1](../distributed-systems-and-failure-modes.md#1-where-the-system-is-synchronous-and-where-it-is-not) · RFC 0005 ORD-D37, RFC 0002 GW-7 |
+| 3 | Internal endpoint calls: asynchronous or not? | [§3](#3-internal-endpoint-calls) · [DS §2](../distributed-systems-and-failure-modes.md#2-how-services-call-each-other) |
+| 4 | How retries are handled within the system | [§4](#4-retry-handling-across-layers) · [DS §3](../distributed-systems-and-failure-modes.md#3-retries-layer-by-layer) |
+| 5 | Understand the saga pattern in detail | [§5](#5-the-saga-pattern-explained) · [DS §4](../distributed-systems-and-failure-modes.md#4-the-saga-pattern) |
+| 6 | Possible failure cases in this kind of system, and how ours handles each | [§6](#6-failure-case-questions) · [DS §5](../distributed-systems-and-failure-modes.md#5-failure-cases-and-how-each-is-handled) |
+| 7 | Scalability bottlenecks | [§7](#7-scalability-bottlenecks-and-the-fixes-made) · [DS §6](../distributed-systems-and-failure-modes.md#6-scalability-bottlenecks) · RFC 0005 ORD-D36, ORD-D37 |
+| 8 | Unit tests that run smoothly, code coverage, complete-flow tests, race-condition tests, edge cases and the other complex cases | [§8](#8-test-depth-race-conditions-and-full-flows) |
+
+**What was missing.**
+
+- **Point 1.** The design held, but its reason did not. No decision row
+  explained why the counter is kept, and the reconciliation job that is meant
+  to prove I5 was designed in RFC 0006 but never built.
+- **Point 2.** The asynchrony was real: checkout returns `202` and the saga
+  runs on a Temporal task queue. But it was not explained in one place.
+- **Point 7.** Three gaps were real:
+  - the gateway's designed rate limit (GW-7) was not built;
+  - the order worker ran on unexamined SDK concurrency defaults;
+  - the fake payment provider deduped charges in process memory, so a second
+    worker replica, or a restart, could charge twice. Scaling the worker out,
+    the obvious answer to bursts, was unsafe.
+
+**What changed.**
+
+- **Code:**
+  - `reconcile_inventory_ledger` is built and scheduled daily (INV-D23).
+  - The gateway enforces GW-7 rate limits, including `order_create` at 30 per
+    user per minute; it fails open.
+  - Worker concurrency is explicit and configurable (ORD-D37).
+  - Payment dedupe lives in a shared `payment_attempts` table (ORD-D36), so
+    `--scale order-worker=N` is safe.
+- **Tests:**
+  - race tests for every conflicting pair of stock operations;
+  - replica races for payments;
+  - burst and fail-open tests for the rate limit;
+  - workflow branch tests;
+  - a pass over every package (§8).
+- **Docs:**
+  - the new [distributed-systems-and-failure-modes.md](../distributed-systems-and-failure-modes.md);
+  - RFC rows INV-D32, ORD-D36, ORD-D37 and GW-7's status;
+  - `business-flows.md` corrected (checkout returns `202`, not `201`).
+
+### 1. Reserved counter versus reservation rows
+
+**Options considered**
+
+| Option | For | Against |
+| --- | --- | --- |
+| **Keep `stock_items.reserved` as a counter of held reservations, updated in the same locked transaction, and prove it with a daily reconciliation (chosen)** | `available = on_hand − reserved` stays a stored, indexable column. The database `CHECK (on_hand >= reserved)` stops oversell even if application code is wrong. Reads never scan reservations | Two places change on every write. Closed by one repository owning every write, one transaction, I5 checked in tests, and the reconciliation job |
+| Reservation rows only; compute `SUM(held)` when needed | One source; nothing can drift | The stock-row lock is still needed to stop two reserves both seeing room, so the main cost stays. The `CHECK` cannot cover a sum over another table, so the oversell guard moves into code. Every availability read becomes an aggregate |
+| A trigger keeps the counter | Code cannot forget the counter | Hidden logic; a second lock path outside the canonical lock order (INV-D7) |
+| Ledger-only event sourcing | One source | Every read folds history (already rejected as INV-D2's alternative) |
+
+**Why.** The two are not equal sources. The reservation rows say *who* holds
+*what*. The counter is their total, kept for a database-enforced guarantee.
+Dropping the counter keeps the hard part, the row lock, and loses the strongest
+guard, the `CHECK`. The risk the mentor saw is drift, and drift is now detected
+daily by `reconcile_inventory_ledger`. It never auto-corrects (INV-D23). It
+was designed but not built; it is built now (`services/inventory/app/v1/stock/reconcile.py`).
+Every race test also ends by asserting there is no drift.
+
+Binding: RFC 0006 INV-D32 (new), INV-D23, I5.
+
+### 2. Where the system is asynchronous
+
+**Options considered**
+
+| Option | For | Against |
+| --- | --- | --- |
+| Run the saga inside the request and return `201 confirmed` | Simple for the client | The request waits on stock, payment and shipping. A burst holds hundreds of open requests and DB connections. A crash mid-request loses the order's progress |
+| Put orders on a Kafka or RabbitMQ queue and process them with consumers | A visible queue | We would rebuild Temporal: per-order state, timers, retries, compensation and resumption after a crash |
+| **Accept with `202 pending`, then schedule a Temporal workflow; the task queue `order-lifecycle` is the order queue (chosen; this is what was built)** | Accepting is cheap and bounded. Work is queued durably and drained at a configured concurrency. A crashed worker resumes from history | A dependency on Temporal (single node here; [DS §6](../distributed-systems-and-failure-modes.md#6-scalability-bottlenecks) B2) |
+
+**Why.** The queue the mentor looked for exists; it is Temporal's. A burst
+becomes many accepted rows and scheduled workflows. They wait on
+`order-lifecycle` and are pulled at each replica's limit. Two things in this
+review make that controllable:
+
+- **ORD-D37**: explicit `max_concurrent_activities` and
+  `max_concurrent_workflow_tasks` per worker replica, set from settings.
+- **GW-7**: a per-user `order_create` limit at the edge, so one client cannot
+  fill the queue.
+
+The walk-through of 500 simultaneous orders is in
+[DS §1.3](../distributed-systems-and-failure-modes.md#13-what-a-burst-looks-like).
+
+### 3. Internal endpoint calls
+
+`/internal/v1/…` routes are plain HTTP. They are asynchronous with respect to
+the *user*: only Temporal activities and workflows call them, never a request
+a person is waiting on. Inside the activity the call is synchronous, because
+the saga needs the answer (reservation IDs, or "no stock") before it charges
+a card.
+
+| Option | For | Against |
+| --- | --- | --- |
+| **Synchronous HTTP from an activity, a service token, idempotent targets (chosen)** | The answer is in hand for the next step. Temporal owns retry and backoff. Inventory dedupes by `(order_id, variant_id)` | Inventory must be reachable at that moment; if not, the activity waits and retries |
+| Request/reply over Kafka | Fully decoupled | Needs a correlation ID, reply topic, timeout and matching state, which is HTTP rebuilt badly. Kafka is kept for facts, not commands (A12) |
+| Fire-and-forget command | No waiting | The saga could not know whether stock was reserved before charging |
+
+The table of every caller, its auth, timeout and retry is in
+[DS §2](../distributed-systems-and-failure-modes.md#2-how-services-call-each-other).
+
+### 4. Retry handling across layers
+
+Retries happen at six layers:
+
+1. the client (with an `Idempotency-Key`);
+2. inventory's own lock-conflict retry;
+3. Temporal activity policies, per step;
+4. Kafka consumers (3 attempts, then DLQ);
+5. the outbox relay (until acknowledged);
+6. Celery autoretry.
+
+Every layer retries only an operation whose target dedupes it, so a retry can
+never apply something twice. The per-step Temporal table and the rules behind
+it are in [DS §3](../distributed-systems-and-failure-modes.md#3-retries-layer-by-layer):
+
+- business refusals are never retried;
+- the forward path fits inside the reservation TTL;
+- compensations retry for an hour.
+
+One RFC sentence was wrong: RFC 0005 §6.1 said a network blip is retried "up
+to three" times. Attempts vary by step (5 for reserve, unlimited for commit),
+and the RFC now points to the table.
+
+### 5. The saga pattern explained
+
+[DS §4](../distributed-systems-and-failure-modes.md#4-the-saga-pattern) covers:
+
+- what a saga is (local transactions plus compensations instead of 2PC);
+- compensatable, pivot and retriable steps;
+- orchestration versus choreography, and why we orchestrate on Temporal;
+- our forward steps and compensations, as a diagram and a table;
+- the hard cases: the ambiguous charge timeout, cancel racing the pivot,
+  operator termination, a refund that keeps failing;
+- the isolation anomalies a saga allows, and our countermeasure for each.
+
+Binding: ARC-D11, ORD-D1, ORD-10.
+
+### 6. Failure-case questions
+
+[DS §5](../distributed-systems-and-failure-modes.md#5-failure-cases-and-how-each-is-handled)
+lists 32 failure cases (F1–F32). Each gives what happens, the mechanism, and
+the test that proves it. Examples:
+
+- a double click;
+- the last-unit race;
+- inventory, Temporal, Kafka, Redis, identity, catalog or Postgres being down;
+- a worker crash after the charge;
+- two replicas running one charge;
+- relay and consumer crashes;
+- poison messages;
+- sweep-versus-commit and cancel-versus-commit races;
+- counter drift;
+- a flash sale on one product;
+- a network split mid-reserve.
+
+### 7. Scalability bottlenecks and the fixes made
+
+The ranked list (B1–B11) is in
+[DS §6](../distributed-systems-and-failure-modes.md#6-scalability-bottlenecks).
+For each bottleneck it gives the current mitigation, the next step, and the
+metric that would trigger it. Three were fixed now:
+
+| Gap | Options | Chosen | Binding |
+| --- | --- | --- | --- |
+| A second order-worker replica, or a restart, could charge twice: the fake provider deduped in memory | A sticky single worker (no scale-out); Redis dedupe (not durable, RFC 0001 §3.1.1.8); **a `payment_attempts` table in `order_db`, first writer wins (chosen)** | Shared and durable, in the service's own DB; `INSERT … ON CONFLICT` counts attempts atomically | ORD-D36, migration `0006_payment_attempts` |
+| Worker concurrency was the SDK default, unexamined | Leave the defaults; **explicit settings per replica, scale out by replicas (chosen)** | Throughput is configuration; each replica's DB pool stays within its limit | ORD-D37 |
+| No edge rate limit, so one client could flood checkout | Per-service limits (cannot span replicas or services); **GW-7 fixed window in Redis, fail open (chosen, as designed)** | Shared by gateway replicas; a Redis outage never blocks orders | GW-7, GW-D11–D13 |
+
+`login_email` (GW-8) is the one GW-7 class still not built; it needs the login
+body read before forwarding. `login_ip` bounds login attempts in the meantime.
+
+### 8. Test depth, race conditions and full flows
+
+**What was added**
+
+| Kind | Where |
+| --- | --- |
+| Race conditions on one row | inventory `test_races.py`: commit vs release, commit vs expiry sweep, saga release vs `order.cancelled` consumer, reverse vs reverse, adjust and set vs reserve, the last unit among 20 orders, mixed line order over 5 SKUs. Each ends with no ledger drift |
+| Reconciliation | inventory `test_reconcile.py`: clean after real traffic; injected drift reported and not corrected; the Celery task |
+| Replicas and restarts | order `test_payment_store.py`: two replicas charging at once, flaky attempts counted across replicas, a restart sees the earlier charge, concurrent refunds |
+| Bursts at the edge | gateway `test_ratelimit.py`: 20 concurrent orders from one user (3 admitted); per-subject isolation, window reset, per-IP before auth, stream exemption, fail-open |
+| Saga branches | order workflow tests with stub activities: every compensation path and the cancel window |
+| Every other package | Unit, edge and race tests for the files the coverage report showed as least covered |
+
+**Bugs the new tests found, and fixed.** All seven are concurrency or retry
+bugs. None showed up in the single-request tests that existed before.
+
+| Service | Bug | Fix |
+| --- | --- | --- |
+| order | `OrderRepo.advance` rolled back on an idempotent no-op, which expired the loaded order. A retried status write whose first attempt had committed then crashed on every retry. After 300 s the saga compensated, so a **successful order could be refunded and its stock reversed** | Commit (release the lock) instead of rolling back; two regression tests |
+| identity | Replaying an already-rotated refresh token while its successor was being rotated left the new session alive, so **reuse detection could be bypassed** (13 of 15 probe runs) | Lock the user row before the session row, so one user's refreshes run one at a time |
+| identity | Two merchants registering the same business name at once got a 500 (slug clash). A slug containing "email" was misreported as email-taken | Match on constraint names; retry the slug |
+| identity | Two admins demoting each other at once deadlocked; the loser got 500 instead of `409 last-admin` | Lock the admin rows in id order before the target |
+| catalog | Deleting a category while a product was created in it, or while a child category was created under it, returned 500 (raw foreign-key error) | Map the foreign key to `409 category-in-use` / `422` unknown reference |
+| notification | Releasing a stream slot decremented and deleted the counter in two Redis commands, so a claim landing between them was wiped and the **3-streams-per-user cap drifted open** (198 of 200 rounds) | One atomic Lua script |
+| assistant | A reindex read `index_state` before locking it, so a newer catalog event could be overwritten by stale chunks, and an unpublished product could be re-indexed | Lock the row on read; skip removed products |
+
+**Found and left open, for a decision.**
+
+- The assistant token budget is checked and charged in separate steps. Concurrent
+  requests from one user can overspend by the in-flight requests' cost. No
+  charge is ever lost, but the docstring promises at most "one request's
+  spend". The fix is either to correct the docstring or to use a conditional
+  charge (AST-D34).
+- When duplicate carrier updates arrive at once, later ones can report
+  `applied: true` although they changed nothing. History and events still
+  record the change once; only the response flag is wrong.
+
+**Coverage (per package, branch coverage; the gate is 85 %)**
+
+| Package | Tests before | Tests after | Coverage before | Coverage after |
+| --- | --- | --- | --- | --- |
+| common | 138 | 234 | 95.0 % | 99.4 % |
+| identity | 53 | 115 | 90.8 % | 98.4 % |
+| catalog | 114 | 204 | 93.5 % | 98.8 % |
+| gateway | 61 | 77 | 93.0 % | 93.6 % (new rate-limit code included) |
+| inventory | 63 | 79 | 99.6 % | 99.6 % (new reconcile code included) |
+| order | 133 | 223 | 93.4 % | 98.5 % (`order_workflow.py` 88 % → 99 %) |
+| notification | 143 | 176 | 97.5 % | 99.8 % |
+| analytics | 123 | 127 | 99.8 % | 99.9 % |
+| assistant | 111 | 162 | 97.3 % | 99.0 % |
+| **e2e** (`tests/e2e`, full stack) | 24 | 28 | — | all pass |
+
+Every new race test was run at least five times in a loop without a failure.
+The lines still uncovered are process entry points, wiring that needs a live
+Temporal, and defensive branches the schema makes unreachable; the agents'
+notes on each are in the PR description.
+
+**How to run**
+
+- `make test-db test-mongo && make test` runs every package. `make cov` adds
+  the coverage report.
+- `make up migrate seed && make test-e2e` runs the full flows through the
+  real stack.

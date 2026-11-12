@@ -61,6 +61,7 @@ service it covers is built and reviewed.
 | 2026-10-06 | [Mentor review](reviews/mentor-reviews.md#review-of-2026-10-06) | `common/` package, entity-first layout with versioned API folders, a decision register in every RFC, Mermaid diagrams, coverage gate, pre-commit and CI |
 | 2026-10-12 | [Mentor review](reviews/mentor-reviews.md#review-of-2026-10-12) | Why FastAPI and the rest of the stack (ARC-D28–ARC-D35); everything an entity uses under its folder; review-changed decisions traced in every RFC; diagram index per service |
 | 2026-10-13 | [Mentor review](reviews/mentor-reviews.md#review-of-2026-10-13) · [full record](reviews/2026-10-13-mentor-review.md) | Version-first layout (`app/v1/<entity>/`, ARC-D23 changed); Kafka partitioning, commit, retry and dedupe explained and built; outbox relay, inventory consumer and Celery in Milestone 3; why Kafka, RabbitMQ/Celery and Temporal each exist; end-to-end business flows; one diagrams page |
+| 2026-10-20 | [Mentor review](reviews/mentor-reviews.md#review-of-2026-10-20) · [distributed systems and failure modes](distributed-systems-and-failure-modes.md) | Reserved counter kept and proven (INV-D32, reconciliation built); asynchrony, internal calls, retries and the saga explained; failure-case catalogue; ranked bottlenecks; gateway rate limit, explicit worker concurrency, shared payment dedupe; race and full-flow tests |
 
 ## Cross-cutting guides
 
@@ -72,6 +73,7 @@ one sitting.
 | [messaging-and-consistency.md](messaging-and-consistency.md) | Kafka partitioning, offset commit and retry, duplicates, atomicity, how each queue works, why Kafka, RabbitMQ/Celery and Temporal each exist |
 | [business-flows.md](business-flows.md) | Every business flow end to end, with failure and compensation paths |
 | [architecture-diagrams.md](architecture-diagrams.md) | The top-level service-communication diagram and one component diagram per service |
+| [distributed-systems-and-failure-modes.md](distributed-systems-and-failure-modes.md) | Where the system is asynchronous, how services call each other, retries per layer, the saga pattern, 32 failure cases, ranked scalability bottlenecks, the reserved counter |
 
 ## Repository structure
 

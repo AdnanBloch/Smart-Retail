@@ -21,6 +21,7 @@ TEST_MONGO_PORT := 57017
 
 .DEFAULT_GOAL := help
 .PHONY: test-mongo mongo-init analytics-indexes analytics-backfill reindex
+.PHONY: review-ui
 .PHONY: help env keys up db-init topics schemas-check dlq-replay down reset logs ps migrate seed dev-install hooks test-db test cov lint-types test-e2e lint fmt audit
 
 help: ## List targets
@@ -75,6 +76,13 @@ db-init: ## Create any missing database and role (idempotent; safe on an existin
 
 down: ## Stop the stack, keep volumes
 	$(COMPOSE) down
+
+REVIEW_UI_PORT ?= 8077
+
+review-ui: ## Build the review explorer from docs/ and the code, and serve it on REVIEW_UI_PORT (8077)
+	python3 tools/review_explorer/build.py
+	@echo "→ http://localhost:$(REVIEW_UI_PORT)  (Ctrl-C to stop)"
+	python3 -m http.server $(REVIEW_UI_PORT) --bind 127.0.0.1 --directory tools/review_explorer/site
 
 reset: ## Stop the stack and delete volumes
 	$(COMPOSE) down -v --remove-orphans

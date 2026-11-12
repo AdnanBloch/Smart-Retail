@@ -226,7 +226,7 @@ sequenceDiagram
     ORD->>CAT: GET /products/{id} for each line (price snapshot)
     ORD->>ORD: order pending + lines + outbox order.created (one tx)
     ORD->>T: start workflow order-{order_id}
-    ORD-->>C: 201 {status: pending}
+    ORD-->>C: 202 {status: pending}
     T->>INV: reserve_inventory (held for 15 min)
     T->>ORD: status → awaiting_payment
     T->>PAY: charge (key order-{id}:charge)

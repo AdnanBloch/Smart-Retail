@@ -4,8 +4,14 @@ import httpx
 import numpy as np
 import pytest
 
+from app.core.config import Settings
 from app.core.errors import EmbeddingUnavailable
-from app.v1.search.clients.embeddings import EmbeddingError, HashingEmbeddings, VoyageEmbeddings
+from app.v1.search.clients.embeddings import (
+    EmbeddingError,
+    HashingEmbeddings,
+    VoyageEmbeddings,
+    build_embeddings,
+)
 from app.v1.search.enums import IndexStatus
 from app.v1.search.repo import ChunkRow, SearchFilters, group_by_product, keyword_query
 from app.v1.search.utils import (
@@ -33,6 +39,35 @@ async def test_hashing_is_deterministic_normalised_and_similarity_aware():
     assert cos(v1, near) > cos(v1, far)
     assert abs(np.linalg.norm(e.vector("")) - 1.0) < 1e-9  # no zero vectors
     assert abs(np.linalg.norm(e.vector("the and of")) - 1.0) < 1e-9
+
+
+def test_hashing_never_returns_nan_when_features_cancel():
+    # In one dimension the signed features of this text sum to exactly zero;
+    # the vector must still be a unit vector, never 0/0.
+    e = HashingEmbeddings(1)
+    assert e.vector("id fljc fi") == [1.0]
+
+
+async def test_build_embeddings_picks_the_configured_provider():
+    url = "postgresql+asyncpg://x/y"
+    async with httpx.AsyncClient() as http:
+        hashing = build_embeddings(Settings(database_url=url), http)
+        assert isinstance(hashing, HashingEmbeddings) and hashing.dimension == 1024
+        voyage_settings = Settings(
+            database_url=url,
+            embedding_provider="voyage",
+            voyage_api_key="secret",
+            voyage_timeout_seconds=3.0,
+        )
+        built = build_embeddings(voyage_settings, http)
+    assert isinstance(built, VoyageEmbeddings)
+    assert (built.api_key, built.model, built.dimension, built.timeout) == (
+        "secret",
+        "voyage-3.5",
+        1024,
+        3.0,
+    )
+    assert built.http is http
 
 
 def voyage(handler) -> VoyageEmbeddings:

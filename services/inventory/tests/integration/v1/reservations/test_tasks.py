@@ -32,6 +32,7 @@ def test_tasks_are_routed_to_the_inventory_maintenance_queue() -> None:
     assert schedule == {
         "smartretail.inventory.sweep_expired_reservations",
         "smartretail.inventory.sweep_processed_events",
+        "smartretail.inventory.reconcile_inventory_ledger",
     }
 
 
